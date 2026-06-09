@@ -1,6 +1,4 @@
-
 .env
-__pycache__/
-*.pyc
+**/.env
 .venv/
-supabase/.temp/
+**/__pycache__/
