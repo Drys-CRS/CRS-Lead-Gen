@@ -20,7 +20,7 @@ supabase = init_connection()
 
 # Fetch data function (Clears cache automatically to pull fresh data daily/on demand)
 def load_data():
-    response = supabase.table("sa_tenders").select("*").order("closing_date", descending=False).execute()
+    response = supabase.table("sa_tenders").select("*").order("closing_date", desc=False).execute()
     return pd.DataFrame(response.data)
 
 df = load_data()
