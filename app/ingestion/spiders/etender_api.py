@@ -7,17 +7,24 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv(override=True)
 
+# Define your exact target areas. Python will check for these in the description.
+TARGET_KEYWORDS = [
+    "cyber", "security", "firewall", "network", "threat", "vulnerability",
+    "training", "comptia", "ibm", "red hat", "ict ", "information technology",
+    "cloud", "server", "endpoint", "infrastructure", "data center",
+    "flare", "vectra", "aikido", "vicarius", "software", "hardware"
+]
+
 def scrape_etenders():
     print("🔥 STARTING ETENDERS API PULL 🔥")
     
     url = "https://www.etenders.gov.za/Home/PaginatedTenderOpportunities"
     
-    # DataTables GET request parameters (flattened for URL encoding)
     params = {
         "draw": "1",
         "start": "0",
-        "length": "1000",       # Pull up to 1000 records at once
-        "status": "1",          # 1 = Currently Advertised
+        "length": "1000",
+        "status": "1", 
         "search[value]": "",
         "search[regex]": "false",
         "order[0][column]": "2",
@@ -31,22 +38,19 @@ def scrape_etenders():
     }
 
     try:
-        # 1. Hit the API directly using GET and params
-        print("📡 Sending GET request with DataTables parameters...")
+        print("📡 Pulling the master list from eTenders...")
         response = requests.get(url, params=params, headers=headers)
         
-        print(f"✅ RESPONSE RECEIVED: HTTP Status {response.status_code}")
-        
         if response.status_code != 200:
-            print(f"❌ Server Error: {response.text[:500]}") # Print first 500 chars of error
+            print(f"❌ Server Error: {response.text[:500]}")
             return
 
         data = response.json()
-        tenders = data.get("data", [])
+        all_tenders = data.get("data", [])
         
-        print(f"🎯 Successfully pulled {len(tenders)} active tenders from the live API.")
+        print(f"📥 Received {len(all_tenders)} total tenders. Applying cyber & training filters...")
         
-        # 2. Connect to Supabase
+        # Connect to Supabase
         url_env = os.getenv("SUPABASE_URL")
         key_env = os.getenv("SUPABASE_KEY")
         
@@ -56,14 +60,30 @@ def scrape_etenders():
             
         supabase = create_client(url_env, key_env)
         
-        # 3. Process and Upload
         success_count = 0
-        for tender in tenders:
+        skipped_count = 0
+        
+        for tender in all_tenders:
+            # Grab the description and category, convert to lowercase for easy matching
+            description = tender.get("description", "").lower()
+            category_text = tender.get("category", "").lower()
+            
+            # Combine them into one string to search against
+            searchable_text = f"{description} {category_text}"
+            
+            # Check if ANY of our target keywords exist in the text
+            is_relevant = any(keyword in searchable_text for keyword in TARGET_KEYWORDS)
+            
+            if not is_relevant:
+                skipped_count += 1
+                continue # Skip this loop and move to the next tender
+                
+            # If it passes the filter, prepare it for the database
             tender_data = {
                 "tender_number": tender.get("tender_No"),
                 "department_name": tender.get("department"),
                 "title": tender.get("description", "")[:200],
-                "category": tender.get("category"), # <--- THE CULPRIT
+                # "category": tender.get("category"), <-- Commented out to prevent the PGRST204 error
                 "issue_date": tender.get("date_Published"),
                 "closing_date": tender.get("closing_Date"),
                 "status": "Open",
@@ -77,10 +97,15 @@ def scrape_etenders():
                     on_conflict="tender_number,department_name"
                 ).execute()
                 success_count += 1
+                print(f"✅ Upserted Match: {tender.get('tender_No')} - {tender.get('category')}")
             except Exception as db_error:
                 print(f"⚠️ DB Upsert Failed for {tender.get('tender_No')}: {db_error}")
 
-        print(f"🚀 Pipeline Complete: {success_count} tenders pushed to Supabase.")
+        print("\n=================================")
+        print(f"🚀 Pipeline Complete!")
+        print(f"🗑️ Ignored {skipped_count} irrelevant tenders.")
+        print(f"💾 Pushed {success_count} targeted tenders to Supabase.")
+        print("=================================")
 
     except Exception as e:
         print(f"❌ Critical Pipeline Failure: {e}")
