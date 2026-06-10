@@ -206,20 +206,7 @@ if st.sidebar.button("🔄 Refresh Data"):
     st.cache_data.clear()
     st.rerun()
 
-st.sidebar.header("Filters")
-competitor_search = st.sidebar.text_input("Filter by Winning Bidder")
-dept_search = st.sidebar.text_input("Filter by Department")
-
-# Country filter — populated from whatever countries are in the DB
-all_countries = sorted(tenders_df["country"].dropna().unique().tolist()) if "country" in tenders_df.columns and not tenders_df.empty else []
-selected_countries = st.sidebar.multiselect(
-    "Filter by Country",
-    options=all_countries,
-    default=all_countries,
-    help="Select one or more countries to show"
-)
-
-# Load data
+# Load data first so sidebar filters can use it
 tenders_df = fetch_tenders()
 
 if tenders_df.empty:
@@ -230,6 +217,19 @@ if tenders_df.empty:
 for col in ["ai_score", "ai_rationale"]:
     if col not in tenders_df.columns:
         tenders_df[col] = None
+
+st.sidebar.header("Filters")
+competitor_search = st.sidebar.text_input("Filter by Winning Bidder")
+dept_search = st.sidebar.text_input("Filter by Department")
+
+# Country filter — populated from live DB values
+all_countries = sorted(tenders_df["country"].dropna().unique().tolist()) if "country" in tenders_df.columns else []
+selected_countries = st.sidebar.multiselect(
+    "Filter by Country",
+    options=all_countries,
+    default=all_countries,
+    help="Select one or more countries to show"
+)
 
 # Apply filters
 df_filtered = tenders_df.copy()
