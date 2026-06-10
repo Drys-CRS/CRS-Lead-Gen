@@ -2,34 +2,26 @@ import streamlit as st
 import pandas as pd
 from supabase import create_client
 
-# ... your database connection setup ...
+# 1. Initialize Supabase Connection
+@st.cache_resource
+def init_connection():
+    url = st.secrets["SUPABASE_URL"]
+    key = st.secrets["SUPABASE_KEY"]
+    return create_client(url, key)
 
-st.title("🛡️ CRS Competitive Intelligence")
+supabase = init_connection()
 
-# Create Tabs for cleaner UI
-tab1, tab2 = st.tabs(["📢 Open Opportunities", "🏆 Awarded Tenders"])
+# 2. Define the missing function
+def fetch_data_from_supabase():
+    try:
+        # Fetching all data from 'sa_tenders'
+        response = supabase.table("sa_tenders").select("*").execute()
+        # Convert the JSON response into a Pandas DataFrame
+        df = pd.DataFrame(response.data)
+        return df
+    except Exception as e:
+        st.error(f"Error fetching data from Supabase: {e}")
+        return pd.DataFrame() # Return an empty DataFrame on error
 
-# Fetch Data (Assuming you have a function to fetch from Supabase)
-# def fetch_tenders(status): ...
-tenders_df = fetch_data_from_supabase() # Your existing function
-
-with tab1:
-    st.subheader("Currently Open Tenders")
-    open_tenders = tenders_df[tenders_df['status'] == 'Open']
-    st.dataframe(open_tenders)
-
-with tab2:
-    st.subheader("Historical Awarded Tenders")
-    awarded_tenders = tenders_df[tenders_df['status'] == 'Awarded']
-    
-    # Display the new columns we just added
-    st.dataframe(awarded_tenders[['tender_number', 'department_name', 'winning_bidder', 'award_value', 'title']])
-
-# Optional: Add a specific competitor filter in the sidebar
-st.sidebar.header("Intelligence Filters")
-competitor_filter = st.sidebar.text_input("Search by Competitor Name")
-
-if competitor_filter:
-    filtered_wins = awarded_tenders[awarded_tenders['winning_bidder'].str.contains(competitor_filter, case=False, na=False)]
-    st.write(f"Wins found for {competitor_filter}:")
-    st.dataframe(filtered_wins)
+# Now your call at line 14 will work:
+tenders_df = fetch_data_from_supabase()
