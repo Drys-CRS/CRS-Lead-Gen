@@ -47,6 +47,15 @@ try:
         }
 
         # --- 3. Build the Tabbed Interface ---
+        # --- Force Refresh Mechanism ---
+# This button clears the local cache and forces a re-run of the load_data function
+if st.sidebar.button("🔄 Refresh All Data & Sources"):
+    st.cache_data.clear()
+    st.cache_resource.clear()
+    st.rerun()
+
+# Optional: Add a timestamp of the last refresh
+st.sidebar.caption(f"Last updated: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}")
         tab1, tab2 = st.tabs(["🟢 Active Pipeline", "🏆 Competitive Intelligence"])
 
         with tab1:
