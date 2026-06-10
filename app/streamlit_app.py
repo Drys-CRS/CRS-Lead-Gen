@@ -75,7 +75,7 @@ else:
     tab1, tab2 = tab1, tab2 = st.tabs(["📢 Open Opportunities", "🏆 Competitive Intelligence (Awarded)"])
 
     # TAB 1: OPEN
-    with tab1:
+ with tab1:
         st.subheader("Currently Open Opportunities")
         open_df = df_filtered[df_filtered['status'] == 'Open'].copy()
         
@@ -86,6 +86,28 @@ else:
             selection_mode="single-row",
             on_select="rerun"
         )
+        
+        # 2. Context Frame (Shows only when a row is clicked)
+        if event.selection.rows:
+            selected_idx = event.selection.rows[0]
+            selected_tender = open_df.iloc[selected_idx]
+            
+            st.divider()
+            st.subheader(f"Context: {selected_tender['tender_number']}")
+            st.write(f"**Description:** {selected_tender['description']}")
+            st.write(f"**Compliance Requirements:** {selected_tender['compliance_requirements']}")
+            
+            # Action Buttons
+            col1, col2 = st.columns(2)
+            with col1:
+                # Button to open eTenders site directly
+                st.link_button("🌐 Open on eTenders", "https://www.etenders.gov.za/Home/opportunities")
+            with col2:
+                # Button to remove item
+                if st.button("🗑️ Mark as Irrelevant"):
+                    # Logic: Delete from Supabase
+                    supabase.table("sa_tenders").delete().eq("tender_number", selected_tender['tender_number']).execute()
+                    st.rerun()
         
         # 2. Context Frame (Shows only when a row is clicked)
         if event.selection.rows:
