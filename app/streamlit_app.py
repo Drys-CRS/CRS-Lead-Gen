@@ -7,12 +7,23 @@ import requests
 # --- Page Configuration ---
 st.set_page_config(page_title="CRS Target Pipeline", layout="wide")
 
-# --- Supabase & GitHub Connection ---
+# --- Supabase & Connection Setup ---
 @st.cache_resource
 def init_connection():
+    # Attempt to retrieve secrets from Streamlit Cloud
+    try:
+        url = st.secrets["SUPABASE_URL"]
+        key = st.secrets["SUPABASE_KEY"]
+        gh_pat = st.secrets["GH_PAT"]
+    except Exception:
+        # Fallback to environment variables if running locally
+        url = os.environ.get("SUPABASE_URL")
+        key = os.environ.get("SUPABASE_KEY")
+        gh_pat = os.environ.get("GH_PAT")
+    
     return {
-        "supabase": create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"]),
-        "gh_token": st.secrets["GH_PAT"]
+        "supabase": create_client(url, key),
+        "gh_token": gh_pat
     }
 
 conn = init_connection()
@@ -22,17 +33,23 @@ supabase = conn["supabase"]
 def trigger_github_workflow():
     owner = "Drys-CRS"
     repo = "CRS-Lead-Gen"
-    workflow_id = "daily_scrape.yml"
+    # Ensure this matches your file name in .github/workflows/
+    workflow_id = "daily_scrape.yml" 
+    
     url = f"https://api.github.com/repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches"
+    
     headers = {
         "Authorization": f"token {conn['gh_token']}",
         "Accept": "application/vnd.github.v3+json"
     }
+    
+    # Ensure 'ref' matches your repository's default branch (usually 'main' or 'master')
     data = {"ref": "main"}
+    
     response = requests.post(url, headers=headers, json=data)
-    return response.status_code == 204
+    return response
 
-# --- Sidebar Controls (OUTSIDE the try block) ---
+# --- Sidebar Controls ---
 st.sidebar.title("Pipeline Controls")
 
 if st.sidebar.button("🔄 Refresh View"):
@@ -41,26 +58,28 @@ if st.sidebar.button("🔄 Refresh View"):
 
 if st.sidebar.button("🚀 Force Run Scrapers"):
     with st.spinner("Dispatching trigger to GitHub..."):
-        if trigger_github_workflow():
+        resp = trigger_github_workflow()
+        if resp.status_code == 204:
             st.sidebar.success("Pipeline triggered! Check GitHub Actions.")
         else:
-            st.sidebar.error("Failed to trigger pipeline.")
+            st.sidebar.error(f"Trigger failed (Status {resp.status_code}): {resp.text}")
 
 st.sidebar.caption(f"Last updated: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-# --- Data Loading & Main App ---
+# --- Data Loading ---
 @st.cache_data(ttl=600)
 def load_data():
     response = supabase.table("sa_tenders").select("*").execute()
     return pd.DataFrame(response.data)
 
+# --- Main App Interface ---
 st.title("CRS Target Pipeline: IT & Cybersecurity")
 
 try:
     df = load_data()
     
     if df.empty:
-        st.info("Database empty. Use 'Force Run Scrapers' to populate.")
+        st.info("No data in database. Click 'Force Run Scrapers' to populate.")
     else:
         df_pending = df[df['award_status'] != 'Awarded'].copy()
         df_won = df[df['award_status'] == 'Awarded'].copy()
