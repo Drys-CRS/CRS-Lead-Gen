@@ -846,13 +846,15 @@ def run_all_scrapers():
 # ─────────────────────────────────────────────
 # 9. MAIN DASHBOARD
 # ─────────────────────────────────────────────
-st.title("🛡️ CRS Competitive Intelligence Dashboard")
-
-# Sidebar — logo + controls
+# Logo — top-left of main area, fixed half-width
 import os as _os
 _logo_path = _os.path.join(_os.path.dirname(__file__), "assets", "crs_logo.png")
-if _os.path.exists(_logo_path):
-    st.sidebar.image(_logo_path, use_container_width=True)
+_logo_cols = st.columns([1, 4])
+with _logo_cols[0]:
+    if _os.path.exists(_logo_path):
+        st.image(_logo_path, width=140)
+
+st.title("🛡️ CRS Competitive Intelligence Dashboard")
 
 st.sidebar.header("Controls")
 st.sidebar.caption(_provider_status())
@@ -921,9 +923,10 @@ with tab1:
         st.subheader(f"Open Opportunities ({len(open_df)})")
     with col_right:
         if st.button("🤖 Score All with AI", help="Run AI fit scoring on all open tenders"):
-            open_df = ai_match_tenders(open_df)
+            ai_match_tenders(open_df)   # scores are written to Supabase inside
             st.cache_data.clear()
-            st.success("Scoring complete — tenders sorted by AI fit score.")
+            st.success("Scoring complete! Reloading…")
+            st.rerun()  # reload from DB so table shows fresh scores
 
     # Sort by score if available
     if "ai_score" in open_df.columns and open_df["ai_score"].notna().any():
@@ -1003,14 +1006,19 @@ with tab2:
 
     # Apply 12-month date range filter
     if "issue_date" in awarded_df.columns:
-        awarded_df["_award_date"] = pd.to_datetime(awarded_df["issue_date"], errors="coerce").dt.date
+        # Convert everything to ISO string for safe cross-type comparison
+        _from_str = awarded_date_from.isoformat()
+        _to_str   = awarded_date_to.isoformat()
+        awarded_df["_award_date_str"] = pd.to_datetime(
+            awarded_df["issue_date"], errors="coerce"
+        ).dt.strftime("%Y-%m-%d")
         awarded_df = awarded_df[
-            awarded_df["_award_date"].isna() |
+            awarded_df["_award_date_str"].isna() |
             (
-                (awarded_df["_award_date"] >= awarded_date_from) &
-                (awarded_df["_award_date"] <= awarded_date_to)
+                (awarded_df["_award_date_str"] >= _from_str) &
+                (awarded_df["_award_date_str"] <= _to_str)
             )
-        ].drop(columns=["_award_date"])
+        ].drop(columns=["_award_date_str"])
 
     if competitor_search:
         awarded_df = awarded_df[
