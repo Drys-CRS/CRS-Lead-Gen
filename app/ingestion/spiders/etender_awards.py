@@ -27,7 +27,6 @@ def scrape_awarded_tenders():
     
     url = "https://www.etenders.gov.za/Home/PaginatedTenderOpportunities"
     
-    # Using the exact DataTables parameters, specifically targeting status=2 for Awarded
     params = {
         "draw": "1",
         "start": "0",
@@ -84,39 +83,46 @@ def scrape_awarded_tenders():
                 skipped_count += 1
                 continue 
                 
-            # --- EXTRACT SUCCESSFUL BIDDERS ---
+            # --- EXTRACT SUCCESSFUL BIDDERS AND AMOUNTS ---
             awards_data = tender.get("awards", [])
-            winner_summary = "Winner Not Disclosed"
-            award_amount = ""
+            winner_names = "Not Disclosed"
+            award_values = "Not Disclosed"
             
             if awards_data and isinstance(awards_data, list) and len(awards_data) > 0:
-                winners_list = []
+                names_list = []
+                values_list = []
+                
                 for award in awards_data:
-                    awardee_name = award.get("awardee", "Unknown Bidder")
-                    # Safely format the amount to include the 'R' symbol
-                    raw_amount = award.get("amount")
-                    formatted_amount = f"R{raw_amount:,.2f}" if isinstance(raw_amount, (int, float)) else str(raw_amount)
+                    # Get Name
+                    names_list.append(award.get("awardee", "Unknown Bidder"))
                     
-                    winners_list.append(f"{awardee_name} ({formatted_amount})")
+                    # Get and format Amount safely
+                    raw_amount = award.get("amount")
+                    if isinstance(raw_amount, (int, float)):
+                        values_list.append(f"R{raw_amount:,.2f}")
+                    elif raw_amount:
+                        values_list.append(str(raw_amount))
+                    else:
+                        values_list.append("Unknown Amount")
                 
-                # Join multiple winners together if there's more than one
-                winner_summary = " | ".join(winners_list)
+                # Join them together in case there are multiple winners
+                winner_names = " | ".join(names_list)
+                award_values = " | ".join(values_list)
 
-            # Prepend the Winner info to the description so it's highly visible
-            enriched_description = f"🏆 SUCCESSFUL BIDDER(S): {winner_summary}\n\n{full_description}"
-                
             tender_data = {
                 "tender_number": tender.get("tender_No"),
                 "department_name": tender.get("department"),
                 "title": full_description[:200], 
-                "description": enriched_description, 
+                "description": full_description, 
                 "category": category_text,
                 "compliance_requirements": tender.get("conditions", "Not specified"),
-                "portal_link": "https://www.etenders.gov.za/Home/opportunities?id=2", # Linked to Awarded portal
+                "portal_link": "https://www.etenders.gov.za/Home/opportunities?id=2", 
                 "issue_date": tender.get("date_Published"),
                 "closing_date": tender.get("closing_Date"),
                 "status": "Awarded",
-                "award_status": winner_summary, # Save the winner directly to this column for easy dashboard filtering
+                "award_status": "Published", 
+                "winning_bidder": winner_names, # Mapped to new column
+                "award_value": award_values,    # Mapped to new column
                 "country": "South Africa"
             }
 
@@ -126,7 +132,7 @@ def scrape_awarded_tenders():
                     on_conflict="tender_number,department_name"
                 ).execute()
                 success_count += 1
-                print(f"✅ Logged Win: {tender.get('tender_No')} -> {winner_summary}")
+                print(f"✅ Logged Win: {tender.get('tender_No')} -> {winner_names} ({award_values})")
             except Exception as db_error:
                 print(f"⚠️ DB Upsert Failed for {tender.get('tender_No')}: {db_error}")
 
