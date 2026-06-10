@@ -102,5 +102,21 @@ else:
             # Create Pivot Table
             pivot_table = awarded_df.pivot_table(
                 values='numeric_value', 
-                index='winning_
+                index='winning_bidder', 
+                aggfunc={'numeric_value': ['sum', 'count']}
+            ).rename(columns={'sum': 'Total Won Value (ZAR)', 'count': 'Tender Count'})
+            
+            pivot_table = pivot_table.sort_values(by='Total Won Value (ZAR)', ascending=False)
+            
+            st.subheader("Competitor Market Share Roll-up")
+            st.dataframe(pivot_table.style.format({'Total Won Value (ZAR)': 'R{:,.2f}'}), use_container_width=True)
+            
+            st.divider()
+            
+            st.subheader("Detailed Award List")
+            st.dataframe(
+                awarded_df[['tender_number', 'department_name', 'winning_bidder', 'award_value', 'title']],
+                use_container_width=True
             )
+        else:
+            st.info("No awarded tenders match your current filters.")
