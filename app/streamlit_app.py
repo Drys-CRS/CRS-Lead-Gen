@@ -50,7 +50,7 @@ supabase = init_connection()
 @st.cache_resource
 def init_gemini():
     genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-    return genai.GenerativeModel("gemini-1.5-flash")
+    return genai.GenerativeModel("gemini-1.5-pro")
 
 ai = init_gemini()
 
