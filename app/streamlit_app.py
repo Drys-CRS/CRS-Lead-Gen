@@ -60,4 +60,40 @@ try:
                 st.dataframe(
                     display_pending,
                     column_config=shared_config,
+                    hide_index=True,
+                    use_container_width=True
                 )
+            else:
+                st.write("No active opportunities matching your criteria.")
+
+        with tab2:
+            st.subheader(f"Awarded Contracts ({len(df_won)})")
+            st.caption("Track competitor wins and contract values for future renewal targeting.")
+            
+            if not df_won.empty:
+                cols = df_won.columns.tolist()
+                
+                # Clean up internal database columns
+                for col in ['id', 'created_at']:
+                    if col in cols:
+                        cols.remove(col)
+                        
+                # Rearrange columns to put the competitor and value front and center
+                if 'winning_bidder' in cols and 'award_value' in cols:
+                    cols.insert(2, cols.pop(cols.index('winning_bidder')))
+                    cols.insert(3, cols.pop(cols.index('award_value')))
+                    display_won = df_won[cols]
+                else:
+                    display_won = df_won
+
+                st.dataframe(
+                    display_won,
+                    column_config=shared_config,
+                    hide_index=True,
+                    use_container_width=True
+                )
+            else:
+                st.write("No historical awarded contracts recorded yet.")
+
+except Exception as e:
+    st.error(f"Error connecting to database or loading data: {e}")
