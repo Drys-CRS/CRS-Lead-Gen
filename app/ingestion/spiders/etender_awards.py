@@ -1,13 +1,13 @@
 import requests
-from bs4 import BeautifulSoup
-import os
 import json
+import os
 from supabase import create_client
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv(override=True)
 
+# Your highly targeted cybersecurity and training filter list
 TARGET_KEYWORDS = [
     "cyber", "EDR", "firewall", "network", "threat", "vulnerability",
     "training", "comptia", "ibm", "red hat", "ict ", "information technology",
@@ -22,36 +22,41 @@ TARGET_KEYWORDS = [
     "redhat", "SUSE", "Application Security", "Identity and Access Management", "IAM", "Zero Trust", "SIEM", "Security Orchestration"
 ]
 
-def scrape_gov_za_awards():
-    print("🏆 STARTING GOV.ZA AWARDS HTML SCRAPER 🏆")
+def scrape_awarded_tenders():
+    print("🏆 STARTING ETENDERS AWARDS PULL (API STATUS=2) 🏆")
     
-    base_url = "https://www.gov.za"
-    target_url = f"{base_url}/documents/awarded-tenders"
+    url = "https://www.etenders.gov.za/Home/PaginatedTenderOpportunities"
     
+    # Using the exact DataTables parameters, specifically targeting status=2 for Awarded
+    params = {
+        "draw": "1",
+        "start": "0",
+        "length": "1000",       
+        "status": "2",          # 2 = Awarded Tenders
+        "search[value]": "",
+        "search[regex]": "false",
+        "order[0][column]": "2",
+        "order[0][dir]": "desc"
+    }
+
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'X-Requested-With': 'XMLHttpRequest',
+        'Accept': 'application/json, text/javascript, */*; q=0.01'
     }
 
     try:
-        print(f"📡 Fetching main page: {target_url}")
-        response = requests.get(target_url, headers=headers)
+        print("📡 Pulling the Awarded master list from eTenders...")
+        response = requests.get(url, params=params, headers=headers)
         
         if response.status_code != 200:
-            print(f"❌ Failed to load gov.za (HTTP {response.status_code})")
+            print(f"❌ Server Error: {response.text[:500]}")
             return
 
-        # Parse the HTML
-        soup = BeautifulSoup(response.text, 'html.parser')
+        data = response.json()
+        awarded_tenders = data.get("data", [])
         
-        # gov.za usually stores these lists inside a table with the class 'views-table'
-        table = soup.find('table', class_='views-table')
-        
-        if not table:
-            print("❌ Could not find the expected HTML table on gov.za. The website layout may have changed.")
-            return
-
-        rows = table.find('tbody').find_all('tr')
-        print(f"📥 Found {len(rows)} awarded tender postings on the front page. Scanning sub-pages...")
+        print(f"📥 Received {len(awarded_tenders)} total Awarded tenders. Applying advanced filters...")
         
         # Connect to Supabase
         url_env = os.getenv("SUPABASE_URL")
@@ -66,57 +71,52 @@ def scrape_gov_za_awards():
         success_count = 0
         skipped_count = 0
         
-        for row in rows:
-            # Extract Title and Link
-            a_tag = row.find('a')
-            if not a_tag:
-                continue
-                
-            title = a_tag.text.strip()
-            link = a_tag.get('href')
+        for tender in awarded_tenders:
+            full_description = tender.get("description", "")
+            category_text = tender.get("category", "")
             
-            # Format relative links into absolute URLs
-            if not link.startswith('http'):
-                full_link = base_url + link
-            else:
-                full_link = link
-                
-            # Extract Date
-            date_td = row.find('td', class_='views-field-field-date-value')
-            issue_date = date_td.text.strip() if date_td else "Unknown Date"
+            searchable_text = f"{full_description} {category_text}".lower()
             
-            # -----------------------------------------------------
-            # DEEP SCAN: Visit the sub-page to read the actual text
-            # -----------------------------------------------------
-            sub_resp = requests.get(full_link, headers=headers)
-            sub_soup = BeautifulSoup(sub_resp.text, 'html.parser')
-            
-            # Grab all visible text from the page and convert to lowercase for easy searching
-            page_text = sub_soup.get_text(separator=" ", strip=True).lower()
-            
-            # Filter check against our keywords
-            is_relevant = any(keyword.lower() in page_text for keyword in TARGET_KEYWORDS)
+            # Filter against your target keywords
+            is_relevant = any(keyword.lower() in searchable_text for keyword in TARGET_KEYWORDS)
             
             if not is_relevant:
                 skipped_count += 1
-                continue
+                continue 
                 
-            # Generate a unique ID based on the end of the gov.za URL slug
-            tender_id = full_link.rstrip('/').split('/')[-1].upper()
+            # --- EXTRACT SUCCESSFUL BIDDERS ---
+            awards_data = tender.get("awards", [])
+            winner_summary = "Winner Not Disclosed"
+            award_amount = ""
             
-            # Clean up the department name from the title if possible (e.g., "Awarded tenders: Department of Health")
-            department = title.replace("Awarded tenders:", "").strip()
+            if awards_data and isinstance(awards_data, list) and len(awards_data) > 0:
+                winners_list = []
+                for award in awards_data:
+                    awardee_name = award.get("awardee", "Unknown Bidder")
+                    # Safely format the amount to include the 'R' symbol
+                    raw_amount = award.get("amount")
+                    formatted_amount = f"R{raw_amount:,.2f}" if isinstance(raw_amount, (int, float)) else str(raw_amount)
+                    
+                    winners_list.append(f"{awardee_name} ({formatted_amount})")
+                
+                # Join multiple winners together if there's more than one
+                winner_summary = " | ".join(winners_list)
 
+            # Prepend the Winner info to the description so it's highly visible
+            enriched_description = f"🏆 SUCCESSFUL BIDDER(S): {winner_summary}\n\n{full_description}"
+                
             tender_data = {
-                "tender_number": tender_id,
-                "department_name": department,
-                "title": title[:200], 
-                "description": f"🏆 GOV.ZA AWARDED TENDER POSTING\n\nMatches found for your cybersecurity/training keywords in the attached documents. Please visit the portal link to download the winner PDFs.\n\nSource: {title}", 
-                "category": "Government Documents",
-                "portal_link": full_link,
-                "issue_date": issue_date,
-                "status": "Awarded", 
-                "award_status": "Published on gov.za", 
+                "tender_number": tender.get("tender_No"),
+                "department_name": tender.get("department"),
+                "title": full_description[:200], 
+                "description": enriched_description, 
+                "category": category_text,
+                "compliance_requirements": tender.get("conditions", "Not specified"),
+                "portal_link": "https://www.etenders.gov.za/Home/opportunities?id=2", # Linked to Awarded portal
+                "issue_date": tender.get("date_Published"),
+                "closing_date": tender.get("closing_Date"),
+                "status": "Awarded",
+                "award_status": winner_summary, # Save the winner directly to this column for easy dashboard filtering
                 "country": "South Africa"
             }
 
@@ -126,13 +126,13 @@ def scrape_gov_za_awards():
                     on_conflict="tender_number,department_name"
                 ).execute()
                 success_count += 1
-                print(f"✅ Target Identified & Logged: {department}")
+                print(f"✅ Logged Win: {tender.get('tender_No')} -> {winner_summary}")
             except Exception as db_error:
-                print(f"⚠️ DB Upsert Failed for {tender_id}: {db_error}")
+                print(f"⚠️ DB Upsert Failed for {tender.get('tender_No')}: {db_error}")
 
         print("\n=================================")
-        print(f"🚀 Gov.za Awards Pipeline Complete!")
-        print(f"🗑️ Ignored {skipped_count} irrelevant documents.")
+        print(f"🚀 Awards Pipeline Complete!")
+        print(f"🗑️ Ignored {skipped_count} irrelevant awards.")
         print(f"💾 Pushed {success_count} targeted wins to Supabase.")
         print("=================================")
 
@@ -140,4 +140,4 @@ def scrape_gov_za_awards():
         print(f"❌ Critical Pipeline Failure: {e}")
 
 if __name__ == "__main__":
-    scrape_gov_za_awards()
+    scrape_awarded_tenders()
