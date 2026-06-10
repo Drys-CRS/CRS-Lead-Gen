@@ -84,6 +84,65 @@ def _call_ai(prompt: str) -> str:
     raw = response.text.strip()
     return re.sub(r"^```json\s*|^```\s*|```$", "", raw, flags=re.MULTILINE).strip()
 
+
+def _call_ai_grounded(prompt: str) -> str:
+    """Call Gemini WITH Google Search grounding so it can find current web results.
+    Falls back to ungrounded if grounding is unavailable on this API tier/model."""
+    grounded_attempts = [
+        # Gemini 2.x style tool
+        lambda: genai.GenerativeModel("gemini-2.0-flash", tools="google_search").generate_content(prompt),
+        # Gemini 1.5 style tool
+        lambda: genai.GenerativeModel("gemini-1.5-pro", tools={"google_search_retrieval": {}}).generate_content(prompt),
+    ]
+    for attempt in grounded_attempts:
+        try:
+            response = attempt()
+            raw = response.text.strip()
+            return re.sub(r"^```json\s*|^```\s*|```$", "", raw, flags=re.MULTILINE).strip()
+        except Exception:
+            continue
+    # Ungrounded fallback — still useful (suggests known portals/companies) but not live
+    return _call_ai(prompt)
+
+
+def ai_discover_tenders(countries: list, focus: str) -> list:
+    """Use Gemini + Google Search to discover private-sector and parastatal
+    tenders/RFPs not covered by government portals. Returns a list of dicts."""
+    prompt = f"""You are a tender discovery researcher for Cyber Retaliator Solutions (CRS),
+a cyber security distributor and IBM/RedHat/SUSE/CompTIA training partner in Africa.
+
+Search the web for CURRENTLY OPEN tenders, RFPs, RFQs, and EOIs that match this focus:
+{focus}
+
+Target countries: {', '.join(countries)}
+
+PRIORITIZE non-government sources that national procurement portals do NOT cover:
+- Banks and financial institutions (e.g. procurement pages of major African banks)
+- Telecommunications companies
+- Mining houses and energy companies
+- Universities and private hospitals
+- Parastatals / state-owned enterprises with their own procurement portals
+- Development finance institutions (AfDB, World Bank country procurement notices)
+
+Return ONLY a JSON array (no other text). Each element:
+{{
+  "title": "tender title",
+  "organisation": "issuing company/org",
+  "country": "country name",
+  "sector": "banking/telco/mining/parastatal/etc",
+  "closing_date": "YYYY-MM-DD or null if unknown",
+  "description": "1-2 sentence summary",
+  "source_url": "direct URL to the tender notice or null"
+}}
+
+Only include tenders you have real evidence of from search results. If you cannot find
+any current ones, return tenders from organisations' known procurement pages with
+closing_date null and note "verify on portal" in the description. Maximum 15 results.
+"""
+    raw = _call_ai_grounded(prompt)
+    parsed = json.loads(raw)
+    return parsed if isinstance(parsed, list) else []
+
 # ─────────────────────────────────────────────
 # 5. DATA FETCHING
 # ─────────────────────────────────────────────
@@ -291,25 +350,39 @@ def _is_relevant(text: str) -> bool:
 def _upsert(records: list, country: str, label: str, status_container):
     if not records:
         return 0
-    ok = 0
+    ok, failed, first_err = 0, 0, None
     for r in records:
         try:
             supabase.table("sa_tenders").upsert(r, on_conflict="tender_number,department_name").execute()
             ok += 1
         except Exception as e:
-            pass
-    status_container(f"  ✅ {country} — {label}: {ok} records saved")
+            failed += 1
+            if first_err is None:
+                first_err = str(e)[:200]
+    msg = f"  ✅ {country} — {label}: {ok} saved"
+    if failed:
+        msg += f" | ❌ {failed} failed (first error: {first_err})"
+    status_container(msg)
     return ok
 
-def _get_json(url, params=None, headers=None, timeout=20):
-    import requests
+def _get_json(url, params=None, headers=None, timeout=20, retries=3):
+    """GET JSON with retries for transient DNS/connection failures."""
+    import requests, time
     h = {"User-Agent": "Mozilla/5.0", "X-Requested-With": "XMLHttpRequest",
          "Accept": "application/json"}
     if headers:
         h.update(headers)
-    r = requests.get(url, params=params, headers=h, timeout=timeout)
-    r.raise_for_status()
-    return r.json()
+    last_err = None
+    for attempt in range(retries):
+        try:
+            r = requests.get(url, params=params, headers=h, timeout=timeout)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last_err = e
+            if attempt < retries - 1:
+                time.sleep(2 * (attempt + 1))  # 2s, 4s backoff
+    raise last_err
 
 def _get_html(url, timeout=20):
     import requests
@@ -380,6 +453,8 @@ def scrape_south_africa(out):
 
 OCDS_REGISTRY = {
     # country: (publication_id, flag)
+    # South Africa included as FALLBACK only — live eTenders API is primary
+    "South Africa": (143, "🇿🇦"),
     "Kenya":    (147, "🇰🇪"),
     "Ghana":    (85,  "🇬🇭"),
     "Tanzania": (152, "🇹🇿"),
@@ -497,14 +572,24 @@ def run_all_scrapers():
         lines.append(msg)
         log.markdown("\n\n".join(lines))
 
-    # South Africa: live eTenders API (most current)
+    # South Africa: live eTenders API (most current), registry fallback if unreachable
+    sa_ok = False
     try:
         scrape_south_africa(out_write)
+        sa_ok = True
     except Exception as e:
-        out_write(f"  ❌ South Africa crashed: {e}")
+        out_write(f"  ⚠️ South Africa live API unreachable: {e}")
+    if not sa_ok:
+        out_write("  🔁 Falling back to OCDS registry for South Africa…")
+        try:
+            scrape_ocds_country("South Africa", out_write)
+        except Exception as e:
+            out_write(f"  ❌ South Africa registry fallback also failed: {e}")
 
     # All other countries: OCDS registry (one robust source, consistent format)
     for country in OCDS_REGISTRY:
+        if country == "South Africa":
+            continue  # handled above with live API + fallback
         try:
             scrape_ocds_country(country, out_write)
         except Exception as e:
@@ -559,10 +644,11 @@ if selected_countries and "country" in df_filtered.columns:
     df_filtered = df_filtered[df_filtered["country"].isin(selected_countries)]
 
 # ─────────────────────────────────────────────
-tab1, tab2, tab3 = st.tabs([
+tab1, tab2, tab3, tab4 = st.tabs([
     "📢 Open Opportunities",
     "🏆 Competitive Intelligence",
-    "🤖 AI Tender Parser"
+    "🤖 AI Tender Parser",
+    "🔎 AI Discovery (Private Sector)"
 ])
 
 # ══════════════════════════════════════════════
@@ -584,11 +670,9 @@ with tab1:
     if "ai_score" in open_df.columns and open_df["ai_score"].notna().any():
         open_df = open_df.sort_values("ai_score", ascending=False, na_position="last")
 
-    # Build display frame
-    display_cols = ["country", "tender_number", "department_name", "title", "closing_date"]
-    if open_df["ai_score"].notna().any():
-        open_df["Fit Score"] = open_df["ai_score"].apply(score_badge)
-        display_cols.append("Fit Score")
+    # Build display frame — Fit Score column is always shown (⚪ — when unscored)
+    open_df["Fit Score"] = open_df["ai_score"].apply(score_badge)
+    display_cols = ["Fit Score", "country", "tender_number", "department_name", "title", "closing_date"]
 
     event = st.dataframe(
         open_df[display_cols],
@@ -764,3 +848,89 @@ with tab3:
 
     st.divider()
     st.caption("💡 Tip: You can also drag a PDF into the browser and copy-paste the text here.")
+
+# ══════════════════════════════════════════════
+# TAB 4 — AI DISCOVERY (PRIVATE SECTOR)
+# ══════════════════════════════════════════════
+with tab4:
+    st.subheader("🔎 AI-Powered Tender Discovery")
+    st.write(
+        "Government portals miss private-sector RFPs from banks, telcos, mining houses, "
+        "universities, and parastatals. Gemini searches the live web for these and "
+        "returns candidates you can review and save."
+    )
+
+    disc_col1, disc_col2 = st.columns([2, 3])
+    with disc_col1:
+        disc_countries = st.multiselect(
+            "Countries to search",
+            ["South Africa", "Kenya", "Nigeria", "Ghana", "Tanzania", "Uganda",
+             "Zambia", "Rwanda", "Botswana", "Namibia", "Zimbabwe"],
+            default=["South Africa", "Kenya", "Nigeria"],
+        )
+    with disc_col2:
+        disc_focus = st.text_input(
+            "Focus (what to look for)",
+            value="cybersecurity solutions, SOC services, penetration testing, "
+                  "IBM / Red Hat / CompTIA technical training, vulnerability management",
+        )
+
+    if st.button("🔎 Discover Tenders", disabled=not disc_countries):
+        with st.spinner("Gemini is searching the web — this can take up to a minute…"):
+            try:
+                found = ai_discover_tenders(disc_countries, disc_focus)
+                if found:
+                    st.session_state["discovered"] = found
+                    st.success(f"Found {len(found)} candidate tenders.")
+                else:
+                    st.info("No candidates found this run. Try broadening the focus or fewer countries.")
+            except json.JSONDecodeError:
+                st.error("Gemini returned an unexpected format — try running discovery again.")
+            except Exception as e:
+                st.error(f"Discovery failed: {e}")
+
+    # Review & save discovered tenders
+    if "discovered" in st.session_state and st.session_state["discovered"]:
+        st.divider()
+        st.subheader("Review Candidates")
+        st.caption("⚠️ AI-discovered results can include stale or incorrect listings — verify the source link before bidding.")
+
+        disc_df = pd.DataFrame(st.session_state["discovered"])
+        st.dataframe(disc_df, use_container_width=True, hide_index=True)
+
+        save_col1, save_col2 = st.columns(2)
+        with save_col1:
+            if st.button("💾 Save All to Database"):
+                import hashlib
+                saved = 0
+                for t in st.session_state["discovered"]:
+                    ref = t.get("source_url") or f"{t.get('organisation','')}{t.get('title','')}"
+                    tender_no = "AI-" + hashlib.md5(ref.encode()).hexdigest()[:10].upper()
+                    record = {
+                        "tender_number": tender_no,
+                        "department_name": t.get("organisation", "Unknown"),
+                        "title": str(t.get("title", ""))[:200],
+                        "description": t.get("description", ""),
+                        "category": f"Private Sector — {t.get('sector', 'unspecified')}",
+                        "compliance_requirements": "Verify on source portal",
+                        "portal_link": t.get("source_url") or "",
+                        "closing_date": t.get("closing_date"),
+                        "status": "Open",
+                        "award_status": "AI Discovered",
+                        "country": t.get("country", ""),
+                    }
+                    try:
+                        supabase.table("sa_tenders").upsert(
+                            record, on_conflict="tender_number,department_name"
+                        ).execute()
+                        saved += 1
+                    except Exception as e:
+                        st.error(f"Save failed for {t.get('title','')[:50]}: {e}")
+                st.success(f"Saved {saved}/{len(st.session_state['discovered'])} tenders. They now appear in Open Opportunities.")
+                del st.session_state["discovered"]
+                st.cache_data.clear()
+        with save_col2:
+            if st.button("🗑️ Discard Results"):
+                del st.session_state["discovered"]
+                st.rerun()
+                
