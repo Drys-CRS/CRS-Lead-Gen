@@ -73,7 +73,7 @@ supabase = init_connection()
 @st.cache_resource
 def init_gemini():
     genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-    return genai.GenerativeModel("gemini-1.5-pro")
+    return genai.GenerativeModel("gemini-2.5-flash")
 
 ai = init_gemini()
 
@@ -89,10 +89,16 @@ def _call_ai_grounded(prompt: str) -> str:
     """Call Gemini WITH Google Search grounding so it can find current web results.
     Falls back to ungrounded if grounding is unavailable on this API tier/model."""
     grounded_attempts = [
-        # Gemini 2.x style tool
-        lambda: genai.GenerativeModel("gemini-2.0-flash", tools="google_search").generate_content(prompt),
-        # Gemini 1.5 style tool
-        lambda: genai.GenerativeModel("gemini-1.5-pro", tools={"google_search_retrieval": {}}).generate_content(prompt),
+        # Gemini 2.5 Flash with Google Search grounding (current SDK syntax)
+        lambda: genai.GenerativeModel(
+            "gemini-2.5-flash",
+            tools=[{"google_search": {}}]
+        ).generate_content(prompt),
+        # Fallback: 2.5 Pro for higher quality grounded results
+        lambda: genai.GenerativeModel(
+            "gemini-2.5-pro",
+            tools=[{"google_search": {}}]
+        ).generate_content(prompt),
     ]
     for attempt in grounded_attempts:
         try:
