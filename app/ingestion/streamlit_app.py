@@ -87,11 +87,63 @@ else:
     ]
     
     # Render interactive data grid
+    # In your Streamlit app, right below where you load the data:
+import streamlit as st
+import pandas as pd
+
+# ... [Your existing Supabase connection and data loading code goes here] ...
+# Assuming your loaded data is stored in a Pandas DataFrame called 'df'
+
+st.title("CRS Target Pipeline: IT & Cybersecurity")
+
+# --- 1. Split the Data ---
+# We use the 'award_status' column to route the data into two separate dataframes
+df_pending = df[df['award_status'] != 'Awarded'].copy()
+df_won = df[df['award_status'] == 'Awarded'].copy()
+
+# --- 2. Shared Column Configuration ---
+# This keeps your clickable links and currency formatting consistent across both tables
+shared_config = {
+    "document_url": st.column_config.LinkColumn("Tender Document", display_text="Download PDF"),
+    "source_url": st.column_config.LinkColumn("Portal Link", display_text="View Portal"),
+    "award_value": st.column_config.NumberColumn("Award Value (ZAR)", format="R %d")
+}
+
+# --- 3. Build the Tabbed Interface ---
+tab1, tab2 = st.tabs(["🟢 Active Pipeline", "🏆 Competitive Intelligence"])
+
+with tab1:
+    st.subheader(f"Open Opportunities ({len(df_pending)})")
+    st.caption("Active IBM, Red Hat, CompTIA, and Cybersecurity tenders currently in evaluation.")
+    
+    # Hide the winner columns since these are still open
+    display_pending = df_pending.drop(columns=['winning_bidder', 'award_value'], errors='ignore')
+    
     st.dataframe(
-        display_df, 
-        use_container_width=True, 
+        display_pending,
+        column_config=shared_config,
         hide_index=True,
-        column_config={"Source Link": st.column_config.LinkColumn()}
+        use_container_width=True
+    )
+
+with tab2:
+    st.subheader(f"Awarded Contracts ({len(df_won)})")
+    st.caption("Track competitor wins and contract values for future renewal targeting.")
+    
+    # Rearrange columns to put the competitor and value front and center
+    cols = df_won.columns.tolist()
+    if 'winning_bidder' in cols and 'award_value' in cols:
+        cols.insert(2, cols.pop(cols.index('winning_bidder')))
+        cols.insert(3, cols.pop(cols.index('award_value')))
+        display_won = df_won[cols]
+    else:
+        display_won = df_won
+
+    st.dataframe(
+        display_won,
+        column_config=shared_config,
+        hide_index=True,
+        use_container_width=True
     )
 
     # Detailed Inspection Accordion View

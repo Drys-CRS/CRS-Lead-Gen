@@ -1,13 +1,21 @@
 import scrapy
 import json
 import os
+import re
 from supabase import create_client
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
+def normalize_ref(ref_string):
+    if not ref_string:
+        return "UNKNOWN"
+    clean_str = re.sub(r'[\s/]+', '-', ref_string.strip().upper())
+    return clean_str
+
 class ETenderSpider(scrapy.Spider):
     name = "etender_api"
+    # Pointing to example.com to bypass the broken National Treasury DNS
     start_urls = ["http://example.com"]
 
     def __init__(self, *args, **kwargs):
@@ -17,6 +25,8 @@ class ETenderSpider(scrapy.Spider):
         self.supabase = create_client(url, key)
 
     def parse(self, response):
+        self.logger.info("Bypassing broken Gov DNS. Loading mock eTender payload...")
+        
         # Comprehensive dataset across the major South African procurement tiers
         mock_json_data = """
         {
@@ -88,7 +98,8 @@ class ETenderSpider(scrapy.Spider):
             return
 
         for tender in tenders:
-            tender_no = tender.get("tenderNumber")
+            raw_tender_no = tender.get("tenderNumber")
+            tender_no = normalize_ref(raw_tender_no)
             
             self.logger.info(f"Processing regional target: {tender_no} [{tender.get('country')}]")
 
@@ -106,7 +117,10 @@ class ETenderSpider(scrapy.Spider):
             }
 
             try:
-                self.supabase.table("sa_tenders").insert(tender_data).execute()
-                self.logger.info(f"Successfully committed {tender_no} to the pipeline.")
+                self.supabase.table("sa_tenders").upsert(
+                    tender_data, 
+                    on_conflict="tender_number,department_name" 
+                ).execute()
+                self.logger.info(f"Successfully upserted {tender_no} into the pipeline.")
             except Exception as e:
                 self.logger.error(f"Database error writing {tender_no}: {e}")
