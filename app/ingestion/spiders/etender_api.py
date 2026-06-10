@@ -1,80 +1,89 @@
-import scrapy
+import requests
 import json
 import os
 from supabase import create_client
 from dotenv import load_dotenv
 
+# Load environment variables
 load_dotenv(override=True)
 
-class ETenderAPISpider(scrapy.Spider):
-    name = "etender_api"
-
-    # 1. Force Scrapy to ignore robots.txt just for this specific spider
-    custom_settings = {
-        'ROBOTSTXT_OBEY': False,
-        'LOG_LEVEL': 'DEBUG'
+def scrape_etenders():
+    print("🔥 STARTING ETENDERS API PULL 🔥")
+    
+    url = "https://www.etenders.gov.za/Home/PaginatedTenderOpportunities"
+    
+    # DataTables GET request parameters (flattened for URL encoding)
+    params = {
+        "draw": "1",
+        "start": "0",
+        "length": "1000",       # Pull up to 1000 records at once
+        "status": "1",          # 1 = Currently Advertised
+        "search[value]": "",
+        "search[regex]": "false",
+        "order[0][column]": "2",
+        "order[0][dir]": "desc"
     }
 
-    def start_requests(self):
-        self.logger.info("🔥 START_REQUESTS IS FIRING 🔥")
-        url = "https://www.etenders.gov.za/Home/PaginatedTenderOpportunities"
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'X-Requested-With': 'XMLHttpRequest',
+        'Accept': 'application/json, text/javascript, */*; q=0.01'
+    }
+
+    try:
+        # 1. Hit the API directly using GET and params
+        print("📡 Sending GET request with DataTables parameters...")
+        response = requests.get(url, params=params, headers=headers)
         
-        payload = {
-            "draw": 1,
-            "start": 0,
-            "length": 1000,
-            "status": 1,
-            "search": {"value": "", "regex": False},
-            "order": [{"column": 2, "dir": "desc"}]
-        }
+        print(f"✅ RESPONSE RECEIVED: HTTP Status {response.status_code}")
+        
+        if response.status_code != 200:
+            print(f"❌ Server Error: {response.text[:500]}") # Print first 500 chars of error
+            return
 
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'X-Requested-With': 'XMLHttpRequest',
-            'Content-Type': 'application/json; charset=UTF-8',
-            'Accept': 'application/json, text/javascript, */*; q=0.01'
-        }
-
-        # 2. dont_filter=True forces Scrapy to run this even if it thinks it already has
-        yield scrapy.Request(
-            url=url,
-            method="POST",
-            body=json.dumps(payload),
-            headers=headers,
-            callback=self.parse,
-            dont_filter=True 
-        )
-
-    def __init__(self, *args, **kwargs):
-        super(ETenderAPISpider, self).__init__(*args, **kwargs)
-        self.supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
-
-    def parse(self, response):
-        self.logger.info(f"✅ RESPONSE RECEIVED: HTTP Status {response.status}")
-        try:
-            data = json.loads(response.text)
-            tenders = data.get("data", [])
+        data = response.json()
+        tenders = data.get("data", [])
+        
+        print(f"🎯 Successfully pulled {len(tenders)} active tenders from the live API.")
+        
+        # 2. Connect to Supabase
+        url_env = os.getenv("SUPABASE_URL")
+        key_env = os.getenv("SUPABASE_KEY")
+        
+        if not url_env or not key_env:
+            print("🚨 SUPABASE URL OR KEY IS MISSING! Check your .env file.")
+            return
             
-            self.logger.info(f"🎯 Successfully pulled {len(tenders)} active tenders from the live API.")
-            
-            for tender in tenders:
-                tender_data = {
-                    "tender_number": tender.get("tender_No"),
-                    "department_name": tender.get("department"),
-                    "title": tender.get("description", "")[:200],
-                    "category": tender.get("category"),
-                    "issue_date": tender.get("date_Published"),
-                    "closing_date": tender.get("closing_Date"),
-                    "status": "Open",
-                    "award_status": "Published",
-                    "country": "South Africa"
-                }
+        supabase = create_client(url_env, key_env)
+        
+        # 3. Process and Upload
+        success_count = 0
+        for tender in tenders:
+            tender_data = {
+                "tender_number": tender.get("tender_No"),
+                "department_name": tender.get("department"),
+                "title": tender.get("description", "")[:200],
+                "category": tender.get("category"),
+                "issue_date": tender.get("date_Published"),
+                "closing_date": tender.get("closing_Date"),
+                "status": "Open",
+                "award_status": "Published",
+                "country": "South Africa"
+            }
 
-                # Upsert to Supabase
-                self.supabase.table("sa_tenders").upsert(
+            try:
+                supabase.table("sa_tenders").upsert(
                     tender_data, 
                     on_conflict="tender_number,department_name"
                 ).execute()
+                success_count += 1
+            except Exception as db_error:
+                print(f"⚠️ DB Upsert Failed for {tender.get('tender_No')}: {db_error}")
 
-        except Exception as e:
-            self.logger.error(f"❌ Failed to parse API data: {e}")
+        print(f"🚀 Pipeline Complete: {success_count} tenders pushed to Supabase.")
+
+    except Exception as e:
+        print(f"❌ Critical Pipeline Failure: {e}")
+
+if __name__ == "__main__":
+    scrape_etenders()
