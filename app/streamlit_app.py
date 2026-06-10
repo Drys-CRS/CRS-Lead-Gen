@@ -105,6 +105,56 @@ def _call_ai_grounded(prompt: str) -> str:
     return _call_ai(prompt)
 
 
+def ai_analyse_partners(awarded_df) -> list:
+    """Given a dataframe of awarded tenders, ask Gemini to identify which winning
+    companies look like strong CRS channel partners and explain why."""
+    # Build a concise data summary — cap at 60 rows to stay within token limits
+    sample = awarded_df[["winning_bidder", "title", "country", "award_value"]].dropna(
+        subset=["winning_bidder"]
+    ).head(60)
+
+    rows_text = sample.to_csv(index=False)
+
+    prompt = f"""You are a channel-partner strategist for Cyber Retaliator Solutions (CRS).
+
+CRS PROFILE:
+{CRS_PROFILE}
+
+Below is a CSV of companies that have been winning government and public-sector tenders
+in Africa for technology, security, and ICT-related work. Your job is to identify which
+of these companies CRS should approach as a channel partner, reseller, or systems
+integrator — companies that are already winning deals in the right space but may be
+missing CRS's vendor portfolio (Vectra, vRx, Aikido, Flare, SMBsecure, BeachheadSecure,
+IBM/RedHat/SUSE/CompTIA training, VAPT services).
+
+AWARDED TENDER DATA:
+{rows_text}
+
+For each recommended company, assess:
+1. Why they align with CRS's portfolio based on the tenders they're winning
+2. Partnership type that makes sense (reseller, referral, integration partner, training sub-contractor)
+3. A realistic outreach angle in one sentence
+
+Return ONLY a JSON array (no other text). Each element:
+{{
+  "company": "company name",
+  "country": "country",
+  "tenders_won": <integer — count from the data>,
+  "partnership_type": "reseller / referral / integration partner / training sub-contractor",
+  "why_aligned": "1-2 sentences on fit",
+  "outreach_angle": "one sentence — what CRS should lead with",
+  "urgency": "high / medium / low"
+}}
+
+Return the top 10-15 most promising companies. Exclude companies that only won
+non-ICT tenders (construction, catering, stationery, vehicles, etc.).
+Only return the JSON array.
+"""
+    raw = _call_ai(prompt)
+    parsed = json.loads(raw)
+    return parsed if isinstance(parsed, list) else []
+
+
 def ai_discover_tenders(countries: list, focus: str) -> list:
     """Use Gemini + Google Search to discover private-sector and parastatal
     tenders/RFPs not covered by government portals. Returns a list of dicts."""
@@ -733,7 +783,13 @@ with tab1:
 # TAB 2 — COMPETITIVE INTELLIGENCE
 # ══════════════════════════════════════════════
 with tab2:
-    st.subheader("Historical Awarded Tenders")
+    st.subheader("🤝 Potential CRS Channel Partners")
+    st.write(
+        "These companies are winning ICT and security tenders across Africa. "
+        "Gemini analyses their win patterns to recommend which ones CRS should approach "
+        "as resellers, integration partners, or training sub-contractors."
+    )
+
     awarded_df = df_filtered[df_filtered["status"] == "Awarded"].copy()
 
     if competitor_search:
@@ -742,38 +798,76 @@ with tab2:
         ]
 
     if awarded_df.empty:
-        st.info("No awarded tenders match your current filters.")
+        st.info("No awarded tenders in the current filters. Run a data refresh to populate this tab.")
     else:
-        # Clean currency
-        awarded_df["clean_val"] = (
-            awarded_df["award_value"].astype(str)
-            .str.replace(r"[R\s,]", "", regex=True)
-        )
-        awarded_df["numeric_value"] = pd.to_numeric(awarded_df["clean_val"], errors="coerce").fillna(0)
+        # ── AI Partner Analysis ──────────────────────────────────────────────
+        col_run, col_info = st.columns([2, 5])
+        with col_run:
+            run_analysis = st.button(
+                "🤖 Analyse Partners with AI",
+                help="Gemini reviews all awarded tender winners and recommends partner candidates"
+            )
+        with col_info:
+            st.caption(
+                f"Based on {len(awarded_df[awarded_df['winning_bidder'].notna()])} awarded tenders "
+                f"across {awarded_df['country'].nunique() if 'country' in awarded_df.columns else '?'} countries."
+            )
 
-        # Pivot — group by country + bidder so values can't be compared cross-currency
-        pivot = awarded_df.pivot_table(
-            values="numeric_value",
-            index=["country", "winning_bidder"] if "country" in awarded_df.columns else "winning_bidder",
-            aggfunc={"numeric_value": ["sum", "count"]}
-        )
-        pivot.columns = ["Tender Count", "Total Won (Value)"]
-        pivot = pivot.sort_values("Total Won (Value)", ascending=False)
+        if run_analysis:
+            with st.spinner("Gemini is analysing winning companies…"):
+                try:
+                    partners = ai_analyse_partners(awarded_df)
+                    st.session_state["partner_analysis"] = partners
+                except json.JSONDecodeError:
+                    st.error("Gemini returned an unexpected format. Try again.")
+                except Exception as e:
+                    st.error(f"Analysis failed: {e}")
 
-        st.subheader("Competitor Market Share")
-        st.caption("⚠️ Values are in local currency per country — don't sum across countries.")
-        st.dataframe(
-            pivot.style.format({"Total Won (Value)": "{:,.0f}"}),
-            use_container_width=True
-        )
+        if "partner_analysis" in st.session_state and st.session_state["partner_analysis"]:
+            partners = st.session_state["partner_analysis"]
 
-        st.divider()
+            # Urgency colour coding
+            URGENCY_ICON = {"high": "🔴", "medium": "🟡", "low": "🟢"}
+
+            # Summary cards row
+            high = [p for p in partners if p.get("urgency") == "high"]
+            med  = [p for p in partners if p.get("urgency") == "medium"]
+            low  = [p for p in partners if p.get("urgency") == "low"]
+
+            m1, m2, m3 = st.columns(3)
+            m1.metric("🔴 High Priority", len(high))
+            m2.metric("🟡 Medium Priority", len(med))
+            m3.metric("🟢 Lower Priority", len(low))
+
+            st.divider()
+
+            # Expandable cards — one per partner
+            for p in sorted(partners, key=lambda x: {"high": 0, "medium": 1, "low": 2}.get(x.get("urgency","low"), 2)):
+                urgency_icon = URGENCY_ICON.get(p.get("urgency", "low"), "⚪")
+                ptype = p.get("partnership_type", "")
+                company = p.get("company", "Unknown")
+                country = p.get("country", "")
+                wins = p.get("tenders_won", "?")
+
+                with st.expander(
+                    f"{urgency_icon} **{company}** — {country}  |  {wins} wins  |  {ptype}"
+                ):
+                    st.write(f"**Why aligned:** {p.get('why_aligned', '')}")
+                    st.info(f"💬 Outreach angle: {p.get('outreach_angle', '')}")
+
+            st.divider()
+
+        # ── Award Detail table (always visible) ─────────────────────────────
         st.subheader("Award Detail")
-        st.dataframe(
-            awarded_df[["country", "tender_number", "department_name", "winning_bidder", "award_value", "title"]],
-            use_container_width=True,
-            hide_index=True,
-        )
+        with st.expander("Show full award list", expanded=False):
+            st.dataframe(
+                awarded_df[[
+                    "country", "tender_number", "department_name",
+                    "winning_bidder", "award_value", "title"
+                ]].sort_values("country"),
+                use_container_width=True,
+                hide_index=True,
+            )
 
 
 # ══════════════════════════════════════════════
