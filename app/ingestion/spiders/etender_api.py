@@ -1,7 +1,6 @@
 import scrapy
 import json
 import os
-import re
 from supabase import create_client
 from dotenv import load_dotenv
 
@@ -9,43 +8,46 @@ load_dotenv(override=True)
 
 class ETenderAPISpider(scrapy.Spider):
     name = "etender_api"
-    start_urls = ["https://ocds.etenders.gov.za/api/tenders"]
+    # Target the newly discovered live API endpoint
+    start_urls = ["https://www.etenders.gov.za/Home/PaginatedTenderOpportunities"]
+
+    def start_requests(self):
+        # Send a POST request with 'status=1' (Currently Advertised)
+        yield scrapy.FormRequest(
+            url="https://www.etenders.gov.za/Home/PaginatedTenderOpportunities",
+            formdata={'status': '1'},
+            callback=self.parse
+        )
 
     def __init__(self, *args, **kwargs):
         super(ETenderAPISpider, self).__init__(*args, **kwargs)
         self.supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 
     def parse(self, response):
-        # 1. ATTEMPT LIVE FETCH
-        if response.status == 200:
-            try:
-                data = response.json()
-                tenders = data.get("data", [])
-                if tenders:
-                    self.logger.info(f"Live API Success: Captured {len(tenders)} tenders.")
-                    for t in tenders: self.upsert_tender(t)
-                    return
-            except:
-                self.logger.warning("Live API JSON invalid. Falling back to mock data.")
-        else:
-            self.logger.warning(f"Live API returned status {response.status}. Falling back to mock data.")
+        try:
+            data = json.loads(response.text)
+            tenders = data.get("data", [])
+            
+            self.logger.info(f"Successfully pulled {len(tenders)} active tenders from the live API.")
+            
+            for tender in tenders:
+                tender_data = {
+                    "tender_number": tender.get("tender_No"),
+                    "department_name": tender.get("department"),
+                    "title": tender.get("description", "")[:200],
+                    "category": tender.get("category"),
+                    "issue_date": tender.get("date_Published"),
+                    "closing_date": tender.get("closing_Date"),
+                    "status": "Open",
+                    "award_status": "Published",
+                    "country": "South Africa"
+                }
 
-        # 2. FALLBACK TO MOCK DATA (If live fails)
-        self.logger.info("Injecting Mock Data into pipeline...")
-        mock_data = [
-            {"tenderNumber": "E-KM3241-CS", "department": "Eskom", "title": "Firewall Refresh", "description": "Enterprise security upgrade"},
-            {"tenderNumber": "TN-2026-05", "department": "Transnet", "title": "EDR Licensing", "description": "Endpoint security rollout"}
-        ]
-        for t in mock_data: self.upsert_tender(t)
+                # Upsert to Supabase
+                self.supabase.table("sa_tenders").upsert(
+                    tender_data, 
+                    on_conflict="tender_number,department_name"
+                ).execute()
 
-    def upsert_tender(self, tender):
-        # Normalization and Supabase upsert logic here...
-        tender_no = re.sub(r'[\s/]+', '-', str(tender.get("tenderNumber")).upper())
-        tender_data = {
-            "tender_number": tender_no,
-            "department_name": tender.get("department", "Unknown"),
-            "title": tender.get("title", "No Title"),
-            "status": "Open",
-            "country": "South Africa"
-        }
-        self.supabase.table("sa_tenders").upsert(tender_data, on_conflict="tender_number,department_name").execute()
+        except Exception as e:
+            self.logger.error(f"Failed to parse API data: {e}")
