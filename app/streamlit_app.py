@@ -103,3 +103,4 @@ else:
             pivot_table = awarded_df.pivot_table(
                 values='numeric_value', 
                 index='winning_
+            )
