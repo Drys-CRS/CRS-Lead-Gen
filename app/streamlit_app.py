@@ -848,7 +848,12 @@ def run_all_scrapers():
 # ─────────────────────────────────────────────
 st.title("🛡️ CRS Competitive Intelligence Dashboard")
 
-# Sidebar
+# Sidebar — logo + controls
+import os as _os
+_logo_path = _os.path.join(_os.path.dirname(__file__), "assets", "crs_logo.png")
+if _os.path.exists(_logo_path):
+    st.sidebar.image(_logo_path, use_container_width=True)
+
 st.sidebar.header("Controls")
 st.sidebar.caption(_provider_status())
 if st.sidebar.button("🔄 Refresh All Countries"):
