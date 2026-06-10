@@ -60,3 +60,4 @@ try:
                 st.dataframe(
                     display_pending,
                     column_config=shared_config,
+                )
