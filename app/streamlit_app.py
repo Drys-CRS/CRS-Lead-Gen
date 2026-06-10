@@ -17,20 +17,43 @@ st.set_page_config(page_title="CRS Competitive Intelligence", layout="wide")
 #    Gemini uses this when scoring and matching.
 # ─────────────────────────────────────────────
 CRS_PROFILE = """
-Company: CRS (Competitive Risk Solutions)
-Core capabilities:
-  - Cybersecurity consulting and managed services
-  - Risk assessment and compliance (POPIA, ISO 27001, NIST)
-  - Penetration testing and vulnerability management
-  - Security awareness training
-  - Incident response and forensics
-  - IT governance and audit support
-  - Software development and systems integration
+Company: Cyber Retaliator Solutions (CRS)
+Head Office: Centurion, South Africa. Training centres in Centurion, Midrand, Sandton, Cape Town.
+Profile: Value Added Cyber Security Distributor and Authorized Training Delivery Partner
+operating globally with 20+ years of experience. Serves reseller, managed services, and
+system integration channels across Africa.
 
-Target sectors: Government, financial services, healthcare, education
-Preferred contract value: R500,000 – R50,000,000
-Certifications: (add your actual certs here)
-Location: South Africa — national coverage
+── TECHNICAL TRAINING (Authorized Delivery Partner) ──
+- IBM Technical Training (incl. z/OS, IBM i, IBM Power, mainframe skills)
+- Red Hat Learning (RHEL, OpenShift, certifications: RHCSA, RHCE)
+- SUSE Technical Product Training
+- CompTIA programmes (A+, Network+, Security+, CySA+ — recruiting, training, certifying students)
+- Agile training
+- AI / emerging technology training
+
+── CYBER SECURITY SOLUTIONS (Distribution & Services) ──
+- Vectra AI: XDR/NDR/ITDR/CDR — AI-powered network & identity threat detection and response,
+  SOC enablement, M365/AWS/Azure AD attack detection
+- vRx (Vicarius): vulnerability management + patch management, auto-remediation
+- Strobes Security: CTEM platform — attack surface management, pentesting-as-a-service (PTaaS),
+  risk-based vulnerability management, application security posture management
+- Aikido: developer-first AppSec — SAST, DAST, SCA, secrets detection, IaC scanning,
+  container scanning, cloud posture (CSPM), AI code review
+- Flare: threat exposure management — dark web monitoring, leaked credential detection,
+  brand protection, supply chain ransomware monitoring, takedown services
+- BeachheadSecure / SMBsecure: endpoint encryption (BitLocker/FileVault), data access control,
+  remote wipe, USB port control, MFA, POPIA compliance reporting
+- Telivy: cyber risk discovery & attack surface management for MSSPs
+- BlueFlag Security: identity-centric SDLC / software supply chain security
+- Cyber Risk Essentials: phishing simulation & cyber awareness training
+- VAPT services: third-party vulnerability and penetration testing through the channel
+
+── TARGET MARKETS ──
+Government, financial services, healthcare, education, enterprises across Africa.
+Strong fit: tenders for cybersecurity solutions/services, technical training delivery
+(especially IBM/RedHat/SUSE/CompTIA), SOC services, vulnerability management,
+security awareness, and POPIA/ISO 27001 compliance support.
+Weak fit: pure hardware supply, civil works, non-ICT goods.
 """
 
 # ─────────────────────────────────────────────
@@ -200,21 +223,70 @@ def score_badge(score):
 # ─────────────────────────────────────────────
 
 TARGET_KEYWORDS = [
-    "cyber", "EDR", "firewall", "network", "threat", "vulnerability",
-    "training", "comptia", "ibm", "red hat", "ict ", "information technology",
-    "cloud", "server", "endpoint", "infrastructure", "data center",
-    "software", "hardware", "NDR", "IDR", "SAST", "VAPT",
-    "penetration testing", "cybersecurity", "cyber security", "cyber risk",
-    "cyber defense", "cyber defence", "cyber incident response",
-    "cyber threat intelligence", "SOC", "patch management",
-    "IT training", "information security", "zero trust", "SIEM",
-    "identity and access management", "IAM", "application security",
-    "cloud security", "network security", "endpoint security",
+    # ── Technical Training (IBM / RedHat / SUSE / CompTIA / AI) ──
+    "ibm training", "ibm technical training", "ibm certification",
+    "red hat training", "redhat training", "red hat certification", "rhcsa", "rhce",
+    "suse training", "suse certification", "linux training", "linux certification",
+    "comptia", "security+", "network+", "a+ certification", "cysa",
+    "ai training", "artificial intelligence training", "machine learning training",
+    "technical training", "ict training", "it training", "cybersecurity training",
+    "cyber security training", "information security training", "security awareness training",
+    "training and certification", "skills development", "capacity building ict",
+    "learnership ict", "training provider", "accredited training",
+    # ── Platform / OS skills CRS trains on ──
+    "z/os", "ibm i", "ibm power", "mainframe", "red hat", "redhat", "suse", "rhel",
+    # ── NDR / XDR / Threat Detection (Vectra) ──
+    "ndr", "network detection and response", "xdr", "extended detection",
+    "threat detection", "threat hunting", "attack detection", "intrusion detection",
+    "cloud detection and response", "identity threat detection", "itdr",
+    "managed detection", "mdr", "soc", "security operations centre", "security operations center",
+    # ── Vulnerability & Patch Management (vRx / Strobes / Telivy) ──
+    "vulnerability management", "vulnerability assessment", "vulnerability scanning",
+    "patch management", "penetration testing", "pentest", "vapt",
+    "attack surface management", "risk based vulnerability", "ctem",
+    "threat exposure management", "security assessment", "security audit",
+    # ── AppSec / DevSecOps (Aikido / BlueFlag) ──
+    "application security", "sast", "dast", "sca", "devsecops",
+    "code security", "secure development", "software supply chain",
+    "container security", "cloud security posture", "cspm", "secrets detection",
+    # ── Data Protection & Endpoint (BeachheadSecure / SMBsecure) ──
+    "endpoint security", "endpoint protection", "edr", "encryption",
+    "data protection", "data security", "data loss prevention", "dlp",
+    "bitlocker", "mobile device management", "mdm", "popia compliance",
+    "multi-factor authentication", "mfa", "access control",
+    # ── Threat Intel / Dark Web (Flare) ──
+    "threat intelligence", "cyber threat intelligence", "dark web monitoring",
+    "digital risk protection", "brand protection", "credential monitoring",
+    "leaked credentials", "ransomware", "takedown",
+    # ── Phishing & Awareness (Cyber Risk Essentials) ──
+    "phishing simulation", "phishing awareness", "cyber awareness",
+    "security culture", "awareness programme", "awareness program",
+    # ── General cyber & ICT infrastructure ──
+    "cyber", "cybersecurity", "cyber security", "cyber risk", "cyber defence", "cyber defense",
+    "incident response", "cyber incident", "firewall", "siem",
+    "security orchestration", "soar", "zero trust",
+    "identity and access management", "iam", "network security", "cloud security",
+    "information security", "infosec", "iso 27001", "nist",
+    "information technology", "ict", "ict infrastructure",
+    "software licence", "software license", "software procurement",
+    "server", "cloud", "infrastructure", "data center", "data centre",
 ]
+
+import re as _re
+
+# Pre-compile: short keywords (<=5 chars) use word boundaries to avoid
+# false positives like "ndr" matching inside "laundry" or "iam" in "diameter".
+_KW_PATTERNS = []
+for _kw in TARGET_KEYWORDS:
+    _k = _kw.lower().strip()
+    if len(_k) <= 5:
+        _KW_PATTERNS.append(_re.compile(r"\b" + _re.escape(_k) + r"\b"))
+    else:
+        _KW_PATTERNS.append(_re.compile(_re.escape(_k)))
 
 def _is_relevant(text: str) -> bool:
     lower = text.lower()
-    return any(kw.lower() in lower for kw in TARGET_KEYWORDS)
+    return any(p.search(lower) for p in _KW_PATTERNS)
 
 def _upsert(records: list, country: str, label: str, status_container):
     if not records:
