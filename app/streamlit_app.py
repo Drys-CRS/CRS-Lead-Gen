@@ -846,13 +846,10 @@ def run_all_scrapers():
 # ─────────────────────────────────────────────
 # 9. MAIN DASHBOARD
 # ─────────────────────────────────────────────
-# Logo — top-left of main area, fixed half-width
-import os as _os
-_logo_path = _os.path.join(_os.path.dirname(__file__), "assets", "crs_logo.png")
-_logo_cols = st.columns([1, 4])
-with _logo_cols[0]:
-    if _os.path.exists(_logo_path):
-        st.image(_logo_path, width=140)
+# Logo — sidebar top, compact
+_logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "crs_logo.png")
+if os.path.exists(_logo_path):
+    st.sidebar.image(_logo_path, width=160)
 
 st.title("🛡️ CRS Competitive Intelligence Dashboard")
 
@@ -1006,19 +1003,14 @@ with tab2:
 
     # Apply 12-month date range filter
     if "issue_date" in awarded_df.columns:
-        # Convert everything to ISO string for safe cross-type comparison
-        _from_str = awarded_date_from.isoformat()
-        _to_str   = awarded_date_to.isoformat()
-        awarded_df["_award_date_str"] = pd.to_datetime(
-            awarded_df["issue_date"], errors="coerce"
-        ).dt.strftime("%Y-%m-%d")
-        awarded_df = awarded_df[
-            awarded_df["_award_date_str"].isna() |
-            (
-                (awarded_df["_award_date_str"] >= _from_str) &
-                (awarded_df["_award_date_str"] <= _to_str)
-            )
-        ].drop(columns=["_award_date_str"])
+        try:
+            # Convert sidebar date objects and df column all to pd.Timestamp for safe comparison
+            _from_ts = pd.Timestamp(awarded_date_from)
+            _to_ts   = pd.Timestamp(awarded_date_to)
+            _dates   = pd.to_datetime(awarded_df["issue_date"], errors="coerce")
+            awarded_df = awarded_df[_dates.isna() | ((_dates >= _from_ts) & (_dates <= _to_ts))]
+        except Exception:
+            pass  # if date filtering fails, show all records rather than crash
 
     if competitor_search:
         awarded_df = awarded_df[
