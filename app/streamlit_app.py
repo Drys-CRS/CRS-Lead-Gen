@@ -902,11 +902,12 @@ if selected_countries and "country" in df_filtered.columns:
     df_filtered = df_filtered[df_filtered["country"].isin(selected_countries)]
 
 # ─────────────────────────────────────────────
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "📢 Open Opportunities",
     "🏆 Competitive Intelligence",
     "🤖 AI Tender Parser",
-    "🔎 AI Discovery (Private Sector)"
+    "🔎 AI Discovery (Private Sector)",
+    "🎯 Lead Intelligence"
 ])
 
 # ══════════════════════════════════════════════
@@ -1247,3 +1248,584 @@ with tab4:
             if st.button("🗑️ Discard Results"):
                 del st.session_state["discovered"]
                 st.rerun()
+
+# ══════════════════════════════════════════════
+# TAB 5 — LEAD INTELLIGENCE
+# ══════════════════════════════════════════════
+with tab5:
+    import hashlib as _hashlib
+
+    st.subheader("🎯 Lead Intelligence")
+    st.write(
+        "Find companies and decision-makers showing buying signals for CRS solutions. "
+        "Sources: Reddit pain-point threads, African tech news, JSE-listed ICT companies, "
+        "and Apollo contact search — all free."
+    )
+
+    # ── Credit tracker ──────────────────────────────────────────────────────
+    if "apollo_credits_used" not in st.session_state:
+        st.session_state["apollo_credits_used"] = 0
+    APOLLO_MONTHLY_BUDGET = 75
+    credits_left = APOLLO_MONTHLY_BUDGET - st.session_state["apollo_credits_used"]
+    cred_col1, cred_col2, cred_col3 = st.columns(3)
+    cred_col1.metric("Apollo Credits Budget", APOLLO_MONTHLY_BUDGET)
+    cred_col2.metric("Credits Used This Session", st.session_state["apollo_credits_used"])
+    cred_col3.metric("Credits Remaining", credits_left, delta_color="inverse")
+    st.caption("⚠️ Apollo credits reset monthly. Organization enrichment costs 1 credit each — people search is free.")
+
+    st.divider()
+
+    # ── Search configuration ─────────────────────────────────────────────────
+    cfg_col1, cfg_col2 = st.columns(2)
+    with cfg_col1:
+        lead_countries = st.multiselect(
+            "Target countries",
+            ["South Africa", "Kenya", "Nigeria", "Ghana", "Tanzania", "Uganda", "Zambia", "Rwanda"],
+            default=["South Africa", "Kenya", "Nigeria"]
+        )
+        job_titles = st.multiselect(
+            "Decision-maker titles to find",
+            ["CISO", "Chief Information Security Officer", "CTO", "Chief Technology Officer",
+             "IT Manager", "IT Director", "Head of IT", "Head of Cybersecurity",
+             "Security Manager", "Security Architect", "Procurement Manager",
+             "ICT Manager", "Digital Transformation Manager", "Head of Infrastructure"],
+            default=["CISO", "CTO", "IT Director", "Head of Cybersecurity", "IT Manager"]
+        )
+    with cfg_col2:
+        solution_focus = st.multiselect(
+            "Solution focus (for sentiment matching)",
+            ["cybersecurity", "endpoint protection", "vulnerability management",
+             "SIEM", "SOC", "penetration testing", "security training",
+             "IBM training", "Red Hat", "cloud security", "ransomware",
+             "data protection", "POPIA compliance", "network security"],
+            default=["cybersecurity", "endpoint protection", "SOC", "ransomware", "POPIA compliance"]
+        )
+        include_jse = st.checkbox("Include JSE-listed ICT companies", value=True)
+        enrich_orgs = st.checkbox(
+            f"Enrich top companies via Apollo (uses credits — {credits_left} left)",
+            value=False
+        )
+
+    run_leads = st.button("🎯 Find Leads", type="primary", disabled=not lead_countries)
+
+    # ────────────────────────────────────────────────────────────────────────
+    # HELPER FUNCTIONS (scoped inside tab so they share session state)
+    # ────────────────────────────────────────────────────────────────────────
+
+    def _apollo_headers():
+        key = st.secrets.get("APOLLO_API_KEY", "")
+        return {"x-api-key": key, "Content-Type": "application/json", "accept": "application/json"}
+
+    def _search_reddit_signals(keywords: list, limit: int = 10) -> list:
+        """Search Reddit public JSON API for buying-signal posts. No key needed."""
+        import requests, time
+        results = []
+        query = " OR ".join(f'"{k}"' for k in keywords[:4])
+        url = "https://www.reddit.com/search.json"
+        params = {"q": query, "sort": "new", "t": "month", "limit": limit, "type": "link"}
+        try:
+            r = requests.get(url, params=params,
+                             headers={"User-Agent": "CRS-LeadGen/1.0"}, timeout=15)
+            if r.ok:
+                for post in r.json().get("data", {}).get("children", []):
+                    d = post.get("data", {})
+                    results.append({
+                        "source": "Reddit",
+                        "title": d.get("title", ""),
+                        "url": f"https://reddit.com{d.get('permalink','')}",
+                        "subreddit": d.get("subreddit", ""),
+                        "score": d.get("score", 0),
+                        "text": d.get("selftext", "")[:500],
+                        "created": d.get("created_utc"),
+                    })
+        except Exception as e:
+            st.toast(f"Reddit fetch error: {e}")
+        return results
+
+    def _search_news(keywords: list, countries: list, limit: int = 20) -> list:
+        """NewsAPI free tier — African tech & cyber news."""
+        import requests
+        key = st.secrets.get("NEWSAPI_KEY", "")
+        if not key:
+            return []
+        query = " OR ".join(keywords[:4])
+        # Add country context
+        country_terms = " OR ".join(countries[:3])
+        full_query = f"({query}) AND ({country_terms})"
+        try:
+            r = requests.get("https://newsapi.org/v2/everything", params={
+                "q": full_query, "sortBy": "publishedAt", "language": "en",
+                "pageSize": limit, "apiKey": key,
+            }, timeout=15)
+            if r.ok:
+                return [{
+                    "source": f"News: {a.get('source',{}).get('name','')}",
+                    "title": a.get("title",""),
+                    "url": a.get("url",""),
+                    "text": a.get("description","") or "",
+                    "published": a.get("publishedAt","")[:10],
+                } for a in r.json().get("articles", [])]
+        except Exception as e:
+            st.toast(f"NewsAPI error: {e}")
+        return []
+
+    def _jse_ict_companies() -> list:
+        """Return a curated list of JSE-listed ICT / financial services companies
+        that are strong CRS prospects — sourced from Wikipedia JSE list."""
+        return [
+            {"name": "Datatec", "ticker": "DTC", "sector": "ICT Solutions & Services", "domain": "datatec.com"},
+            {"name": "BCX (EOH subsidiary)", "ticker": "EOH", "sector": "ICT", "domain": "bcx.co.za"},
+            {"name": "EOH Holdings", "ticker": "EOH", "sector": "ICT Services", "domain": "eoh.co.za"},
+            {"name": "Dimension Data (NTT)", "ticker": "N/A", "sector": "ICT", "domain": "dimensiondata.com"},
+            {"name": "Telkom SA", "ticker": "TKG", "sector": "Telco/ICT", "domain": "telkom.co.za"},
+            {"name": "MTN Group", "ticker": "MTN", "sector": "Telco", "domain": "mtn.com"},
+            {"name": "Vodacom", "ticker": "VOD", "sector": "Telco", "domain": "vodacom.co.za"},
+            {"name": "FirstRand (FNB)", "ticker": "FSR", "sector": "Banking", "domain": "fnb.co.za"},
+            {"name": "Standard Bank", "ticker": "SBK", "sector": "Banking", "domain": "standardbank.co.za"},
+            {"name": "Absa Group", "ticker": "ABG", "sector": "Banking", "domain": "absa.co.za"},
+            {"name": "Nedbank", "ticker": "NED", "sector": "Banking", "domain": "nedbank.co.za"},
+            {"name": "Discovery Limited", "ticker": "DSY", "sector": "Insurance/Health", "domain": "discovery.co.za"},
+            {"name": "Old Mutual", "ticker": "OMU", "sector": "Financial Services", "domain": "oldmutual.com"},
+            {"name": "Sanlam", "ticker": "SLM", "sector": "Financial Services", "domain": "sanlam.co.za"},
+            {"name": "Capitec Bank", "ticker": "CPI", "sector": "Banking", "domain": "capitecbank.co.za"},
+            {"name": "Multichoice Group", "ticker": "MCG", "sector": "Media/Digital", "domain": "multichoice.com"},
+            {"name": "Altron", "ticker": "AEL", "sector": "ICT/Electronics", "domain": "altron.com"},
+            {"name": "Mustek", "ticker": "MST", "sector": "ICT Distribution", "domain": "mustek.co.za"},
+            {"name": "Alviva Holdings", "ticker": "AVV", "sector": "ICT Distribution", "domain": "alviva.com"},
+            {"name": "Adapt IT", "ticker": "ADI", "sector": "Software/ICT", "domain": "adaptit.co.za"},
+            {"name": "Bytes Technology Group", "ticker": "BYI", "sector": "Software/ICT", "domain": "bytes.co.za"},
+            {"name": "Liquid Intelligent Technologies", "ticker": "N/A", "sector": "Network/Cloud", "domain": "liquid.tech"},
+            {"name": "Atos South Africa", "ticker": "N/A", "sector": "ICT Services", "domain": "atos.net"},
+            {"name": "NEC XON", "ticker": "N/A", "sector": "ICT/Security", "domain": "necxon.com"},
+        ]
+
+    def _apollo_search_contacts(titles: list, countries: list) -> list:
+        """contacts/search — find existing contacts in your Apollo account by title/location."""
+        import requests
+        payload = {
+            "contact_titles": titles[:8],
+            "contact_locations": countries,
+            "per_page": 25,
+            "page": 1,
+        }
+        try:
+            r = requests.post(
+                "https://api.apollo.io/api/v1/contacts/search",
+                json=payload, headers=_apollo_headers(), timeout=20
+            )
+            if r.ok:
+                contacts = r.json().get("contacts", [])
+                return [{
+                    "name": f"{c.get('first_name','')} {c.get('last_name','')}".strip(),
+                    "title": c.get("title", ""),
+                    "company": (c.get("account") or {}).get("name", ""),
+                    "country": c.get("country", ""),
+                    "linkedin": c.get("linkedin_url", ""),
+                    "email": c.get("email", ""),
+                    "phone": c.get("sanitized_phone", ""),
+                    "apollo_id": c.get("id", ""),
+                    "source": "Apollo CRM",
+                } for c in contacts if c.get("first_name")]
+            else:
+                st.toast(f"Apollo contacts/search {r.status_code}: {r.text[:120]}")
+                return []
+        except Exception as e:
+            st.toast(f"Apollo contacts error: {e}")
+            return []
+
+    def _apollo_search_orgs(keywords: list, countries: list) -> list:
+        """organizations/search — find companies by keyword/location."""
+        import requests
+        payload = {
+            "q_organization_keyword_tags": keywords[:6],
+            "organization_locations": countries,
+            "per_page": 20,
+            "page": 1,
+        }
+        try:
+            r = requests.post(
+                "https://api.apollo.io/api/v1/organizations/search",
+                json=payload, headers=_apollo_headers(), timeout=20
+            )
+            if r.ok:
+                orgs = r.json().get("organizations", [])
+                return [{
+                    "name": o.get("name", ""),
+                    "domain": o.get("primary_domain", ""),
+                    "industry": o.get("industry", ""),
+                    "employees": o.get("estimated_num_employees"),
+                    "country": o.get("country", ""),
+                    "linkedin": o.get("linkedin_url", ""),
+                    "description": o.get("short_description", "")[:200],
+                    "apollo_id": o.get("id", ""),
+                } for o in orgs if o.get("name")]
+            else:
+                st.toast(f"Apollo orgs/search {r.status_code}: {r.text[:120]}")
+                return []
+        except Exception as e:
+            st.toast(f"Apollo orgs error: {e}")
+            return []
+
+    def _apollo_top_people(org_id: str, titles: list) -> list:
+        """mixed_people/organization_top_people — get key contacts at a specific org."""
+        import requests
+        payload = {
+            "organization_id": org_id,
+            "person_titles": titles[:5],
+            "per_page": 10,
+        }
+        try:
+            r = requests.post(
+                "https://api.apollo.io/api/v1/mixed_people/organization_top_people",
+                json=payload, headers=_apollo_headers(), timeout=20
+            )
+            if r.ok:
+                people = r.json().get("people", [])
+                return [{
+                    "name": f"{p.get('first_name','')} {p.get('last_name','')}".strip(),
+                    "title": p.get("title", ""),
+                    "linkedin": p.get("linkedin_url", ""),
+                    "email_status": p.get("email_status", ""),
+                    "apollo_id": p.get("id", ""),
+                    "source": "Apollo Top People",
+                } for p in people if p.get("first_name")]
+        except Exception as e:
+            st.toast(f"Apollo top people error: {e}")
+        return []
+
+    def _apollo_enrich_org(domain: str) -> dict:
+        """organizations/enrich — full enrichment by domain. Uses 1 credit."""
+        import requests
+        try:
+            r = requests.get(
+                "https://api.apollo.io/api/v1/organizations/enrich",
+                params={"domain": domain},
+                headers=_apollo_headers(), timeout=15
+            )
+            if r.ok:
+                org = r.json().get("organization", {})
+                st.session_state["apollo_credits_used"] += 1
+                return {
+                    "name": org.get("name", ""),
+                    "industry": org.get("industry", ""),
+                    "employees": org.get("estimated_num_employees"),
+                    "revenue": org.get("annual_revenue_printed", ""),
+                    "linkedin": org.get("linkedin_url", ""),
+                    "description": org.get("short_description", ""),
+                    "tech_stack": [t.get("name","") for t in (org.get("technology_names") or [])[:10]],
+                }
+        except Exception:
+            pass
+        return {}
+
+    def _apollo_create_contact(person: dict, account_id: str = None) -> bool:
+        """contacts/create — push a qualified lead into Apollo CRM."""
+        import requests
+        payload = {
+            "first_name": person.get("name","").split(" ")[0],
+            "last_name":  " ".join(person.get("name","").split(" ")[1:]) or ".",
+            "title":      person.get("title",""),
+            "organization_name": person.get("company",""),
+            "linkedin_url": person.get("linkedin",""),
+            "label_names": ["CRS Lead", "Dashboard Import"],
+        }
+        if account_id:
+            payload["account_id"] = account_id
+        try:
+            r = requests.post(
+                "https://api.apollo.io/api/v1/contacts/create",
+                json=payload, headers=_apollo_headers(), timeout=15
+            )
+            return r.ok
+        except Exception:
+            return False
+
+    def _apollo_bulk_create_accounts(companies: list) -> dict:
+        """accounts/bulk_create — push target companies into Apollo CRM (up to 25 at once)."""
+        import requests
+        accounts = [{"name": c.get("name",""), "domain": c.get("domain",""),
+                     "label_names": ["CRS Target", "Dashboard Import"]}
+                    for c in companies[:25] if c.get("name")]
+        if not accounts:
+            return {}
+        try:
+            r = requests.post(
+                "https://api.apollo.io/api/v1/accounts/bulk_create",
+                json={"accounts": accounts}, headers=_apollo_headers(), timeout=20
+            )
+            if r.ok:
+                created = r.json().get("accounts", [])
+                return {a.get("name",""): a.get("id","") for a in created}
+        except Exception as e:
+            st.toast(f"Apollo bulk account error: {e}")
+        return {}
+
+    def _ai_score_leads(signals: list, people: list, jse_companies: list, focus: list) -> dict:
+        """Use AI to score companies by buying signal strength and produce outreach angles."""
+        nl = "\n"
+        signal_summary = nl.join(
+            f"- [{s['source']}] {s['title'][:120]}" for s in signals[:20]
+        )
+        jse_names = nl.join(f"- {c['name']} ({c['sector']})" for c in jse_companies)
+        people_summary = nl.join(
+            f"- {p['name']}, {p['title']} at {p['company']} ({p['country']})"
+            for p in people[:20]
+        )
+
+        prompt = f"""You are a B2B sales strategist for Cyber Retaliator Solutions (CRS).
+
+CRS PROFILE:
+{CRS_PROFILE}
+
+SOLUTION FOCUS FOR THIS SEARCH: {', '.join(focus)}
+
+BUYING SIGNALS DETECTED (Reddit + News):
+{signal_summary or "No signals found."}
+
+JSE-LISTED COMPANIES IN SCOPE:
+{jse_names or "Not included."}
+
+PEOPLE FOUND VIA APOLLO:
+{people_summary or "No people found."}
+
+Your task:
+1. Identify the TOP 8 COMPANIES to target based on the signals, JSE list, and people found.
+   Prioritise companies where buying signals align with CRS's solutions.
+2. For each company, suggest the best OUTREACH ANGLE in one sentence.
+3. From the people list, identify the TOP 5 CONTACTS to reach out to first and why.
+4. Suggest 3 FOLLOW-UP ACTIONS CRS should take this week.
+
+Return ONLY a valid JSON object:
+{{
+  "top_companies": [
+    {{
+      "name": "company name",
+      "why": "1-2 sentence buying signal rationale",
+      "outreach_angle": "one sentence",
+      "urgency": "high/medium/low",
+      "domain": "company domain or null"
+    }}
+  ],
+  "top_contacts": [
+    {{
+      "name": "person name",
+      "title": "job title",
+      "company": "company",
+      "why_first": "why reach out to this person first",
+      "linkedin": "linkedin url or null"
+    }}
+  ],
+  "follow_up_actions": ["action 1", "action 2", "action 3"]
+}}
+"""
+        raw = _call_ai(prompt)
+        return json.loads(raw)
+
+    # ────────────────────────────────────────────────────────────────────────
+    # RUN LEAD SEARCH
+    # ────────────────────────────────────────────────────────────────────────
+    if run_leads:
+        with st.spinner("🔍 Gathering signals from Reddit, news, Apollo, and JSE data…"):
+
+            # 1. Buying signals — Reddit + News (no credits)
+            reddit_signals = _search_reddit_signals(solution_focus)
+            news_signals   = _search_news(solution_focus, lead_countries)
+            all_signals    = reddit_signals + news_signals
+            st.toast(f"📡 {len(all_signals)} buying signals collected")
+
+            # 2. Apollo CRM contacts (contacts/search — searches your existing CRM)
+            apollo_contacts = _apollo_search_contacts(job_titles, lead_countries)
+            st.toast(f"👤 {len(apollo_contacts)} contacts found in Apollo CRM")
+
+            # 3. Apollo org discovery (organizations/search — finds new target companies)
+            apollo_orgs = _apollo_search_orgs(solution_focus, lead_countries)
+            st.toast(f"🏢 {len(apollo_orgs)} organisations found via Apollo")
+
+            # 4. For top Apollo orgs, get key decision-makers (organization_top_people)
+            top_people = []
+            for org in apollo_orgs[:3]:   # limit to top 3 orgs to avoid hammering API
+                if org.get("apollo_id"):
+                    people = _apollo_top_people(org["apollo_id"], job_titles)
+                    for p in people:
+                        p["company"] = org["name"]
+                    top_people.extend(people)
+            if top_people:
+                st.toast(f"👥 {len(top_people)} key contacts found at Apollo orgs")
+
+            # 5. JSE companies
+            jse_list = _jse_ict_companies() if include_jse else []
+
+            # 6. Optional org enrichment (costs 1 credit each)
+            enriched = {}
+            if enrich_orgs and credits_left > 0:
+                enrich_limit = min(credits_left, 5)
+                st.toast(f"🔍 Enriching top {enrich_limit} JSE companies (uses {enrich_limit} credits)…")
+                for co in jse_list[:enrich_limit]:
+                    enriched[co["name"]] = _apollo_enrich_org(co["domain"])
+
+            # Merge all people sources for AI analysis
+            all_people = apollo_contacts + top_people
+
+            # 7. AI scoring and outreach recommendations
+            try:
+                ai_leads = _ai_score_leads(all_signals, all_people, jse_list + apollo_orgs, solution_focus)
+            except Exception as e:
+                st.error(f"AI analysis failed: {e}")
+                ai_leads = {}
+
+            st.session_state["lead_results"] = {
+                "signals":         all_signals,
+                "apollo_contacts": apollo_contacts,
+                "apollo_orgs":     apollo_orgs,
+                "top_people":      top_people,
+                "jse":             jse_list,
+                "enriched":        enriched,
+                "ai":              ai_leads,
+            }
+
+    # ────────────────────────────────────────────────────────────────────────
+    # DISPLAY RESULTS
+    # ────────────────────────────────────────────────────────────────────────
+    if "lead_results" in st.session_state:
+        res    = st.session_state["lead_results"]
+        ai_out = res.get("ai", {})
+        URGENCY = {"high": "🔴", "medium": "🟡", "low": "🟢"}
+
+        # ── Summary metrics ──────────────────────────────────────────────
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Buying Signals",    len(res.get("signals",[])))
+        m2.metric("Apollo CRM Contacts", len(res.get("apollo_contacts",[])))
+        m3.metric("Apollo Orgs Found", len(res.get("apollo_orgs",[])))
+        m4.metric("JSE Companies",     len(res.get("jse",[])))
+
+        st.divider()
+
+        # ── AI Top Companies ─────────────────────────────────────────────
+        top_cos = ai_out.get("top_companies", [])
+        if top_cos:
+            st.subheader(f"🏢 Top {len(top_cos)} Target Companies")
+            for co in top_cos:
+                icon = URGENCY.get(co.get("urgency","low"), "⚪")
+                with st.expander(
+                    f"{icon} **{co.get('name','')}** — {co.get('urgency','').capitalize()} priority"
+                ):
+                    st.write(f"**Why now:** {co.get('why','')}")
+                    st.info(f"💬 Outreach angle: {co.get('outreach_angle','')}")
+                    enr = res.get("enriched",{}).get(co.get("name",""), {})
+                    if enr:
+                        ec1, ec2 = st.columns(2)
+                        ec1.write(f"**Employees:** {enr.get('employees','?')}")
+                        ec2.write(f"**Revenue:** {enr.get('revenue','?')}")
+                        if enr.get("tech_stack"):
+                            st.write(f"**Tech stack:** {', '.join(enr['tech_stack'])}")
+
+        st.divider()
+
+        # ── AI Top Contacts ──────────────────────────────────────────────
+        top_contacts = ai_out.get("top_contacts", [])
+        all_people = res.get("apollo_contacts",[]) + res.get("top_people",[])
+        st.subheader(f"👤 Decision-Makers ({len(all_people)} found)")
+
+        if top_contacts:
+            st.write("**🎯 AI-prioritised — reach out to these first:**")
+            for c in top_contacts:
+                with st.expander(
+                    f"**{c.get('name','')}** — {c.get('title','')} at {c.get('company','')}"
+                ):
+                    st.write(f"**Why first:** {c.get('why_first','')}")
+                    if c.get("linkedin"):
+                        st.markdown(f"[🔗 LinkedIn]({c['linkedin']})")
+
+        if all_people:
+            people_df = pd.DataFrame(all_people)
+            show_cols = [c for c in ["name","title","company","country","linkedin","email","email_status","source"]
+                         if c in people_df.columns]
+            st.dataframe(
+                people_df[show_cols].rename(columns={
+                    "name":"Name","title":"Title","company":"Company",
+                    "country":"Location","linkedin":"LinkedIn",
+                    "email":"Email","email_status":"Email Status","source":"Source"
+                }),
+                use_container_width=True, hide_index=True
+            )
+
+        st.divider()
+
+        # ── Apollo Orgs found ────────────────────────────────────────────
+        if res.get("apollo_orgs"):
+            st.subheader(f"🔍 Apollo Organisation Search Results ({len(res['apollo_orgs'])})")
+            org_df = pd.DataFrame(res["apollo_orgs"])[
+                [c for c in ["name","industry","employees","country","description","domain"]
+                 if c in pd.DataFrame(res["apollo_orgs"]).columns]
+            ]
+            st.dataframe(org_df, use_container_width=True, hide_index=True)
+            st.divider()
+
+        # ── JSE Companies ────────────────────────────────────────────────
+        if res.get("jse"):
+            st.subheader(f"📈 JSE ICT Companies in Scope ({len(res['jse'])})")
+            jse_df = pd.DataFrame(res["jse"])[["name","ticker","sector","domain"]]
+            jse_df.columns = ["Company","Ticker","Sector","Domain"]
+            st.dataframe(jse_df, use_container_width=True, hide_index=True)
+
+        st.divider()
+
+        # ── Buying signals ───────────────────────────────────────────────
+        st.subheader(f"📡 Buying Signals ({len(res.get('signals',[]))})")
+        if res.get("signals"):
+            sig_df = pd.DataFrame(res["signals"])[
+                [c for c in ["source","title","published","url"] if c in pd.DataFrame(res["signals"]).columns]
+            ]
+            st.dataframe(sig_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("No signals found — try broader focus terms or add a NewsAPI key.")
+
+        st.divider()
+
+        # ── Follow-up actions ────────────────────────────────────────────
+        actions = ai_out.get("follow_up_actions", [])
+        if actions:
+            st.subheader("✅ Recommended Actions This Week")
+            for i, action in enumerate(actions, 1):
+                st.write(f"**{i}.** {action}")
+
+        st.divider()
+
+        # ── Push to Apollo CRM ───────────────────────────────────────────
+        st.subheader("🚀 Push to Apollo CRM")
+        st.caption("Bulk-create target companies as Accounts, then add key contacts — all in one click.")
+        push_col1, push_col2 = st.columns(2)
+
+        with push_col1:
+            if st.button("📤 Push Top Companies to Apollo Accounts"):
+                push_cos = top_cos[:10] if top_cos else res.get("apollo_orgs",[])[:10]
+                if push_cos:
+                    with st.spinner("Creating accounts in Apollo…"):
+                        id_map = _apollo_bulk_create_accounts(push_cos)
+                    st.success(f"✅ {len(id_map)} companies added to Apollo as Accounts.")
+                    st.session_state["apollo_account_ids"] = id_map
+                else:
+                    st.info("Run a lead search first to populate target companies.")
+
+        with push_col2:
+            if st.button("📤 Push Priority Contacts to Apollo CRM"):
+                push_people = top_contacts if top_contacts else all_people[:10]
+                if push_people:
+                    saved = 0
+                    account_ids = st.session_state.get("apollo_account_ids", {})
+                    with st.spinner(f"Creating {len(push_people)} contacts in Apollo…"):
+                        for person in push_people:
+                            acct_id = account_ids.get(person.get("company",""))
+                            if _apollo_create_contact(person, acct_id):
+                                saved += 1
+                    st.success(f"✅ {saved}/{len(push_people)} contacts pushed to Apollo CRM.")
+                else:
+                    st.info("Run a lead search first to populate contacts.")
+
+        # ── Export CSV ───────────────────────────────────────────────────
+        if all_people:
+            csv = pd.DataFrame(all_people).to_csv(index=False)
+            st.download_button(
+                "⬇️ Export All Contacts as CSV",
+                data=csv, file_name="crs_leads.csv", mime="text/csv"
+            )
