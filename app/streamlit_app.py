@@ -374,222 +374,117 @@ def scrape_south_africa(out):
     except Exception as e:
         out(f"  ❌ {country} error: {e}")
 
-# ── Kenya ─────────────────────────────────────────────────────────────────────
-def scrape_kenya(out):
-    country = "Kenya"
-    out(f"🇰🇪 Scraping {country}…")
+# ── OCDS Registry scraper (Kenya, Ghana, Tanzania, Uganda, Nigeria, Zambia, Rwanda) ──
+# Downloads standardised OCDS data from the Open Contracting Data Registry:
+# https://data.open-contracting.org — one consistent JSONL format for all countries.
+
+OCDS_REGISTRY = {
+    # country: (publication_id, flag)
+    "Kenya":    (147, "🇰🇪"),
+    "Ghana":    (85,  "🇬🇭"),
+    "Tanzania": (152, "🇹🇿"),
+    "Uganda":   (130, "🇺🇬"),
+    "Nigeria":  (64,  "🇳🇬"),
+    "Zambia":   (3,   "🇿🇲"),
+    "Rwanda":   (145, "🇷🇼"),
+}
+
+def _download_ocds_year(pub_id: int, year: int):
+    """Download and decompress one year's JSONL from the OCDS registry. Returns list of lines or None."""
+    import requests, gzip, io
+    url = f"https://data.open-contracting.org/en/publication/{pub_id}/download?name={year}.jsonl.gz"
     try:
-        supabase.table("sa_tenders").delete().eq("status", "Open").eq("country", country).execute()
-        data = _get_json("https://tenders.go.ke/Home/PaginatedTenderOpportunities",
-            {"draw":"1","start":"0","length":"500","status":"1",
-             "search[value]":"","search[regex]":"false","order[0][column]":"2","order[0][dir]":"desc"})
-        records = []
-        for t in data.get("data", []):
-            text = f"{t.get('description','')} {t.get('category','')}"
-            if not _is_relevant(text): continue
-            records.append({
-                "tender_number": t.get("tenderNo") or t.get("tender_No",""),
-                "department_name": t.get("procuringEntity") or t.get("department",""),
-                "title": str(t.get("description",""))[:200],
-                "description": t.get("description",""),
-                "category": t.get("category",""),
-                "compliance_requirements": t.get("conditions","Not specified"),
-                "portal_link": "https://tenders.go.ke/tenders",
-                "issue_date": t.get("datePublished") or t.get("date_Published"),
-                "closing_date": t.get("closingDate") or t.get("closing_Date"),
-                "status": "Open", "award_status": "Published", "country": country,
+        r = requests.get(url, timeout=120, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200 or len(r.content) < 100:
+            return None
+        with gzip.open(io.BytesIO(r.content), "rt", encoding="utf-8") as f:
+            return f.readlines()
+    except Exception:
+        return None
+
+
+def scrape_ocds_country(country: str, out):
+    """Pull open + awarded tenders for one country from the OCDS registry."""
+    import json as _json
+    from datetime import datetime, timezone
+
+    pub_id, flag = OCDS_REGISTRY[country]
+    out(f"{flag} Scraping {country} (OCDS registry)…")
+
+    # Current year first; fall back to previous year if not yet published
+    year = datetime.now().year
+    lines = _download_ocds_year(pub_id, year)
+    if not lines:
+        out(f"  ℹ️ {country}: no {year} file yet, trying {year-1}…")
+        lines = _download_ocds_year(pub_id, year - 1)
+    if not lines:
+        out(f"  ❌ {country}: no data available from registry")
+        return
+
+    today = datetime.now(timezone.utc).date().isoformat()
+    open_records, awarded_records = [], []
+
+    for line in lines:
+        try:
+            rel = _json.loads(line)
+        except Exception:
+            continue
+
+        tender = rel.get("tender") or {}
+        title = tender.get("title") or ""
+        desc = tender.get("description") or title
+        category = tender.get("mainProcurementCategory") or ""
+
+        if not _is_relevant(f"{title} {desc} {category}"):
+            continue
+
+        buyer = (rel.get("buyer") or {}).get("name") or (tender.get("procuringEntity") or {}).get("name", "")
+        ocid = rel.get("ocid", "")
+        tender_id = tender.get("id") or ocid
+        period = tender.get("tenderPeriod") or {}
+        end_date = (period.get("endDate") or "")[:10]
+        start_date = (period.get("startDate") or rel.get("date", ""))[:10]
+        awards = rel.get("awards") or []
+
+        base = {
+            "tender_number": str(tender_id)[:100],
+            "department_name": str(buyer)[:200],
+            "title": str(title or desc)[:200],
+            "description": str(desc),
+            "category": str(category),
+            "portal_link": f"https://data.open-contracting.org/en/publication/{pub_id}",
+            "country": country,
+        }
+
+        # Open: tender period hasn't closed and status is active-ish
+        status = (tender.get("status") or "").lower()
+        if end_date and end_date >= today and status not in ("cancelled", "unsuccessful", "withdrawn"):
+            open_records.append({
+                **base,
+                "compliance_requirements": tender.get("submissionMethodDetails") or "See portal",
+                "issue_date": start_date or None,
+                "closing_date": end_date,
+                "status": "Open",
+                "award_status": "Published",
             })
-        _upsert(records, country, "Open", out)
 
-        supabase.table("sa_tenders").delete().eq("status", "Awarded").eq("country", country).execute()
-        data2 = _get_json("https://tenders.go.ke/Home/PaginatedTenderOpportunities",
-            {"draw":"1","start":"0","length":"500","status":"2"})
-        awarded = []
-        for t in data2.get("data", []):
-            if not _is_relevant(f"{t.get('description','')} {t.get('category','')}"): continue
-            companies = t.get("company", [])
-            winner = companies[0].get("company","Unknown") if companies else t.get("bidders","Unknown")
-            amount = companies[0].get("tenderAmount","Not Disclosed") if companies else t.get("tenderAmount","Not Disclosed")
-            awarded.append({
-                "tender_number": t.get("tenderNo") or t.get("tender_No",""),
-                "department_name": t.get("procuringEntity") or t.get("department",""),
-                "title": str(t.get("description",""))[:200],
-                "description": t.get("description",""),
-                "status": "Awarded", "winning_bidder": winner,
-                "award_value": str(amount), "country": country,
+        # Awarded: any award entries with suppliers
+        for aw in awards:
+            suppliers = aw.get("suppliers") or []
+            winner = suppliers[0].get("name", "Unknown") if suppliers else "Not Disclosed"
+            val = aw.get("value") or {}
+            amount = f"{val.get('currency', '')} {val.get('amount', '')}".strip() if val else "Not Disclosed"
+            awarded_records.append({
+                **base,
+                "status": "Awarded",
+                "winning_bidder": str(winner)[:200],
+                "award_value": amount or "Not Disclosed",
             })
-        _upsert(awarded, country, "Awarded", out)
-    except Exception as e:
-        out(f"  ❌ {country} error: {e}")
 
-# ── Nigeria ───────────────────────────────────────────────────────────────────
-def scrape_nigeria(out):
-    country = "Nigeria"
-    out(f"🇳🇬 Scraping {country}…")
-    try:
-        import requests
-        supabase.table("sa_tenders").delete().eq("country", country).execute()
-        # NoCoPo OCDS API
-        page, records = 1, []
-        while True:
-            try:
-                data = _get_json("https://nocopo.bpp.gov.ng/api/tenders",
-                    {"page": page, "per_page": 100})
-                batch = data.get("data", [])
-                if not batch: break
-                records.extend(batch)
-                if page >= data.get("meta",{}).get("last_page", 1): break
-                page += 1
-            except: break
-
-        relevant = []
-        for t in records:
-            title = t.get("title") or t.get("description","")
-            if not _is_relevant(f"{title} {t.get('procurementCategory','')}"):  continue
-            buyer = t.get("buyer",{})
-            dept = buyer.get("name","") if isinstance(buyer, dict) else str(buyer)
-            tp = t.get("tenderPeriod",{}) or {}
-            relevant.append({
-                "tender_number": t.get("ocid") or t.get("id",""),
-                "department_name": dept,
-                "title": str(title)[:200], "description": str(title),
-                "category": t.get("procurementCategory",""),
-                "portal_link": "https://nocopo.bpp.gov.ng",
-                "issue_date": t.get("date") or tp.get("startDate"),
-                "closing_date": tp.get("endDate"),
-                "status": "Open", "award_status": "Published", "country": country,
-            })
-        _upsert(relevant, country, "Open", out)
-    except Exception as e:
-        out(f"  ❌ {country} error: {e}")
-
-# ── Ghana ─────────────────────────────────────────────────────────────────────
-def scrape_ghana(out):
-    country = "Ghana"
-    out(f"🇬🇭 Scraping {country}…")
-    try:
-        from bs4 import BeautifulSoup
-        supabase.table("sa_tenders").delete().eq("status", "Open").eq("country", country).execute()
-        soup = _get_html("https://www.ghaneps.gov.gh/epps/app/viewTender.do?searchType=basic&selectedItem=viewTender.do")
-        records = []
-        for row in soup.select("table.dataTable tbody tr, table tbody tr"):
-            cols = row.find_all("td")
-            if len(cols) < 3: continue
-            title = cols[1].get_text(strip=True) if len(cols) > 1 else ""
-            if not _is_relevant(title): continue
-            records.append({
-                "tender_number": cols[0].get_text(strip=True),
-                "department_name": cols[2].get_text(strip=True) if len(cols) > 2 else "",
-                "title": title[:200], "description": title,
-                "category": cols[3].get_text(strip=True) if len(cols) > 3 else "",
-                "closing_date": cols[4].get_text(strip=True) if len(cols) > 4 else None,
-                "compliance_requirements": "Not specified",
-                "portal_link": "https://www.ghaneps.gov.gh",
-                "status": "Open", "country": country,
-            })
-        _upsert(records, country, "Open", out)
-    except Exception as e:
-        out(f"  ❌ {country} error: {e}")
-
-# ── Tanzania ──────────────────────────────────────────────────────────────────
-def scrape_tanzania(out):
-    country = "Tanzania"
-    out(f"🇹🇿 Scraping {country}…")
-    try:
-        from bs4 import BeautifulSoup
-        supabase.table("sa_tenders").delete().eq("status", "Open").eq("country", country).execute()
-        records = []
-        for cat in ["G", "W", "C", "N"]:
-            try:
-                soup = _get_html(f"https://nest.ppra.go.tz/tenders/published-tenders?category={cat}")
-                for row in soup.select("table tbody tr"):
-                    cols = row.find_all("td")
-                    if len(cols) < 3: continue
-                    desc = cols[2].get_text(strip=True) if len(cols) > 2 else cols[1].get_text(strip=True)
-                    if not _is_relevant(desc): continue
-                    records.append({
-                        "tender_number": cols[0].get_text(strip=True),
-                        "department_name": cols[1].get_text(strip=True),
-                        "title": desc[:200], "description": desc,
-                        "closing_date": cols[3].get_text(strip=True) if len(cols) > 3 else None,
-                        "category": cat, "compliance_requirements": "Not specified",
-                        "portal_link": "https://nest.ppra.go.tz",
-                        "status": "Open", "country": country,
-                    })
-            except: continue
-        _upsert(records, country, "Open", out)
-    except Exception as e:
-        out(f"  ❌ {country} error: {e}")
-
-# ── Uganda ────────────────────────────────────────────────────────────────────
-def scrape_uganda(out):
-    country = "Uganda"
-    out(f"🇺🇬 Scraping {country}…")
-    try:
-        from bs4 import BeautifulSoup
-        supabase.table("sa_tenders").delete().eq("status", "Open").eq("country", country).execute()
-        records = []
-        for page in range(1, 6):
-            try:
-                soup = _get_html(f"https://gpp.ppda.go.ug/tenders?page={page}")
-                rows = soup.select("table tbody tr")
-                if not rows: break
-                for row in rows:
-                    cols = row.find_all("td")
-                    if len(cols) < 2: continue
-                    title = cols[1].get_text(strip=True)
-                    if not _is_relevant(title): continue
-                    records.append({
-                        "tender_number": cols[0].get_text(strip=True),
-                        "department_name": cols[2].get_text(strip=True) if len(cols) > 2 else "",
-                        "title": title[:200], "description": title,
-                        "category": cols[3].get_text(strip=True) if len(cols) > 3 else "",
-                        "closing_date": cols[4].get_text(strip=True) if len(cols) > 4 else None,
-                        "compliance_requirements": "Not specified",
-                        "portal_link": "https://gpp.ppda.go.ug",
-                        "status": "Open", "country": country,
-                    })
-            except: break
-        _upsert(records, country, "Open", out)
-    except Exception as e:
-        out(f"  ❌ {country} error: {e}")
-
-# ── Southern Africa (HTML scrapers) ──────────────────────────────────────────
-def _scrape_html_portal(country, flag, url, out):
-    out(f"{flag} Scraping {country}…")
-    try:
-        from bs4 import BeautifulSoup
-        supabase.table("sa_tenders").delete().eq("status","Open").eq("country",country).execute()
-        soup = _get_html(url)
-        records = []
-        for row in soup.select("table tbody tr"):
-            cols = row.find_all("td")
-            if len(cols) < 2: continue
-            title = cols[1].get_text(strip=True) if len(cols) > 1 else cols[0].get_text(strip=True)
-            if not _is_relevant(title): continue
-            records.append({
-                "tender_number": cols[0].get_text(strip=True),
-                "department_name": cols[2].get_text(strip=True) if len(cols) > 2 else "",
-                "title": title[:200], "description": title,
-                "closing_date": cols[3].get_text(strip=True) if len(cols) > 3 else None,
-                "compliance_requirements": "Not specified",
-                "portal_link": url, "status": "Open", "country": country,
-            })
-        _upsert(records, country, "Open", out)
-    except Exception as e:
-        out(f"  ❌ {country} error: {e}")
-
-def scrape_botswana(out):
-    _scrape_html_portal("Botswana","🇧🇼","https://www.ppadb.co.bw/index.php/bid-opportunities", out)
-
-def scrape_namibia(out):
-    _scrape_html_portal("Namibia","🇳🇦","https://www.cpb.org.na/tenders", out)
-
-def scrape_zimbabwe(out):
-    _scrape_html_portal("Zimbabwe","🇿🇼","https://www.praz.org.zw/tenders", out)
-
-def scrape_zambia(out):
-    _scrape_html_portal("Zambia","🇿🇲","https://www.zppa.org.zm/tenders", out)
+    # Replace this country's data
+    supabase.table("sa_tenders").delete().eq("country", country).execute()
+    _upsert(open_records, country, "Open", out)
+    _upsert(awarded_records, country, "Awarded", out)
 
 
 def run_all_scrapers():
@@ -602,24 +497,18 @@ def run_all_scrapers():
         lines.append(msg)
         log.markdown("\n\n".join(lines))
 
-    # Wrap each scraper so one failure never kills the rest
-    scrapers = [
-        scrape_south_africa,
-        scrape_kenya,
-        scrape_nigeria,
-        scrape_ghana,
-        scrape_tanzania,
-        scrape_uganda,
-        scrape_botswana,
-        scrape_namibia,
-        scrape_zimbabwe,
-        scrape_zambia,
-    ]
-    for fn in scrapers:
+    # South Africa: live eTenders API (most current)
+    try:
+        scrape_south_africa(out_write)
+    except Exception as e:
+        out_write(f"  ❌ South Africa crashed: {e}")
+
+    # All other countries: OCDS registry (one robust source, consistent format)
+    for country in OCDS_REGISTRY:
         try:
-            fn(out_write)
+            scrape_ocds_country(country, out_write)
         except Exception as e:
-            out_write(f"  ❌ {fn.__name__} crashed: {e}")
+            out_write(f"  ❌ {country} crashed: {e}")
 
     out_write("\n✅ **All countries done!**")
 
