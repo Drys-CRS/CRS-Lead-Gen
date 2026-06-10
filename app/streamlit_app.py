@@ -584,55 +584,86 @@ def _get_html(url, timeout=20):
 def scrape_south_africa(out):
     country = "South Africa"
     out(f"🇿🇦 Scraping {country}…")
+    from datetime import datetime, timedelta
+
+    cutoff = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
+
     try:
-        # Open tenders
+        # ── OPEN tenders (replace fully — these change daily) ────────────────
         supabase.table("sa_tenders").delete().eq("status", "Open").eq("country", country).execute()
-        data = _get_json("https://www.etenders.gov.za/Home/PaginatedTenderOpportunities",
-            {"draw":"1","start":"0","length":"1000","status":"1",
-             "search[value]":"","search[regex]":"false","order[0][column]":"2","order[0][dir]":"desc"})
-        open_records = []
-        for t in data.get("data", []):
-            text = f"{t.get('description','')} {t.get('category','')}"
-            if not _is_relevant(text): continue
-            open_records.append({
-                "tender_number": t.get("tender_No",""),
-                "department_name": t.get("department",""),
-                "title": str(t.get("description",""))[:200],
-                "description": t.get("description",""),
-                "category": t.get("category",""),
-                "compliance_requirements": t.get("conditions","Not specified"),
-                "portal_link": "https://www.etenders.gov.za/Home/opportunities?id=1",
-                "issue_date": t.get("date_Published"),
-                "closing_date": t.get("closing_Date"),
-                "status": "Open", "award_status": "Published", "country": country,
+        open_records, start = [], 0
+        while True:
+            data = _get_json("https://www.etenders.gov.za/Home/PaginatedTenderOpportunities", {
+                "draw": "1", "start": str(start), "length": "500",
+                "status": "1", "search[value]": "", "search[regex]": "false",
+                "order[0][column]": "2", "order[0][dir]": "desc",
             })
+            batch = data.get("data", [])
+            if not batch:
+                break
+            for t in batch:
+                text = f"{t.get('description','')} {t.get('category','')}"
+                if not _is_relevant(text):
+                    continue
+                open_records.append({
+                    "tender_number": t.get("tender_No", ""),
+                    "department_name": t.get("department", ""),
+                    "title": str(t.get("description", ""))[:200],
+                    "description": t.get("description", ""),
+                    "category": t.get("category", ""),
+                    "compliance_requirements": t.get("conditions", "Not specified"),
+                    "portal_link": "https://www.etenders.gov.za/Home/opportunities?id=1",
+                    "issue_date": t.get("date_Published"),
+                    "closing_date": t.get("closing_Date"),
+                    "status": "Open", "award_status": "Published", "country": country,
+                })
+            start += len(batch)
+            if start >= int(data.get("recordsTotal", 0)):
+                break
         _upsert(open_records, country, "Open", out)
 
-        # Awarded tenders
-        supabase.table("sa_tenders").delete().eq("status", "Awarded").eq("country", country).execute()
-        data2 = _get_json("https://www.etenders.gov.za/Home/PaginatedTenderOpportunities",
-            {"draw":"1","start":"0","length":"1000","status":"2"})
-        awarded_records = []
-        for t in data2.get("data", []):
-            text = f"{t.get('description','')} {t.get('category','')}"
-            if not _is_relevant(text): continue
-            companies = t.get("company", [])
-            winner, amount = "Not Disclosed", "Not Disclosed"
-            if companies and isinstance(companies, list):
-                winner = companies[0].get("company","Unknown")
-                amount = companies[0].get("tenderAmount","Not Disclosed")
-            if winner == "Not Disclosed":
-                winner = t.get("bidders") or "Unknown"
-                amount = t.get("tenderAmount") or "Not Disclosed"
-            awarded_records.append({
-                "tender_number": t.get("tender_No",""),
-                "department_name": t.get("department",""),
-                "title": str(t.get("description",""))[:200],
-                "description": t.get("description",""),
-                "status": "Awarded", "winning_bidder": winner,
-                "award_value": str(amount), "country": country,
+        # ── AWARDED tenders: paginate back 12 months, UPSERT only (keep history) ──
+        out(f"  🇿🇦 Fetching awarded tenders back to {cutoff}…")
+        awarded_records, start = [], 0
+        stop_early = False
+        while not stop_early:
+            data2 = _get_json("https://www.etenders.gov.za/Home/PaginatedTenderOpportunities", {
+                "draw": "1", "start": str(start), "length": "500", "status": "2",
             })
-        _upsert(awarded_records, country, "Awarded", out)
+            batch = data2.get("data", [])
+            if not batch:
+                break
+            for t in batch:
+                # eTenders returns results newest-first; stop when we pass the cutoff
+                award_date = (t.get("closing_Date") or t.get("date_Published") or "")[:10]
+                if award_date and award_date < cutoff:
+                    stop_early = True
+                    break
+                text = f"{t.get('description','')} {t.get('category','')}"
+                if not _is_relevant(text):
+                    continue
+                companies = t.get("company", [])
+                winner, amount = "Not Disclosed", "Not Disclosed"
+                if companies and isinstance(companies, list):
+                    winner = companies[0].get("company", "Unknown")
+                    amount = companies[0].get("tenderAmount", "Not Disclosed")
+                if winner == "Not Disclosed":
+                    winner = t.get("bidders") or "Unknown"
+                    amount = t.get("tenderAmount") or "Not Disclosed"
+                awarded_records.append({
+                    "tender_number": t.get("tender_No", ""),
+                    "department_name": t.get("department", ""),
+                    "title": str(t.get("description", ""))[:200],
+                    "description": t.get("description", ""),
+                    "status": "Awarded", "winning_bidder": winner,
+                    "award_value": str(amount), "country": country,
+                })
+            start += len(batch)
+            if start >= int(data2.get("recordsTotal", 0)):
+                break
+        # UPSERT only — never wipe awarded history
+        _upsert(awarded_records, country, "Awarded (12-month)", out)
+
     except Exception as e:
         out(f"  ❌ {country} error: {e}")
 
@@ -654,11 +685,12 @@ OCDS_REGISTRY = {
 }
 
 def _download_ocds_year(pub_id: int, year: int):
-    """Download and decompress one year's JSONL from the OCDS registry. Returns list of lines or None."""
+    """Download and decompress one year's JSONL from the OCDS registry.
+    Returns list of text lines, or None if unavailable."""
     import requests, gzip, io
     url = f"https://data.open-contracting.org/en/publication/{pub_id}/download?name={year}.jsonl.gz"
     try:
-        r = requests.get(url, timeout=120, headers={"User-Agent": "Mozilla/5.0"})
+        r = requests.get(url, timeout=180, headers={"User-Agent": "Mozilla/5.0"})
         if r.status_code != 200 or len(r.content) < 100:
             return None
         with gzip.open(io.BytesIO(r.content), "rt", encoding="utf-8") as f:
@@ -668,87 +700,112 @@ def _download_ocds_year(pub_id: int, year: int):
 
 
 def scrape_ocds_country(country: str, out):
-    """Pull open + awarded tenders for one country from the OCDS registry."""
+    """Pull 12 months of open + awarded tenders for one country from the OCDS registry.
+    - Downloads current year AND previous year files and merges them.
+    - Open records replace existing ones (stale tenders close daily).
+    - Awarded records are UPSERTED only — history is never wiped.
+    - Awards older than 12 months are filtered out before upserting.
+    """
     import json as _json
-    from datetime import datetime, timezone
+    from datetime import datetime, timezone, timedelta
 
     pub_id, flag = OCDS_REGISTRY[country]
-    out(f"{flag} Scraping {country} (OCDS registry)…")
+    out(f"{flag} Scraping {country} (OCDS — 12 months)…")
 
-    # Current year first; fall back to previous year if not yet published
-    year = datetime.now().year
-    lines = _download_ocds_year(pub_id, year)
-    if not lines:
-        out(f"  ℹ️ {country}: no {year} file yet, trying {year-1}…")
-        lines = _download_ocds_year(pub_id, year - 1)
-    if not lines:
+    now = datetime.now(timezone.utc)
+    today = now.date().isoformat()
+    cutoff = (now - timedelta(days=365)).date().isoformat()
+    current_year = now.year
+
+    # Collect lines from both years so we span the full 12-month window
+    all_lines = []
+    for yr in [current_year, current_year - 1]:
+        yr_lines = _download_ocds_year(pub_id, yr)
+        if yr_lines:
+            all_lines.extend(yr_lines)
+            out(f"  ℹ️ {country} {yr}: {len(yr_lines):,} records downloaded")
+        else:
+            out(f"  ℹ️ {country}: no data for {yr}")
+
+    if not all_lines:
         out(f"  ❌ {country}: no data available from registry")
         return
 
-    today = datetime.now(timezone.utc).date().isoformat()
     open_records, awarded_records = [], []
+    seen_awarded = set()  # deduplicate across year files
 
-    for line in lines:
+    for line in all_lines:
         try:
             rel = _json.loads(line)
         except Exception:
             continue
 
-        tender = rel.get("tender") or {}
-        title = tender.get("title") or ""
-        desc = tender.get("description") or title
+        tender  = rel.get("tender") or {}
+        title   = tender.get("title") or ""
+        desc    = tender.get("description") or title
         category = tender.get("mainProcurementCategory") or ""
 
         if not _is_relevant(f"{title} {desc} {category}"):
             continue
 
-        buyer = (rel.get("buyer") or {}).get("name") or (tender.get("procuringEntity") or {}).get("name", "")
-        ocid = rel.get("ocid", "")
-        tender_id = tender.get("id") or ocid
-        period = tender.get("tenderPeriod") or {}
-        end_date = (period.get("endDate") or "")[:10]
+        buyer      = (rel.get("buyer") or {}).get("name") or                      (tender.get("procuringEntity") or {}).get("name", "")
+        ocid       = rel.get("ocid", "")
+        tender_id  = tender.get("id") or ocid
+        period     = tender.get("tenderPeriod") or {}
+        end_date   = (period.get("endDate") or "")[:10]
         start_date = (period.get("startDate") or rel.get("date", ""))[:10]
-        awards = rel.get("awards") or []
+        awards     = rel.get("awards") or []
 
         base = {
-            "tender_number": str(tender_id)[:100],
+            "tender_number":   str(tender_id)[:100],
             "department_name": str(buyer)[:200],
-            "title": str(title or desc)[:200],
-            "description": str(desc),
-            "category": str(category),
-            "portal_link": f"https://data.open-contracting.org/en/publication/{pub_id}",
-            "country": country,
+            "title":           str(title or desc)[:200],
+            "description":     str(desc),
+            "category":        str(category),
+            "portal_link":     f"https://data.open-contracting.org/en/publication/{pub_id}",
+            "country":         country,
         }
 
-        # Open: tender period hasn't closed and status is active-ish
+        # Open: not yet closed, not cancelled
         status = (tender.get("status") or "").lower()
         if end_date and end_date >= today and status not in ("cancelled", "unsuccessful", "withdrawn"):
             open_records.append({
                 **base,
                 "compliance_requirements": tender.get("submissionMethodDetails") or "See portal",
-                "issue_date": start_date or None,
+                "issue_date":   start_date or None,
                 "closing_date": end_date,
-                "status": "Open",
+                "status":       "Open",
                 "award_status": "Published",
             })
 
-        # Awarded: any award entries with suppliers
+        # Awarded: within 12-month window, deduplicated
         for aw in awards:
+            award_date = (aw.get("date") or rel.get("date") or "")[:10]
+            # Skip if award date is known and outside the 12-month window
+            if award_date and award_date < cutoff:
+                continue
             suppliers = aw.get("suppliers") or []
-            winner = suppliers[0].get("name", "Unknown") if suppliers else "Not Disclosed"
-            val = aw.get("value") or {}
-            amount = f"{val.get('currency', '')} {val.get('amount', '')}".strip() if val else "Not Disclosed"
+            winner    = suppliers[0].get("name", "Unknown") if suppliers else "Not Disclosed"
+            val       = aw.get("value") or {}
+            amount    = f"{val.get('currency','')} {val.get('amount','')}".strip() if val else "Not Disclosed"
+            dedup_key = f"{tender_id}|{winner}"
+            if dedup_key in seen_awarded:
+                continue
+            seen_awarded.add(dedup_key)
             awarded_records.append({
                 **base,
-                "status": "Awarded",
+                "status":         "Awarded",
                 "winning_bidder": str(winner)[:200],
-                "award_value": amount or "Not Disclosed",
+                "award_value":    amount or "Not Disclosed",
+                "issue_date":     award_date or None,
             })
 
-    # Replace this country's data
-    supabase.table("sa_tenders").delete().eq("country", country).execute()
+    # Open records: replace (stale tenders close)
+    supabase.table("sa_tenders").delete().eq("status", "Open").eq("country", country).execute()
     _upsert(open_records, country, "Open", out)
-    _upsert(awarded_records, country, "Awarded", out)
+
+    # Awarded records: UPSERT only — never wipe, history accumulates
+    _upsert(awarded_records, country, f"Awarded (12-month, {len(awarded_records)} records)", out)
 
 
 def run_all_scrapers():
@@ -823,6 +880,13 @@ selected_countries = st.sidebar.multiselect(
     default=all_countries,
     help="Select one or more countries to show"
 )
+
+# Date range filter for awarded tenders (12-month history)
+st.sidebar.header("Awarded Date Range")
+from datetime import date, timedelta
+default_from = date.today() - timedelta(days=365)
+awarded_date_from = st.sidebar.date_input("From", value=default_from)
+awarded_date_to   = st.sidebar.date_input("To",   value=date.today())
 
 # Apply filters
 df_filtered = tenders_df.copy()
@@ -931,6 +995,17 @@ with tab2:
     )
 
     awarded_df = df_filtered[df_filtered["status"] == "Awarded"].copy()
+
+    # Apply 12-month date range filter
+    if "issue_date" in awarded_df.columns:
+        awarded_df["_award_date"] = pd.to_datetime(awarded_df["issue_date"], errors="coerce").dt.date
+        awarded_df = awarded_df[
+            awarded_df["_award_date"].isna() |
+            (
+                (awarded_df["_award_date"] >= awarded_date_from) &
+                (awarded_df["_award_date"] <= awarded_date_to)
+            )
+        ].drop(columns=["_award_date"])
 
     if competitor_search:
         awarded_df = awarded_df[
