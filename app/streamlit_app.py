@@ -33,17 +33,16 @@ supabase = conn["supabase"]
 def trigger_github_workflow():
     owner = "Drys-CRS"
     repo = "CRS-Lead-Gen"
-    # Ensure this matches your file name in .github/workflows/
     workflow_id = "daily_scrape.yml" 
     
     url = f"https://api.github.com/repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches"
     
     headers = {
         "Authorization": f"token {conn['gh_token']}",
-        "Accept": "application/vnd.github.v3+json"
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28"  # <--- Added this required header
     }
     
-    # Ensure 'ref' matches your repository's default branch (usually 'main' or 'master')
     data = {"ref": "main"}
     
     response = requests.post(url, headers=headers, json=data)
