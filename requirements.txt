@@ -5,3 +5,5 @@ python-dotenv
 google-generativeai
 requests
 beautifulsoup4
+groq
+cerebras-cloud-sdk
