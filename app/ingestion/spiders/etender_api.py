@@ -7,12 +7,19 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv(override=True)
 
-# Define your exact target areas. Python will check for these in the description.
+# Expanded keyword list for targeted filtering
 TARGET_KEYWORDS = [
-    "cyber", "security", "firewall", "network", "threat", "vulnerability",
+    "cyber", "EDR", "firewall", "network", "threat", "vulnerability",
     "training", "comptia", "ibm", "red hat", "ict ", "information technology",
     "cloud", "server", "endpoint", "infrastructure", "data center",
-    "flare", "vectra", "aikido", "vicarius", "software", "hardware"
+    "flare", "vectra", "aikido", "vicarius", "software", "hardware", "NDR", "IDR", "SAST", "VAPT",
+    "penetration testing", "cybersecurity", "cyber security", "cyber risk", "cyber risk management",
+    "cyber defense", "cyber defence", "cyber incident response", "cyber threat intelligence", "cyber threat hunting",
+    "cyber vulnerability management", "cyber risk assessment", "cyber risk mitigation", "cyber risk monitoring",
+    "cyber risk reporting", "cyber risk compliance", "penetration testing", "data security",
+    "z/os", "SOC", "Patch Management", "Technical Training", "Cybersecurity Training", "IT Training", "Information Security Training",
+    "AI", "Security+", "IBM i", "Red Hat", "CompTIA", "Cloud Security", "Network Security", "Endpoint Security",
+    "redhat", "SUSE", "Application Security", "Identity and Access Management", "IAM", "Zero Trust", "SIEM", "Security Orchestration"
 ]
 
 def scrape_etenders():
@@ -20,11 +27,12 @@ def scrape_etenders():
     
     url = "https://www.etenders.gov.za/Home/PaginatedTenderOpportunities"
     
+    # DataTables GET request parameters
     params = {
         "draw": "1",
         "start": "0",
-        "length": "1000",
-        "status": "1", 
+        "length": "1000",       # Pull up to 1000 records at once
+        "status": "1",          # 1 = Currently Advertised
         "search[value]": "",
         "search[regex]": "false",
         "order[0][column]": "2",
@@ -48,10 +56,9 @@ def scrape_etenders():
         data = response.json()
         all_tenders = data.get("data", [])
         
-        print(f"📥 Received {len(all_tenders)} total tenders. Applying cyber & training filters...")
+        print(f"📥 Received {len(all_tenders)} total tenders. Applying advanced filters...")
         
         # Connect to Supabase
-       # 2. Connect to Supabase
         url_env = os.getenv("SUPABASE_URL")
         key_env = os.getenv("SUPABASE_KEY")
         
@@ -61,40 +68,40 @@ def scrape_etenders():
             
         supabase = create_client(url_env, key_env)
         
-        # --- NEW WIPE LOGIC ---
+        # Clean the database of old 'Open' tenders to prevent ghosts
         print("🧹 Clearing old 'Open' tenders from the database...")
         try:
             supabase.table("sa_tenders").delete().eq("status", "Open").execute()
             print("✅ Old tenders cleared. Ready for fresh data.")
         except Exception as e:
             print(f"⚠️ Warning: Failed to clear old tenders: {e}")
-        # ----------------------
         
-        # 3. Process and Upload
         success_count = 0
         skipped_count = 0
         
         for tender in all_tenders:
-            # Grab the description and category, convert to lowercase for easy matching
-            description = tender.get("description", "").lower()
-            category_text = tender.get("category", "").lower()
+            # Grab fields for filtering
+            full_description = tender.get("description", "")
+            category_text = tender.get("category", "")
             
-            # Combine them into one string to search against
-            searchable_text = f"{description} {category_text}"
+            searchable_text = f"{full_description} {category_text}".lower()
             
-            # Check if ANY of our target keywords exist in the text
-            is_relevant = any(keyword in searchable_text for keyword in TARGET_KEYWORDS)
+            # Check if ANY target keywords exist (converting keywords to lowercase on the fly to match the searchable_text)
+            is_relevant = any(keyword.lower() in searchable_text for keyword in TARGET_KEYWORDS)
             
             if not is_relevant:
                 skipped_count += 1
-                continue # Skip this loop and move to the next tender
+                continue 
                 
-            # If it passes the filter, prepare it for the database
+            # Prepare data with all fields
             tender_data = {
                 "tender_number": tender.get("tender_No"),
                 "department_name": tender.get("department"),
-                "title": tender.get("description", "")[:200],
-                # "category": tender.get("category"), <-- Commented out to prevent the PGRST204 error
+                "title": full_description[:200], 
+                "description": full_description, 
+                "category": category_text,
+                "compliance_requirements": tender.get("conditions", "Not specified"),
+                "portal_link": "https://www.etenders.gov.za/Home/opportunities?id=1",
                 "issue_date": tender.get("date_Published"),
                 "closing_date": tender.get("closing_Date"),
                 "status": "Open",
@@ -108,7 +115,7 @@ def scrape_etenders():
                     on_conflict="tender_number,department_name"
                 ).execute()
                 success_count += 1
-                print(f"✅ Upserted Match: {tender.get('tender_No')} - {tender.get('category')}")
+                print(f"✅ Upserted Match: {tender.get('tender_No')} - {category_text}")
             except Exception as db_error:
                 print(f"⚠️ DB Upsert Failed for {tender.get('tender_No')}: {db_error}")
 
