@@ -78,11 +78,25 @@ def init_gemini():
 ai = init_gemini()
 
 
-def _call_ai(prompt: str) -> str:
-    """Single helper to call Gemini and return text."""
-    response = ai.generate_content(prompt)
-    raw = response.text.strip()
-    return re.sub(r"^```json\s*|^```\s*|```$", "", raw, flags=re.MULTILINE).strip()
+def _call_ai(prompt: str, retries: int = 5) -> str:
+    """Call Gemini with automatic retry + exponential backoff on 429 rate-limit errors."""
+    import time
+    delay = 20  # start at 20 s — free tier resets in ~16 s per the error message
+    for attempt in range(retries):
+        try:
+            response = ai.generate_content(prompt)
+            raw = response.text.strip()
+            return re.sub(r"^```json\s*|^```\s*|```$", "", raw, flags=re.MULTILINE).strip()
+        except Exception as e:
+            err = str(e)
+            if "429" in err or "quota" in err.lower() or "rate" in err.lower():
+                if attempt < retries - 1:
+                    wait = delay * (attempt + 1)   # 20 s, 40 s, 60 s, 80 s
+                    st.toast(f"⏳ Gemini rate limit hit — waiting {wait}s before retry {attempt+2}/{retries}…")
+                    time.sleep(wait)
+                    continue
+            raise  # non-rate-limit errors propagate immediately
+    raise RuntimeError(f"Gemini rate limit persisted after {retries} retries. Try again in a minute.")
 
 
 def _call_ai_grounded(prompt: str) -> str:
@@ -275,47 +289,72 @@ No text outside the JSON.
     return json.loads(raw)
 
 
+# Seconds to wait between individual scoring calls on free tier (5 rpm = 12 s apart)
+_SCORE_THROTTLE_SECS = 13
+
 def ai_match_tenders(open_df: pd.DataFrame) -> pd.DataFrame:
-    """Score all unscored open tenders and return df sorted by score."""
+    """Score UNSCORED open tenders only, throttled to stay within free-tier limits.
+    Already-scored tenders are skipped to avoid wasting quota."""
+    import time
     if open_df.empty:
         return open_df
 
-    results = []
-    progress = st.progress(0, text="Scoring tenders with AI…")
+    # Only score tenders that don't already have a score
+    unscored = open_df[open_df["ai_score"].isna()].copy()
+    already_scored = open_df[open_df["ai_score"].notna()].copy()
 
-    for i, (_, row) in enumerate(open_df.iterrows()):
-        progress.progress((i + 1) / len(open_df), text=f"Scoring {i+1}/{len(open_df)}: {row.get('tender_number', '')}")
+    if unscored.empty:
+        st.info("All visible tenders are already scored. Clear scores in Supabase to re-run.")
+        return open_df.sort_values("ai_score", ascending=False, na_position="last")
+
+    st.caption(
+        f"Scoring {len(unscored)} unscored tenders "
+        f"({len(already_scored)} already scored, skipping). "
+        f"Free tier: ~1 request per {_SCORE_THROTTLE_SECS}s — est. "
+        f"{len(unscored) * _SCORE_THROTTLE_SECS // 60 + 1} min."
+    )
+
+    results = []
+    progress = st.progress(0, text="Starting AI scoring…")
+
+    for i, (_, row) in enumerate(unscored.iterrows()):
+        pct = (i + 1) / len(unscored)
+        progress.progress(pct, text=f"Scoring {i+1}/{len(unscored)}: {str(row.get('tender_number', ''))[:40]}")
+
         try:
             scored = ai_score_tender(row.to_dict())
             results.append({
                 "tender_number": row["tender_number"],
                 "ai_score": scored["score"],
-                "ai_rationale": scored["rationale"]
+                "ai_rationale": scored["rationale"],
             })
-            # Persist to Supabase
             supabase.table("sa_tenders").update({
                 "ai_score": scored["score"],
-                "ai_rationale": scored["rationale"]
+                "ai_rationale": scored["rationale"],
             }).eq("tender_number", row["tender_number"]).execute()
         except Exception as e:
             results.append({
                 "tender_number": row["tender_number"],
                 "ai_score": None,
-                "ai_rationale": f"Scoring failed: {e}"
+                "ai_rationale": f"Scoring failed: {e}",
             })
+
+        # Throttle — don't fire next request immediately
+        if i < len(unscored) - 1:
+            time.sleep(_SCORE_THROTTLE_SECS)
 
     progress.empty()
 
-    scores_df = pd.DataFrame(results)
-    merged = open_df.merge(scores_df, on="tender_number", how="left", suffixes=("", "_new"))
+    if results:
+        scores_df = pd.DataFrame(results)
+        unscored = unscored.merge(scores_df, on="tender_number", how="left", suffixes=("", "_new"))
+        if "ai_score_new" in unscored.columns:
+            unscored["ai_score"] = unscored["ai_score_new"].combine_first(unscored["ai_score"])
+            unscored["ai_rationale"] = unscored["ai_rationale_new"].combine_first(unscored["ai_rationale"])
+            unscored.drop(columns=["ai_score_new", "ai_rationale_new"], inplace=True)
 
-    # Use new scores where computed, keep old otherwise
-    if "ai_score_new" in merged.columns:
-        merged["ai_score"] = merged["ai_score_new"].combine_first(merged.get("ai_score"))
-        merged["ai_rationale"] = merged["ai_rationale_new"].combine_first(merged.get("ai_rationale"))
-        merged.drop(columns=["ai_score_new", "ai_rationale_new"], inplace=True)
-
-    return merged.sort_values("ai_score", ascending=False, na_position="last")
+    combined = pd.concat([already_scored, unscored], ignore_index=True)
+    return combined.sort_values("ai_score", ascending=False, na_position="last")
 
 
 # ─────────────────────────────────────────────
