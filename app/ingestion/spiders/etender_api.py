@@ -51,6 +51,7 @@ def scrape_etenders():
         print(f"📥 Received {len(all_tenders)} total tenders. Applying cyber & training filters...")
         
         # Connect to Supabase
+       # 2. Connect to Supabase
         url_env = os.getenv("SUPABASE_URL")
         key_env = os.getenv("SUPABASE_KEY")
         
@@ -60,6 +61,16 @@ def scrape_etenders():
             
         supabase = create_client(url_env, key_env)
         
+        # --- NEW WIPE LOGIC ---
+        print("🧹 Clearing old 'Open' tenders from the database...")
+        try:
+            supabase.table("sa_tenders").delete().eq("status", "Open").execute()
+            print("✅ Old tenders cleared. Ready for fresh data.")
+        except Exception as e:
+            print(f"⚠️ Warning: Failed to clear old tenders: {e}")
+        # ----------------------
+        
+        # 3. Process and Upload
         success_count = 0
         skipped_count = 0
         
