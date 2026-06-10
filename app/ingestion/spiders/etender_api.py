@@ -9,17 +9,23 @@ load_dotenv(override=True)
 class ETenderAPISpider(scrapy.Spider):
     name = "etender_api"
 
+    # 1. Force Scrapy to ignore robots.txt just for this specific spider
+    custom_settings = {
+        'ROBOTSTXT_OBEY': False,
+        'LOG_LEVEL': 'DEBUG'
+    }
+
     def start_requests(self):
+        self.logger.info("🔥 START_REQUESTS IS FIRING 🔥")
         url = "https://www.etenders.gov.za/Home/PaginatedTenderOpportunities"
         
-        # We must simulate the exact JSON structure DataTables sends to prevent server crashes
         payload = {
             "draw": 1,
             "start": 0,
             "length": 1000,
-            "status": 1, # 1 = Currently Advertised
+            "status": 1,
             "search": {"value": "", "regex": False},
-            "order": [{"column": 2, "dir": "desc"}] # Matches their JS sorting rule
+            "order": [{"column": 2, "dir": "desc"}]
         }
 
         headers = {
@@ -29,13 +35,14 @@ class ETenderAPISpider(scrapy.Spider):
             'Accept': 'application/json, text/javascript, */*; q=0.01'
         }
 
-        # Send as a POST request with the JSON body
+        # 2. dont_filter=True forces Scrapy to run this even if it thinks it already has
         yield scrapy.Request(
             url=url,
             method="POST",
             body=json.dumps(payload),
             headers=headers,
-            callback=self.parse
+            callback=self.parse,
+            dont_filter=True 
         )
 
     def __init__(self, *args, **kwargs):
@@ -43,11 +50,12 @@ class ETenderAPISpider(scrapy.Spider):
         self.supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 
     def parse(self, response):
+        self.logger.info(f"✅ RESPONSE RECEIVED: HTTP Status {response.status}")
         try:
             data = json.loads(response.text)
             tenders = data.get("data", [])
             
-            self.logger.info(f"Successfully pulled {len(tenders)} active tenders from the live API.")
+            self.logger.info(f"🎯 Successfully pulled {len(tenders)} active tenders from the live API.")
             
             for tender in tenders:
                 tender_data = {
@@ -69,4 +77,4 @@ class ETenderAPISpider(scrapy.Spider):
                 ).execute()
 
         except Exception as e:
-            self.logger.error(f"Failed to parse API data: {e}")
+            self.logger.error(f"❌ Failed to parse API data: {e}")
