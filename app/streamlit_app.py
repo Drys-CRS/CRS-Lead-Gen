@@ -68,35 +68,129 @@ def init_connection():
 supabase = init_connection()
 
 # ─────────────────────────────────────────────
-# 4. GEMINI CLIENT
+# 4. AI CLIENTS  (Groq → Cerebras → Gemini cascade)
+#
+# Priority for scoring/parsing:
+#   1. Groq        — 30 RPM free, fastest inference (~1s responses)
+#   2. Cerebras    — 1M tokens/day free, fast, good fallback
+#   3. Gemini      — 5 RPM free, kept for grounded web search (Discovery tab)
+#
+# Each key is optional — the cascade skips any provider whose key is missing.
 # ─────────────────────────────────────────────
+import time as _time
+
 @st.cache_resource
 def init_gemini():
     genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
     return genai.GenerativeModel("gemini-2.5-flash")
 
-ai = init_gemini()
+@st.cache_resource
+def init_groq():
+    try:
+        from groq import Groq
+        key = st.secrets.get("GROQ_API_KEY")
+        if not key:
+            return None
+        return Groq(api_key=key)
+    except Exception:
+        return None
 
+@st.cache_resource
+def init_cerebras():
+    try:
+        from cerebras.cloud.sdk import Cerebras
+        key = st.secrets.get("CEREBRAS_API_KEY")
+        if not key:
+            return None
+        return Cerebras(api_key=key)
+    except Exception:
+        return None
 
-def _call_ai(prompt: str, retries: int = 5) -> str:
-    """Call Gemini with automatic retry + exponential backoff on 429 rate-limit errors."""
-    import time
-    delay = 20  # start at 20 s — free tier resets in ~16 s per the error message
+ai         = init_gemini()
+groq_ai    = init_groq()
+cerebras_ai = init_cerebras()
+
+# ── Provider status shown in sidebar ──
+def _provider_status() -> str:
+    parts = []
+    parts.append("🟢 Groq"     if groq_ai     else "⚪ Groq (no key)")
+    parts.append("🟢 Cerebras" if cerebras_ai else "⚪ Cerebras (no key)")
+    parts.append("🟢 Gemini")
+    return " · ".join(parts)
+
+def _clean(raw: str) -> str:
+    """Strip markdown fences from an AI response."""
+    return re.sub(r"^```json\s*|^```\s*|```$", "", raw.strip(), flags=re.MULTILINE).strip()
+
+def _is_rate_limit(err: str) -> bool:
+    return any(x in err.lower() for x in ["429", "quota", "rate limit", "too many", "throttl"])
+
+def _call_groq(prompt: str) -> str:
+    """Call Groq (llama-3.3-70b-versatile). Raises on any error."""
+    resp = groq_ai.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
+        max_tokens=1500,
+    )
+    return _clean(resp.choices[0].message.content)
+
+def _call_cerebras(prompt: str) -> str:
+    """Call Cerebras (llama3.1-70b). Raises on any error."""
+    resp = cerebras_ai.chat.completions.create(
+        model="llama3.1-70b",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
+        max_tokens=1500,
+    )
+    return _clean(resp.choices[0].message.content)
+
+def _call_gemini(prompt: str, retries: int = 3) -> str:
+    """Call Gemini with backoff. Raises after all retries."""
+    delay = 20
     for attempt in range(retries):
         try:
             response = ai.generate_content(prompt)
-            raw = response.text.strip()
-            return re.sub(r"^```json\s*|^```\s*|```$", "", raw, flags=re.MULTILINE).strip()
+            return _clean(response.text)
         except Exception as e:
-            err = str(e)
-            if "429" in err or "quota" in err.lower() or "rate" in err.lower():
-                if attempt < retries - 1:
-                    wait = delay * (attempt + 1)   # 20 s, 40 s, 60 s, 80 s
-                    st.toast(f"⏳ Gemini rate limit hit — waiting {wait}s before retry {attempt+2}/{retries}…")
-                    time.sleep(wait)
-                    continue
-            raise  # non-rate-limit errors propagate immediately
-    raise RuntimeError(f"Gemini rate limit persisted after {retries} retries. Try again in a minute.")
+            if _is_rate_limit(str(e)) and attempt < retries - 1:
+                wait = delay * (attempt + 1)
+                st.toast(f"⏳ Gemini rate limit — retrying in {wait}s ({attempt+2}/{retries})…")
+                _time.sleep(wait)
+            else:
+                raise
+    raise RuntimeError("Gemini quota exceeded after retries.")
+
+def _call_ai(prompt: str) -> str:
+    """Smart cascade: Groq → Cerebras → Gemini.
+    Tries each provider in order; skips unavailable or rate-limited ones.
+    Raises only if ALL providers fail."""
+    providers = []
+    if groq_ai:
+        providers.append(("Groq", _call_groq))
+    if cerebras_ai:
+        providers.append(("Cerebras", _call_cerebras))
+    providers.append(("Gemini", _call_gemini))
+
+    last_err = None
+    for name, fn in providers:
+        try:
+            result = fn(prompt)
+            return result
+        except Exception as e:
+            last_err = e
+            err_str = str(e)
+            if _is_rate_limit(err_str):
+                st.toast(f"⏳ {name} rate limit hit — trying next provider…")
+                continue  # try next provider
+            else:
+                # Hard error (auth, model not found, etc.) — skip this provider
+                st.toast(f"⚠️ {name} error: {err_str[:80]} — trying next provider…")
+                continue
+    raise RuntimeError(
+        f"All AI providers failed. Last error: {last_err}\n"
+        "Check your API keys in Streamlit secrets."
+    )
 
 
 def _call_ai_grounded(prompt: str) -> str:
@@ -289,8 +383,8 @@ No text outside the JSON.
     return json.loads(raw)
 
 
-# Seconds to wait between individual scoring calls on free tier (5 rpm = 12 s apart)
-_SCORE_THROTTLE_SECS = 13
+# Seconds between scoring calls — Groq allows 30 RPM so 2s is safe; Gemini-only needs 13s
+_SCORE_THROTTLE_SECS = 2
 
 def ai_match_tenders(open_df: pd.DataFrame) -> pd.DataFrame:
     """Score UNSCORED open tenders only, throttled to stay within free-tier limits.
@@ -699,6 +793,7 @@ st.title("🛡️ CRS Competitive Intelligence Dashboard")
 
 # Sidebar
 st.sidebar.header("Controls")
+st.sidebar.caption(_provider_status())
 if st.sidebar.button("🔄 Refresh All Countries"):
     run_all_scrapers()
     st.cache_data.clear()
