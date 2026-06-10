@@ -63,7 +63,7 @@ def scrape_etenders():
                 "tender_number": tender.get("tender_No"),
                 "department_name": tender.get("department"),
                 "title": tender.get("description", "")[:200],
-                "category": tender.get("category"),
+                "category": tender.get("category"), # <--- THE CULPRIT
                 "issue_date": tender.get("date_Published"),
                 "closing_date": tender.get("closing_Date"),
                 "status": "Open",
