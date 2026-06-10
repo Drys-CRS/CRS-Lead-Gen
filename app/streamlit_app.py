@@ -933,4 +933,3 @@ with tab4:
             if st.button("🗑️ Discard Results"):
                 del st.session_state["discovered"]
                 st.rerun()
-                
