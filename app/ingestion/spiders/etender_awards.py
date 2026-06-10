@@ -4,10 +4,8 @@ import os
 from supabase import create_client
 from dotenv import load_dotenv
 
-# Load environment variables
 load_dotenv(override=True)
 
-# Your highly targeted cybersecurity and training filter list
 TARGET_KEYWORDS = [
     "cyber", "EDR", "firewall", "network", "threat", "vulnerability",
     "training", "comptia", "ibm", "red hat", "ict ", "information technology",
@@ -23,7 +21,7 @@ TARGET_KEYWORDS = [
 ]
 
 def scrape_awarded_tenders():
-    print("🏆 STARTING ETENDERS AWARDS PULL (API STATUS=2) 🏆")
+    print("🏆 STARTING ETENDERS AWARDS PULL (STATUS=2) 🏆")
     
     url = "https://www.etenders.gov.za/Home/PaginatedTenderOpportunities"
     
@@ -45,106 +43,63 @@ def scrape_awarded_tenders():
     }
 
     try:
-        print("📡 Pulling the Awarded master list from eTenders...")
-        response = requests.get(url, params=params, headers=headers)
+        # 1. Connect and Wipe
+        supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
         
-        if response.status_code != 200:
-            print(f"❌ Server Error: {response.text[:500]}")
-            return
+        print("🧹 Clearing old 'Awarded' tenders from the database...")
+        try:
+            supabase.table("sa_tenders").delete().eq("status", "Awarded").execute()
+            print("✅ Database wiped. Ready for fresh awards.")
+        except Exception as e:
+            print(f"⚠️ Warning: Could not clear database: {e}")
 
+        # 2. Fetch Data
+        response = requests.get(url, params=params, headers=headers)
         data = response.json()
         awarded_tenders = data.get("data", [])
         
-        print(f"📥 Received {len(awarded_tenders)} total Awarded tenders. Applying advanced filters...")
-        
-        # Connect to Supabase
-        url_env = os.getenv("SUPABASE_URL")
-        key_env = os.getenv("SUPABASE_KEY")
-        
-        if not url_env or not key_env:
-            print("🚨 SUPABASE URL OR KEY IS MISSING! Check your .env file.")
-            return
-            
-        supabase = create_client(url_env, key_env)
+        print(f"📥 Received {len(awarded_tenders)} awards. Filtering...")
         
         success_count = 0
-        skipped_count = 0
-        
         for tender in awarded_tenders:
-            full_description = tender.get("description", "")
-            category_text = tender.get("category", "")
-            
-            searchable_text = f"{full_description} {category_text}".lower()
-            
-            # Filter against your target keywords
-            is_relevant = any(keyword.lower() in searchable_text for keyword in TARGET_KEYWORDS)
-            
-            if not is_relevant:
-                skipped_count += 1
-                continue 
-                
-            # --- EXTRACT SUCCESSFUL BIDDERS AND AMOUNTS ---
-            # --- REPLACE THE EXTRACTION LOGIC IN etender_awards.py WITH THIS ---
+            # Filter
+            searchable_text = f"{tender.get('description', '')} {tender.get('category', '')}".lower()
+            if not any(k.lower() in searchable_text for k in TARGET_KEYWORDS):
+                continue
 
-            # --- EXTRACT SUCCESSFUL BIDDERS AND AMOUNTS ---
-            # We look for the 'awards' key which is populated upon expansion
+            # --- EXTRACT SUCCESSFUL BIDDERS ---
             awards_data = tender.get("awards", [])
-            
-            winner_names = []
-            award_values = []
+            winner_names = "Not Disclosed"
+            award_values = "0"
             
             if awards_data and isinstance(awards_data, list):
-                for award in awards_data:
-                    # Capture Bidder Name
-                    name = award.get("awardee") or award.get("successful_bidder") or "Unknown Bidder"
-                    winner_names.append(name)
-                    
-                    # Capture Amount
-                    val = award.get("amount") or award.get("value") or "0"
-                    award_values.append(str(val))
-            
-            # If still empty, check if it's hidden in the 'description' field (common fallback)
-            if not winner_names and "SUCCESSFUL BIDDER(S):" in full_description:
-                # Basic string parsing to pull it out of the text if the JSON is empty
-                try:
-                    parts = full_description.split("SUCCESSFUL BIDDER(S):")[1].split("\n")[0]
-                    winner_names = [parts.strip()]
-                    award_values = ["Data in Text"]
-                except:
-                    pass
+                names = [a.get("awardee") or "Unknown" for a in awards_data]
+                vals = [str(a.get("amount") or "0") for a in awards_data]
+                winner_names = " | ".join(names)
+                award_values = " | ".join(vals)
 
-            # Join arrays into strings for DB storage
-            winning_bidder_str = " | ".join(winner_names) if winner_names else "Not Disclosed"
-            award_value_str = " | ".join(award_values) if award_values else "0"
-
+            # 3. Upsert New Record
             tender_data = {
                 "tender_number": tender.get("tender_No"),
                 "department_name": tender.get("department"),
-                "title": full_description[:200], 
-                "description": full_description, 
-                "winning_bidder": winning_bidder_str, # New dedicated column
-                "award_value": award_value_str,       # New dedicated column
-                # ... rest of your mapping ...
+                "title": tender.get("description", "")[:200],
+                "description": tender.get("description", ""),
+                "category": tender.get("category", ""),
+                "compliance_requirements": tender.get("conditions", "N/A"),
+                "portal_link": "https://www.etenders.gov.za/Home/opportunities?id=2",
+                "status": "Awarded",
+                "winning_bidder": winner_names,
+                "award_value": award_values
             }
 
-            try:
-                supabase.table("sa_tenders").upsert(
-                    tender_data, 
-                    on_conflict="tender_number,department_name"
-                ).execute()
-                success_count += 1
-                print(f"✅ Logged Win: {tender.get('tender_No')} -> {winner_names} ({award_values})")
-            except Exception as db_error:
-                print(f"⚠️ DB Upsert Failed for {tender.get('tender_No')}: {db_error}")
+            supabase.table("sa_tenders").upsert(tender_data, on_conflict="tender_number,department_name").execute()
+            success_count += 1
+            print(f"✅ Logged: {tender.get('tender_No')} -> {winner_names}")
 
-        print("\n=================================")
-        print(f"🚀 Awards Pipeline Complete!")
-        print(f"🗑️ Ignored {skipped_count} irrelevant awards.")
-        print(f"💾 Pushed {success_count} targeted wins to Supabase.")
-        print("=================================")
+        print(f"\n🚀 Pipeline Complete! {success_count} wins stored.")
 
     except Exception as e:
-        print(f"❌ Critical Pipeline Failure: {e}")
+        print(f"❌ Error: {e}")
 
 if __name__ == "__main__":
     scrape_awarded_tenders()
