@@ -8,14 +8,33 @@ load_dotenv(override=True)
 
 class ETenderAPISpider(scrapy.Spider):
     name = "etender_api"
-    # Target the newly discovered live API endpoint
-    start_urls = ["https://www.etenders.gov.za/Home/PaginatedTenderOpportunities"]
 
     def start_requests(self):
-        # Send a POST request with 'status=1' (Currently Advertised)
-        yield scrapy.FormRequest(
-            url="https://www.etenders.gov.za/Home/PaginatedTenderOpportunities",
-            formdata={'status': '1'},
+        url = "https://www.etenders.gov.za/Home/PaginatedTenderOpportunities"
+        
+        # We must simulate the exact JSON structure DataTables sends to prevent server crashes
+        payload = {
+            "draw": 1,
+            "start": 0,
+            "length": 1000,
+            "status": 1, # 1 = Currently Advertised
+            "search": {"value": "", "regex": False},
+            "order": [{"column": 2, "dir": "desc"}] # Matches their JS sorting rule
+        }
+
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'X-Requested-With': 'XMLHttpRequest',
+            'Content-Type': 'application/json; charset=UTF-8',
+            'Accept': 'application/json, text/javascript, */*; q=0.01'
+        }
+
+        # Send as a POST request with the JSON body
+        yield scrapy.Request(
+            url=url,
+            method="POST",
+            body=json.dumps(payload),
+            headers=headers,
             callback=self.parse
         )
 
