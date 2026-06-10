@@ -1,126 +1,70 @@
 import scrapy
 import json
 import os
-import re
 from supabase import create_client
 from dotenv import load_dotenv
+import re
 
+# Load environment variables
 load_dotenv(override=True)
 
 def normalize_ref(ref_string):
     if not ref_string:
         return "UNKNOWN"
-    clean_str = re.sub(r'[\s/]+', '-', ref_string.strip().upper())
-    return clean_str
+    return re.sub(r'[\s/]+', '-', str(ref_string).strip().upper())
 
-class ETenderSpider(scrapy.Spider):
+class ETenderAPISpider(scrapy.Spider):
     name = "etender_api"
-    # Pointing to example.com to bypass the broken National Treasury DNS
-    start_urls = ["http://example.com"]
+    
+    # Targeting the live OCDS API endpoint used by the transparency portal
+    start_urls = ["https://ocds.etenders.gov.za/api/tenders"]
+
+    # Spoofing headers to look like a standard Chrome browser request
+    custom_settings = {
+        'DEFAULT_REQUEST_HEADERS': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'application/json, text/javascript, */*; q=0.01',
+            'Referer': 'https://www.etenders.gov.za/'
+        },
+        'ROBOTSTXT_OBEY': False # Necessary for API access
+    }
 
     def __init__(self, *args, **kwargs):
-        super(ETenderSpider, self).__init__(*args, **kwargs)
-        url = os.getenv("SUPABASE_URL")
-        key = os.getenv("SUPABASE_KEY")
-        self.supabase = create_client(url, key)
+        super(ETenderAPISpider, self).__init__(*args, **kwargs)
+        self.supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 
     def parse(self, response):
-        self.logger.info("Bypassing broken Gov DNS. Loading mock eTender payload...")
-        
-        # Comprehensive dataset across the major South African procurement tiers
-        mock_json_data = """
-        {
-            "tenders": [
-                {
-                    "tenderNumber": "E/KM3241-CS",
-                    "department": "Eskom Holdings SOC Ltd",
-                    "country": "South Africa",
-                    "title": "Substation Firewall Infrastructure Refresh and Network Segmentation",
-                    "description": "Procurement of industrial-grade enterprise firewalls, deployment services, and zero-trust architecture implementation across critical generation sub-stations.",
-                    "datePublished": "2026-06-09",
-                    "closingDate": "2026-07-28",
-                    "url": "https://tenderbulletin.eskom.co.za",
-                    "requirements": "Mandatory CSD Registration, B-BBEE Level 1-4, Certified OEM Deployment Partner Status"
-                },
-                {
-                    "tenderNumber": "TN/2026/05/0012/GCTC",
-                    "department": "Transnet SOC Ltd",
-                    "country": "South Africa",
-                    "title": "Endpoint Detection and Response (EDR) Licensing and 3-Year Support",
-                    "description": "Supply, delivery, and configuration of enterprise-wide EDR agent licensing to secure port and rail logistics operations infrastructure.",
-                    "datePublished": "2026-06-08",
-                    "closingDate": "2026-07-14",
-                    "url": "https://transnetetenders.azurewebsites.net",
-                    "requirements": "B-BBEE Level 1-3, Valid Tax Compliance Status, National Treasury CSD Verified"
-                },
-                {
-                    "tenderNumber": "241S/2025/26",
-                    "department": "City of Cape Town Municipality",
-                    "title": "Provision of Red Hat Enterprise Linux (RHEL) and SUSE Subscription Portfolios",
-                    "country": "South Africa",
-                    "description": "Tender for an authorized value-added partner to supply enterprise open-source software subscriptions, technical support, and platform architecture training.",
-                    "datePublished": "2026-06-10",
-                    "closingDate": "2026-07-22",
-                    "url": "https://web1.capetown.gov.za/web1/TenderPortal",
-                    "requirements": "Local Supplier Preference, B-BBEE Compliant, OEM Authorized Distributor Letter"
-                },
-                {
-                    "tenderNumber": "RFP 45/2026",
-                    "department": "South African Revenue Service (SARS)",
-                    "country": "South Africa",
-                    "title": "Advanced Threat Exposure Management and Vulnerability Assessment Platform",
-                    "description": "Implementation of a centralized vulnerability management platform incorporating VAPT automation, risk-based prioritization, and security posture dashboards.",
-                    "datePublished": "2026-06-07",
-                    "closingDate": "2026-07-09",
-                    "url": "https://www.sars.gov.za/about/procurement",
-                    "requirements": "Strict B-BBEE Level 1-2 Requirement, Comprehensive CSD Profile, ISO 27001 Compliance Certification"
-                },
-                {
-                    "tenderNumber": "DPW-HQ-20419",
-                    "department": "Department of Public Works and Infrastructure",
-                    "country": "South Africa",
-                    "title": "Cybersecurity Awareness and Information Security Risk Training",
-                    "description": "Provision of formal cybersecurity capability training, risk management courses, and basic awareness qualifications for public sector administrative personnel.",
-                    "datePublished": "2026-06-05",
-                    "closingDate": "2026-07-18",
-                    "url": "https://www.publicworks.gov.za",
-                    "requirements": "SAQA Aligned Training Credentials, MICT SETA or QCTO Accreditation, CSD Registered"
-                }
-            ]
-        }
-        """
-
         try:
-            data = json.loads(mock_json_data)
-            tenders = data.get("tenders", [])
-        except json.JSONDecodeError:
-            self.logger.error("Failed to decode mock dataset.")
-            return
-
-        for tender in tenders:
-            raw_tender_no = tender.get("tenderNumber")
-            tender_no = normalize_ref(raw_tender_no)
+            # Parse the JSON response directly
+            data = response.json()
+            tenders = data.get("data", []) # Adjust if the key is 'items' or 'results'
             
-            self.logger.info(f"Processing regional target: {tender_no} [{tender.get('country')}]")
+            self.logger.info(f"Successfully connected to live API. Found {len(tenders)} tenders.")
 
-            tender_data = {
-                "tender_number": tender_no,
-                "department_name": tender.get("department"),
-                "country": tender.get("country", "South Africa"),
-                "title": tender.get("title"),
-                "description": tender.get("description"),
-                "issue_date": tender.get("datePublished"),
-                "closing_date": tender.get("closingDate"),
-                "source_url": tender.get("url"),
-                "status": "Open",
-                "compliance_requirements": tender.get("requirements")
-            }
+            for tender in tenders:
+                tender_no = normalize_ref(tender.get("tenderNumber"))
+                title = tender.get("title", "No Title")
+                
+                # Database structure
+                tender_data = {
+                    "tender_number": tender_no,
+                    "department_name": tender.get("department", "Unknown"),
+                    "title": title[:200],
+                    "description": tender.get("description", "")[:500],
+                    "issue_date": tender.get("datePublished"),
+                    "closing_date": tender.get("closingDate"),
+                    "status": "Open",
+                    "award_status": "In Evaluation",
+                    "country": "South Africa"
+                }
 
-            try:
+                # Upsert to Supabase
                 self.supabase.table("sa_tenders").upsert(
                     tender_data, 
                     on_conflict="tender_number,department_name" 
                 ).execute()
-                self.logger.info(f"Successfully upserted {tender_no} into the pipeline.")
-            except Exception as e:
-                self.logger.error(f"Database error writing {tender_no}: {e}")
+                
+                self.logger.info(f"Live Ingest: {tender_no}")
+
+        except Exception as e:
+            self.logger.error(f"Failed to process live API feed: {e}")
