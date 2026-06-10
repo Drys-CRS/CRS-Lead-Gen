@@ -84,46 +84,47 @@ def scrape_awarded_tenders():
                 continue 
                 
             # --- EXTRACT SUCCESSFUL BIDDERS AND AMOUNTS ---
+            # --- REPLACE THE EXTRACTION LOGIC IN etender_awards.py WITH THIS ---
+
+            # --- EXTRACT SUCCESSFUL BIDDERS AND AMOUNTS ---
+            # We look for the 'awards' key which is populated upon expansion
             awards_data = tender.get("awards", [])
-            winner_names = "Not Disclosed"
-            award_values = "Not Disclosed"
             
-            if awards_data and isinstance(awards_data, list) and len(awards_data) > 0:
-                names_list = []
-                values_list = []
-                
+            winner_names = []
+            award_values = []
+            
+            if awards_data and isinstance(awards_data, list):
                 for award in awards_data:
-                    # Get Name
-                    names_list.append(award.get("awardee", "Unknown Bidder"))
+                    # Capture Bidder Name
+                    name = award.get("awardee") or award.get("successful_bidder") or "Unknown Bidder"
+                    winner_names.append(name)
                     
-                    # Get and format Amount safely
-                    raw_amount = award.get("amount")
-                    if isinstance(raw_amount, (int, float)):
-                        values_list.append(f"R{raw_amount:,.2f}")
-                    elif raw_amount:
-                        values_list.append(str(raw_amount))
-                    else:
-                        values_list.append("Unknown Amount")
-                
-                # Join them together in case there are multiple winners
-                winner_names = " | ".join(names_list)
-                award_values = " | ".join(values_list)
+                    # Capture Amount
+                    val = award.get("amount") or award.get("value") or "0"
+                    award_values.append(str(val))
+            
+            # If still empty, check if it's hidden in the 'description' field (common fallback)
+            if not winner_names and "SUCCESSFUL BIDDER(S):" in full_description:
+                # Basic string parsing to pull it out of the text if the JSON is empty
+                try:
+                    parts = full_description.split("SUCCESSFUL BIDDER(S):")[1].split("\n")[0]
+                    winner_names = [parts.strip()]
+                    award_values = ["Data in Text"]
+                except:
+                    pass
+
+            # Join arrays into strings for DB storage
+            winning_bidder_str = " | ".join(winner_names) if winner_names else "Not Disclosed"
+            award_value_str = " | ".join(award_values) if award_values else "0"
 
             tender_data = {
                 "tender_number": tender.get("tender_No"),
                 "department_name": tender.get("department"),
                 "title": full_description[:200], 
                 "description": full_description, 
-                "category": category_text,
-                "compliance_requirements": tender.get("conditions", "Not specified"),
-                "portal_link": "https://www.etenders.gov.za/Home/opportunities?id=2", 
-                "issue_date": tender.get("date_Published"),
-                "closing_date": tender.get("closing_Date"),
-                "status": "Awarded",
-                "award_status": "Published", 
-                "winning_bidder": winner_names, # Mapped to new column
-                "award_value": award_values,    # Mapped to new column
-                "country": "South Africa"
+                "winning_bidder": winning_bidder_str, # New dedicated column
+                "award_value": award_value_str,       # New dedicated column
+                # ... rest of your mapping ...
             }
 
             try:
