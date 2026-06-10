@@ -210,6 +210,15 @@ st.sidebar.header("Filters")
 competitor_search = st.sidebar.text_input("Filter by Winning Bidder")
 dept_search = st.sidebar.text_input("Filter by Department")
 
+# Country filter — populated from whatever countries are in the DB
+all_countries = sorted(tenders_df["country"].dropna().unique().tolist()) if "country" in tenders_df.columns and not tenders_df.empty else []
+selected_countries = st.sidebar.multiselect(
+    "Filter by Country",
+    options=all_countries,
+    default=all_countries,
+    help="Select one or more countries to show"
+)
+
 # Load data
 tenders_df = fetch_tenders()
 
@@ -222,12 +231,14 @@ for col in ["ai_score", "ai_rationale"]:
     if col not in tenders_df.columns:
         tenders_df[col] = None
 
-# Apply department filter
+# Apply filters
 df_filtered = tenders_df.copy()
 if dept_search:
     df_filtered = df_filtered[
         df_filtered["department_name"].str.contains(dept_search, case=False, na=False)
     ]
+if selected_countries and "country" in df_filtered.columns:
+    df_filtered = df_filtered[df_filtered["country"].isin(selected_countries)]
 
 # ─────────────────────────────────────────────
 tab1, tab2, tab3 = st.tabs([
@@ -256,7 +267,7 @@ with tab1:
         open_df = open_df.sort_values("ai_score", ascending=False, na_position="last")
 
     # Build display frame
-    display_cols = ["tender_number", "department_name", "title", "closing_date"]
+    display_cols = ["country", "tender_number", "department_name", "title", "closing_date"]
     if open_df["ai_score"].notna().any():
         open_df["Fit Score"] = open_df["ai_score"].apply(score_badge)
         display_cols.append("Fit Score")
@@ -282,7 +293,7 @@ with tab1:
             if pd.notna(t.get("ai_score")):
                 st.metric("AI Fit Score", score_badge(t["ai_score"]))
 
-        st.write(f"**Department:** {t.get('department_name', 'N/A')}")
+        st.write(f"**Country:** {t.get('country', 'N/A')}  |  **Department:** {t.get('department_name', 'N/A')}")
         st.write(f"**Description:** {t.get('description', 'N/A')}")
         st.write(f"**Compliance Requirements:** {t.get('compliance_requirements', 'N/A')}")
         st.write(f"**Closing Date:** {t.get('closing_date', 'N/A')}")
@@ -338,25 +349,26 @@ with tab2:
         )
         awarded_df["numeric_value"] = pd.to_numeric(awarded_df["clean_val"], errors="coerce").fillna(0)
 
-        # Pivot
+        # Pivot — group by country + bidder so values can't be compared cross-currency
         pivot = awarded_df.pivot_table(
             values="numeric_value",
-            index="winning_bidder",
+            index=["country", "winning_bidder"] if "country" in awarded_df.columns else "winning_bidder",
             aggfunc={"numeric_value": ["sum", "count"]}
         )
-        pivot.columns = ["Tender Count", "Total Won (ZAR)"]
-        pivot = pivot.sort_values("Total Won (ZAR)", ascending=False)
+        pivot.columns = ["Tender Count", "Total Won (Value)"]
+        pivot = pivot.sort_values("Total Won (Value)", ascending=False)
 
         st.subheader("Competitor Market Share")
+        st.caption("⚠️ Values are in local currency per country — don't sum across countries.")
         st.dataframe(
-            pivot.style.format({"Total Won (ZAR)": "R{:,.0f}"}),
+            pivot.style.format({"Total Won (Value)": "{:,.0f}"}),
             use_container_width=True
         )
 
         st.divider()
         st.subheader("Award Detail")
         st.dataframe(
-            awarded_df[["tender_number", "department_name", "winning_bidder", "award_value", "title"]],
+            awarded_df[["country", "tender_number", "department_name", "winning_bidder", "award_value", "title"]],
             use_container_width=True,
             hide_index=True,
         )
