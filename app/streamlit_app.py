@@ -2,27 +2,54 @@ import streamlit as st
 import pandas as pd
 from supabase import create_client, Client
 import os
+import requests
 
 # --- Page Configuration ---
 st.set_page_config(page_title="CRS Target Pipeline", layout="wide")
 
-# --- Supabase Connection ---
+# --- Supabase & GitHub Connection ---
 @st.cache_resource
-def init_connection() -> Client:
-    # Check for Streamlit Cloud secrets first, fallback to local environment variables
-    try:
-        url = st.secrets["SUPABASE_URL"]
-        key = st.secrets["SUPABASE_KEY"]
-    except FileNotFoundError:
-        url = os.environ.get("SUPABASE_URL")
-        key = os.environ.get("SUPABASE_KEY")
-    
-    return create_client(url, key)
+def init_connection():
+    return {
+        "supabase": create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"]),
+        "gh_token": st.secrets["GH_PAT"]
+    }
 
-supabase = init_connection()
+conn = init_connection()
+supabase = conn["supabase"]
 
-# --- Data Loading ---
-@st.cache_data(ttl=600) # Cache data for 10 minutes to keep the dashboard fast
+# --- GitHub Workflow Trigger ---
+def trigger_github_workflow():
+    owner = "Drys-CRS"
+    repo = "CRS-Lead-Gen"
+    workflow_id = "daily_scrape.yml"
+    url = f"https://api.github.com/repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches"
+    headers = {
+        "Authorization": f"token {conn['gh_token']}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+    data = {"ref": "main"}
+    response = requests.post(url, headers=headers, json=data)
+    return response.status_code == 204
+
+# --- Sidebar Controls (OUTSIDE the try block) ---
+st.sidebar.title("Pipeline Controls")
+
+if st.sidebar.button("🔄 Refresh View"):
+    st.cache_data.clear()
+    st.rerun()
+
+if st.sidebar.button("🚀 Force Run Scrapers"):
+    with st.spinner("Dispatching trigger to GitHub..."):
+        if trigger_github_workflow():
+            st.sidebar.success("Pipeline triggered! Check GitHub Actions.")
+        else:
+            st.sidebar.error("Failed to trigger pipeline.")
+
+st.sidebar.caption(f"Last updated: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+# --- Data Loading & Main App ---
+@st.cache_data(ttl=600)
 def load_data():
     response = supabase.table("sa_tenders").select("*").execute()
     return pd.DataFrame(response.data)
@@ -33,76 +60,28 @@ try:
     df = load_data()
     
     if df.empty:
-        st.info("No tender data found in the database. Run your spiders to populate the pipeline.")
+        st.info("Database empty. Use 'Force Run Scrapers' to populate.")
     else:
-        # --- 1. Split the Data ---
         df_pending = df[df['award_status'] != 'Awarded'].copy()
         df_won = df[df['award_status'] == 'Awarded'].copy()
 
-        # --- 2. Shared Column Configuration ---
         shared_config = {
             "document_url": st.column_config.LinkColumn("Tender Document", display_text="Download PDF"),
             "source_url": st.column_config.LinkColumn("Portal Link", display_text="View Portal"),
             "award_value": st.column_config.NumberColumn("Award Value (ZAR)", format="R %d")
         }
 
-        # --- 3. Build the Tabbed Interface ---
-        # --- Force Refresh Mechanism ---
-# This button clears the local cache and forces a re-run of the load_data function
-if st.sidebar.button("🔄 Refresh All Data & Sources"):
-    st.cache_data.clear()
-    st.cache_resource.clear()
-    st.rerun()
-
-# Optional: Add a timestamp of the last refresh
-st.sidebar.caption(f"Last updated: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}")
         tab1, tab2 = st.tabs(["🟢 Active Pipeline", "🏆 Competitive Intelligence"])
 
         with tab1:
             st.subheader(f"Open Opportunities ({len(df_pending)})")
-            st.caption("Active IBM, Red Hat, CompTIA, and Cybersecurity tenders currently in evaluation.")
-            
-            if not df_pending.empty:
-                # Hide the winner columns and database metadata
-                display_pending = df_pending.drop(columns=['winning_bidder', 'award_value', 'id', 'created_at'], errors='ignore')
-                
-                st.dataframe(
-                    display_pending,
-                    column_config=shared_config,
-                    hide_index=True,
-                    use_container_width=True
-                )
-            else:
-                st.write("No active opportunities matching your criteria.")
+            display_pending = df_pending.drop(columns=['winning_bidder', 'award_value', 'id', 'created_at'], errors='ignore')
+            st.dataframe(display_pending, column_config=shared_config, hide_index=True, use_container_width=True)
 
         with tab2:
             st.subheader(f"Awarded Contracts ({len(df_won)})")
-            st.caption("Track competitor wins and contract values for future renewal targeting.")
-            
-            if not df_won.empty:
-                cols = df_won.columns.tolist()
-                
-                # Clean up internal database columns
-                for col in ['id', 'created_at']:
-                    if col in cols:
-                        cols.remove(col)
-                        
-                # Rearrange columns to put the competitor and value front and center
-                if 'winning_bidder' in cols and 'award_value' in cols:
-                    cols.insert(2, cols.pop(cols.index('winning_bidder')))
-                    cols.insert(3, cols.pop(cols.index('award_value')))
-                    display_won = df_won[cols]
-                else:
-                    display_won = df_won
-
-                st.dataframe(
-                    display_won,
-                    column_config=shared_config,
-                    hide_index=True,
-                    use_container_width=True
-                )
-            else:
-                st.write("No historical awarded contracts recorded yet.")
+            display_won = df_won.drop(columns=['id', 'created_at'], errors='ignore')
+            st.dataframe(display_won, column_config=shared_config, hide_index=True, use_container_width=True)
 
 except Exception as e:
-    st.error(f"Error connecting to database or loading data: {e}")
+    st.error(f"Error loading data: {e}")
