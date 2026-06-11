@@ -3,7 +3,12 @@ import pandas as pd
 import os
 import json
 import re
-import google.generativeai as genai
+try:
+    import google.genai as genai
+    _GENAI_NEW = True
+except ImportError:
+    import google.generativeai as genai  # legacy fallback
+    _GENAI_NEW = False
 from supabase import create_client
 
 # Monday.com integration (optional — only active if MONDAY_API_KEY is set)
@@ -863,12 +868,24 @@ def _call_openrouter(prompt: str) -> str:
 
 
 def _call_gemini(prompt: str, retries: int = 3) -> str:
-    """Call Gemini with backoff. Raises after all retries."""
+    """Call Gemini with backoff. Handles both new google.genai and legacy SDK."""
+    if ai is None:
+        raise RuntimeError("Gemini not initialised — check GEMINI_API_KEY in secrets.")
     delay = 20
     for attempt in range(retries):
         try:
-            response = ai.generate_content(prompt)
-            return _clean(response.text)
+            if _GENAI_NEW:
+                # New google.genai SDK
+                response = ai.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=prompt,
+                )
+                text = response.text
+            else:
+                # Legacy google.generativeai SDK
+                response = ai.generate_content(prompt)
+                text = response.text
+            return _clean(text)
         except Exception as e:
             if _is_rate_limit(str(e)) and attempt < retries - 1:
                 wait = delay * (attempt + 1)
@@ -929,28 +946,34 @@ def _call_ai(prompt: str) -> str:
 
 
 def _call_ai_grounded(prompt: str) -> str:
-    """Call Gemini WITH Google Search grounding so it can find current web results.
-    Falls back to ungrounded if grounding is unavailable on this API tier/model."""
-    grounded_attempts = [
-        # Gemini 2.5 Flash with Google Search grounding (current SDK syntax)
-        lambda: genai.GenerativeModel(
-            "gemini-2.5-flash",
-            tools=[{"google_search": {}}]
-        ).generate_content(prompt),
-        # Fallback: 2.5 Pro for higher quality grounded results
-        lambda: genai.GenerativeModel(
-            "gemini-2.5-pro",
-            tools=[{"google_search": {}}]
-        ).generate_content(prompt),
-    ]
-    for attempt in grounded_attempts:
-        try:
-            response = attempt()
+    """Call Gemini WITH Google Search grounding. Handles both new and legacy SDK."""
+    key = st.secrets.get("GEMINI_API_KEY", "")
+    if not key:
+        return _call_ai(prompt)
+    try:
+        if _GENAI_NEW:
+            # New google.genai SDK
+            from google.genai import types as _gtypes
+            client = genai.Client(api_key=key)
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=prompt,
+                config=_gtypes.GenerateContentConfig(
+                    tools=[_gtypes.Tool(google_search=_gtypes.GoogleSearch())]
+                ),
+            )
             raw = response.text.strip()
-            return re.sub(r"^```json\s*|^```\s*|```$", "", raw, flags=re.MULTILINE).strip()
-        except Exception:
-            continue
-    # Ungrounded fallback — still useful (suggests known portals/companies) but not live
+        else:
+            # Legacy SDK
+            response = genai.GenerativeModel(
+                "gemini-2.5-flash",
+                tools=[{"google_search": {}}]
+            ).generate_content(prompt)
+            raw = response.text.strip()
+        return re.sub(r"^```json\s*|^```\s*|```$", "", raw, flags=re.MULTILINE).strip()
+    except Exception:
+        pass
+    # Ungrounded fallback
     return _call_ai(prompt)
 
 
