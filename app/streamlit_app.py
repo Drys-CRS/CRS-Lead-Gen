@@ -1316,13 +1316,28 @@ with tab5:
         key = st.secrets.get("APOLLO_API_KEY", "")
         return {"x-api-key": key, "Content-Type": "application/json", "accept": "application/json"}
 
-    def _search_reddit_signals(keywords: list, limit: int = 10) -> list:
-        """Search Reddit public JSON API for buying-signal posts. No key needed."""
-        import requests, time
+    # African country/region terms appended to every search to geo-filter signals
+    _AFRICA_GEO_TERMS = [
+        "South Africa", "Kenya", "Nigeria", "Ghana", "Tanzania", "Uganda",
+        "Zambia", "Rwanda", "Africa", "African", "Johannesburg", "Cape Town",
+        "Nairobi", "Lagos", "Accra",
+    ]
+    _AFRICA_SUBREDDITS = [
+        "r/southafrica", "r/africa", "r/Nigeria", "r/Kenya", "r/Ghana",
+        "r/cybersecurity", "r/netsec", "r/sysadmin", "r/networking",
+        "r/ITManagers", "r/msp",
+    ]
+
+    def _search_reddit_signals(keywords: list, limit: int = 15) -> list:
+        """Search Reddit for African buying-signal posts. No key needed."""
+        import requests
         results = []
-        query = " OR ".join(f'"{k}"' for k in keywords[:4])
+        # Build query: focus keywords + Africa geo filter
+        kw_part  = " OR ".join(f'"{k}"' for k in keywords[:3])
+        geo_part = " OR ".join(f'"{g}"' for g in _AFRICA_GEO_TERMS[:5])
+        query    = f"({kw_part}) ({geo_part})"
         url = "https://www.reddit.com/search.json"
-        params = {"q": query, "sort": "new", "t": "month", "limit": limit, "type": "link"}
+        params = {"q": query, "sort": "new", "t": "year", "limit": limit, "type": "link"}
         try:
             r = requests.get(url, params=params,
                              headers={"User-Agent": "CRS-LeadGen/1.0"}, timeout=15)
@@ -1330,28 +1345,26 @@ with tab5:
                 for post in r.json().get("data", {}).get("children", []):
                     d = post.get("data", {})
                     results.append({
-                        "source": "Reddit",
+                        "source": f"Reddit r/{d.get('subreddit','')}",
                         "title": d.get("title", ""),
                         "url": f"https://reddit.com{d.get('permalink','')}",
-                        "subreddit": d.get("subreddit", ""),
-                        "score": d.get("score", 0),
-                        "text": d.get("selftext", "")[:500],
-                        "created": d.get("created_utc"),
+                        "text": d.get("selftext", "")[:300],
+                        "published": "",
+                        "crs_score": None,
                     })
         except Exception as e:
             st.toast(f"Reddit fetch error: {e}")
         return results
 
     def _search_news(keywords: list, countries: list, limit: int = 20) -> list:
-        """NewsAPI free tier — African tech & cyber news."""
+        """NewsAPI free tier — African tech & cyber news, geo-filtered."""
         import requests
         key = st.secrets.get("NEWSAPI_KEY", "")
         if not key:
             return []
-        query = " OR ".join(keywords[:4])
-        # Add country context
-        country_terms = " OR ".join(countries[:3])
-        full_query = f"({query}) AND ({country_terms})"
+        kw_part  = " OR ".join(f'"{k}"' for k in keywords[:3])
+        geo_part = " OR ".join(f'"{c}"' for c in (countries + ["Africa"])[:4])
+        full_query = f"({kw_part}) AND ({geo_part})"
         try:
             r = requests.get("https://newsapi.org/v2/everything", params={
                 "q": full_query, "sortBy": "publishedAt", "language": "en",
@@ -1364,6 +1377,7 @@ with tab5:
                     "url": a.get("url",""),
                     "text": a.get("description","") or "",
                     "published": a.get("publishedAt","")[:10],
+                    "crs_score": None,
                 } for a in r.json().get("articles", [])]
         except Exception as e:
             st.toast(f"NewsAPI error: {e}")
@@ -1560,16 +1574,22 @@ with tab5:
             st.toast(f"Apollo bulk account error: {e}")
         return {}
 
-    def _ai_score_leads(signals: list, people: list, jse_companies: list, focus: list) -> dict:
-        """Use AI to score companies by buying signal strength and produce outreach angles."""
+    def _ai_score_leads(signals: list, people: list, companies: list, focus: list) -> dict:
+        """Score every signal, company and person for CRS relevance, then recommend targets."""
         nl = "\n"
-        signal_summary = nl.join(
-            f"- [{s['source']}] {s['title'][:120]}" for s in signals[:20]
+
+        # Safe field access — JSE has 'sector', Apollo orgs have 'industry'
+        def _co_label(c):
+            sector = c.get("sector") or c.get("industry") or "unknown sector"
+            return f"- {c.get('name','?')} ({sector})"
+
+        signal_summary  = nl.join(
+            f"- [{s.get('source','?')}] {s.get('title','')[:120]}" for s in signals[:25]
         )
-        jse_names = nl.join(f"- {c['name']} ({c['sector']})" for c in jse_companies)
-        people_summary = nl.join(
-            f"- {p['name']}, {p['title']} at {p['company']} ({p['country']})"
-            for p in people[:20]
+        company_summary = nl.join(_co_label(c) for c in companies[:30])
+        people_summary  = nl.join(
+            f"- {p.get('name','?')} | {p.get('title','')} at {p.get('company','')} ({p.get('country','')})"
+            for p in people[:25]
         )
 
         prompt = f"""You are a B2B sales strategist for Cyber Retaliator Solutions (CRS).
@@ -1577,49 +1597,52 @@ with tab5:
 CRS PROFILE:
 {CRS_PROFILE}
 
-SOLUTION FOCUS FOR THIS SEARCH: {', '.join(focus)}
+SOLUTION FOCUS: {", ".join(focus)}
 
-BUYING SIGNALS DETECTED (Reddit + News):
-{signal_summary or "No signals found."}
+ALL DATA IS AFRICA-FOCUSED. Score every item 1-10 for CRS relevance where:
+10 = perfect fit (active buying signal + CRS can directly solve the need)
+7-9 = strong fit
+4-6 = moderate fit
+1-3 = weak/indirect fit
 
-JSE-LISTED COMPANIES IN SCOPE:
-{jse_names or "Not included."}
+BUYING SIGNALS (Reddit + News — Africa):
+{signal_summary or "None found."}
 
-PEOPLE FOUND VIA APOLLO:
-{people_summary or "No people found."}
+COMPANIES IN SCOPE (JSE + Apollo orgs):
+{company_summary or "None."}
 
-Your task:
-1. Identify the TOP 8 COMPANIES to target based on the signals, JSE list, and people found.
-   Prioritise companies where buying signals align with CRS's solutions.
-2. For each company, suggest the best OUTREACH ANGLE in one sentence.
-3. From the people list, identify the TOP 5 CONTACTS to reach out to first and why.
-4. Suggest 3 FOLLOW-UP ACTIONS CRS should take this week.
+DECISION-MAKERS (Apollo contacts + top people):
+{people_summary or "None found."}
 
-Return ONLY a valid JSON object:
+Return ONLY a valid JSON object with these exact keys:
 {{
-  "top_companies": [
-    {{
-      "name": "company name",
-      "why": "1-2 sentence buying signal rationale",
-      "outreach_angle": "one sentence",
-      "urgency": "high/medium/low",
-      "domain": "company domain or null"
-    }}
+  "scored_signals": [
+    {{"title": "signal title (first 80 chars)", "crs_score": 1-10, "reason": "one sentence"}}
   ],
-  "top_contacts": [
-    {{
-      "name": "person name",
-      "title": "job title",
-      "company": "company",
-      "why_first": "why reach out to this person first",
-      "linkedin": "linkedin url or null"
-    }}
+  "scored_companies": [
+    {{"name": "company", "crs_score": 1-10, "why": "1-2 sentences", "outreach_angle": "one sentence", "urgency": "high/medium/low"}}
   ],
-  "follow_up_actions": ["action 1", "action 2", "action 3"]
+  "scored_contacts": [
+    {{"name": "person", "title": "title", "company": "company", "crs_score": 1-10, "why_first": "one sentence", "linkedin": "url or null"}}
+  ],
+  "top_companies": ["name1", "name2", "name3", "name4", "name5"],
+  "top_contacts":  ["name1", "name2", "name3"],
+  "follow_up_actions": ["action 1", "action 2", "action 3"],
+  "overall_market_signal": "2-3 sentence summary of what the data tells CRS about the African market right now"
 }}
 """
         raw = _call_ai(prompt)
-        return json.loads(raw)
+        result = json.loads(raw)
+
+        # Back-fill crs_score onto the original signal/people dicts for display
+        score_map_signals  = {s.get("title","")[:80]: s.get("crs_score") for s in result.get("scored_signals",[])}
+        score_map_contacts = {c.get("name",""):        c.get("crs_score") for c in result.get("scored_contacts",[])}
+        for s in signals:
+            s["crs_score"] = score_map_signals.get(s.get("title","")[:80])
+        for p in people:
+            p["crs_score"] = score_map_contacts.get(p.get("name",""))
+
+        return result
 
     # ────────────────────────────────────────────────────────────────────────
     # RUN LEAD SEARCH
@@ -1700,14 +1723,24 @@ Return ONLY a valid JSON object:
 
         st.divider()
 
-        # ── AI Top Companies ─────────────────────────────────────────────
-        top_cos = ai_out.get("top_companies", [])
-        if top_cos:
-            st.subheader(f"🏢 Top {len(top_cos)} Target Companies")
-            for co in top_cos:
-                icon = URGENCY.get(co.get("urgency","low"), "⚪")
+        # ── Market Signal Summary ────────────────────────────────────────
+        market_signal = ai_out.get("overall_market_signal", "")
+        if market_signal:
+            st.info(f"🌍 **Market Signal:** {market_signal}")
+
+        st.divider()
+
+        # ── AI Scored Companies ──────────────────────────────────────────
+        scored_cos = ai_out.get("scored_companies", [])
+        if scored_cos:
+            scored_cos_sorted = sorted(scored_cos, key=lambda x: x.get("crs_score",0), reverse=True)
+            st.subheader(f"🏢 Companies — CRS Relevance Ranked ({len(scored_cos_sorted)})")
+            for co in scored_cos_sorted:
+                score = co.get("crs_score", 0)
+                icon  = URGENCY.get(co.get("urgency","low"), "⚪")
+                badge = "🟢" if score >= 8 else "🟡" if score >= 5 else "🔴"
                 with st.expander(
-                    f"{icon} **{co.get('name','')}** — {co.get('urgency','').capitalize()} priority"
+                    f"{badge} **{co.get('name','')}** — CRS Score {score}/10  {icon} {co.get('urgency','').capitalize()}"
                 ):
                     st.write(f"**Why now:** {co.get('why','')}")
                     st.info(f"💬 Outreach angle: {co.get('outreach_angle','')}")
@@ -1721,28 +1754,33 @@ Return ONLY a valid JSON object:
 
         st.divider()
 
-        # ── AI Top Contacts ──────────────────────────────────────────────
-        top_contacts = ai_out.get("top_contacts", [])
+        # ── AI Scored Contacts ───────────────────────────────────────────
+        scored_contacts = ai_out.get("scored_contacts", [])
         all_people = res.get("apollo_contacts",[]) + res.get("top_people",[])
-        st.subheader(f"👤 Decision-Makers ({len(all_people)} found)")
+        st.subheader(f"👤 Decision-Makers — CRS Relevance Ranked ({len(all_people)} found)")
 
-        if top_contacts:
-            st.write("**🎯 AI-prioritised — reach out to these first:**")
-            for c in top_contacts:
+        if scored_contacts:
+            scored_contacts_sorted = sorted(scored_contacts, key=lambda x: x.get("crs_score",0), reverse=True)
+            st.write("**🎯 AI-scored contacts — highest relevance first:**")
+            for c in scored_contacts_sorted:
+                score = c.get("crs_score", 0)
+                badge = "🟢" if score >= 8 else "🟡" if score >= 5 else "🔴"
                 with st.expander(
-                    f"**{c.get('name','')}** — {c.get('title','')} at {c.get('company','')}"
+                    f"{badge} **{c.get('name','')}** — {c.get('title','')} at {c.get('company','')}  Score {score}/10"
                 ):
-                    st.write(f"**Why first:** {c.get('why_first','')}")
+                    st.write(f"**Why reach out:** {c.get('why_first','')}")
                     if c.get("linkedin"):
                         st.markdown(f"[🔗 LinkedIn]({c['linkedin']})")
 
         if all_people:
             people_df = pd.DataFrame(all_people)
-            show_cols = [c for c in ["name","title","company","country","linkedin","email","email_status","source"]
+            show_cols = [c for c in ["crs_score","name","title","company","country","linkedin","email","email_status","source"]
                          if c in people_df.columns]
+            if "crs_score" in people_df.columns:
+                people_df = people_df.sort_values("crs_score", ascending=False, na_position="last")
             st.dataframe(
                 people_df[show_cols].rename(columns={
-                    "name":"Name","title":"Title","company":"Company",
+                    "crs_score":"CRS Score","name":"Name","title":"Title","company":"Company",
                     "country":"Location","linkedin":"LinkedIn",
                     "email":"Email","email_status":"Email Status","source":"Source"
                 }),
@@ -1771,11 +1809,17 @@ Return ONLY a valid JSON object:
         st.divider()
 
         # ── Buying signals ───────────────────────────────────────────────
-        st.subheader(f"📡 Buying Signals ({len(res.get('signals',[]))})")
+        st.subheader(f"📡 Buying Signals — Africa ({len(res.get('signals',[]))})")
         if res.get("signals"):
-            sig_df = pd.DataFrame(res["signals"])[
-                [c for c in ["source","title","published","url"] if c in pd.DataFrame(res["signals"]).columns]
-            ]
+            sig_df = pd.DataFrame(res["signals"])
+            show_sig_cols = [c for c in ["crs_score","source","title","published","url"]
+                             if c in sig_df.columns]
+            if "crs_score" in sig_df.columns:
+                sig_df = sig_df.sort_values("crs_score", ascending=False, na_position="last")
+            sig_df = sig_df[show_sig_cols].rename(columns={
+                "crs_score":"CRS Score","source":"Source",
+                "title":"Title","published":"Date","url":"URL"
+            })
             st.dataframe(sig_df, use_container_width=True, hide_index=True)
         else:
             st.info("No signals found — try broader focus terms or add a NewsAPI key.")
