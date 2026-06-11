@@ -11,11 +11,8 @@ try:
     import sys, os
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from monday_client import (
-        discover_columns, find_item_by_name,
-        create_lead, create_subitem, create_company,
-        push_tender_lead, push_attack_signal_lead,
-        push_apollo_contact, push_partner_company,
-        update_lead_columns,
+        push_tender_to_tickets,
+        get_board_id, get_tenders_group_id,
     )
     _MONDAY_AVAILABLE = bool(st.secrets.get("MONDAY_API_KEY") if hasattr(st, 'secrets') else False)
 except ImportError:
@@ -195,8 +192,9 @@ def run_pipeline(trigger: str = "scheduled"):
                     mon_count = 0
                     for row in high_score:
                         try:
-                            push_tender_lead(row)
-                            mon_count += 1
+                            _, act = push_tender_to_tickets(row)
+                            if act == "created":
+                                mon_count += 1
                         except Exception:
                             pass
                     if mon_count:
@@ -1475,8 +1473,11 @@ with tab1:
                     for i, (_, row) in enumerate(high.iterrows()):
                         prog.progress((i+1)/len(high), text=f"Pushing {i+1}/{len(high)}…")
                         try:
-                            push_tender_lead(row.to_dict())
-                            pushed += 1
+                            _, action = push_tender_to_tickets(row.to_dict())
+                            if action == "created":
+                                pushed += 1
+                            else:
+                                skipped += 1
                         except Exception:
                             skipped += 1
                     prog.empty()
@@ -1551,7 +1552,7 @@ with tab1:
                              help="Create lead on Monday.com Leads Board"):
                     with st.spinner("Pushing to Monday.com…"):
                         try:
-                            mid = push_tender_lead(t.to_dict())
+                            mid, action = push_tender_to_tickets(t.to_dict())
                             st.success(f"✅ Lead created in Monday.com (ID: {mid})")
                         except Exception as e:
                             st.error(f"Monday push failed: {e}")
@@ -1664,7 +1665,7 @@ with tab2:
                     pushed = 0
                     for p in partners:
                         try:
-                            push_partner_company(p)
+                            _monday_legacy_push_partner_company(p)
                             pushed += 1
                         except Exception:
                             pass
@@ -2625,7 +2626,7 @@ Return ONLY a valid JSON object:
                     pushed = 0
                     for s in high_sigs:
                         try:
-                            push_attack_signal_lead(s)
+                            _monday_legacy_push_attack_signal_lead(s)
                             pushed += 1
                         except Exception:
                             pass
@@ -2637,7 +2638,7 @@ Return ONLY a valid JSON object:
                     pushed = 0
                     for p in contacts:
                         try:
-                            push_apollo_contact(p)
+                            _monday_legacy_push_apollo_contact(p)
                             pushed += 1
                         except Exception:
                             pass
@@ -2649,7 +2650,7 @@ Return ONLY a valid JSON object:
                     pushed = 0
                     for co in [c for c in top_cos if (c.get("crs_score") or 0) >= 7]:
                         try:
-                            create_lead(
+                            _monday_legacy_create_lead(
                                 name=co.get("name",""), company=co.get("name",""),
                                 lead_origin="AI Lead Discovery",
                                 notes=co.get("why",""),
@@ -2814,7 +2815,7 @@ with tab6:
         disc_board_id = st.text_input("Enter a Monday Board ID to inspect:", placeholder="1234567890")
         if st.button("🔍 Discover Column IDs") and disc_board_id:
             try:
-                cols = discover_columns(disc_board_id)
+                cols = _monday_legacy_discover_columns(disc_board_id)
                 st.write("**Column title → Column ID mapping:**")
                 st.dataframe(
                     pd.DataFrame(list(cols.items()), columns=["Title","Column ID"]),

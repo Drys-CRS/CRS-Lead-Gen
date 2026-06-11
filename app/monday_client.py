@@ -1,66 +1,95 @@
 """
 monday_client.py — CRS Monday.com Integration
-All board IDs and column IDs are loaded from Streamlit secrets so they
-can be configured without touching code.
+Uses the real column IDs from the Outstanding Tickets board (5657844182)
+discovered via MCP on 2026-06-11.
 
-Required secrets:
-  MONDAY_API_KEY        = "your_token_here"
-
-  # Board IDs — get from each board's URL: monday.com/boards/XXXXXXXXX
-  MONDAY_LEADS_BOARD_ID        = "1234567890"
-  MONDAY_CONTACTS_BOARD_ID     = "1234567890"
-  MONDAY_COMPANIES_BOARD_ID    = "1234567890"
-  MONDAY_TICKETS_BOARD_ID      = "1234567890"   # Outstanding Tickets
-
-  # Group IDs within Leads board (get from board URL after selecting group)
-  MONDAY_LEADS_INTAKE_GROUP    = "new_group"    # default intake group name
-  MONDAY_COMPANIES_RESELLERS   = "resellers"    # Resellers group in Companies
+Required secret:
+  MONDAY_API_KEY = "your_token_here"
 """
 import json
 import requests
 import streamlit as st
 
-MONDAY_URL = "https://api.monday.com/v2"
+MONDAY_URL        = "https://api.monday.com/v2"
+TICKETS_BOARD_ID  = 5657844182
+TENDERS_GROUP_ID  = "group_mkz9h01q"   # "Tenders" group within Outstanding Tickets
 
-# ── Column value formats ────────────────────────────────────────────────────
-# These are the column IDs as they appear in your board (lowercase, underscored).
-# CRS board column IDs derived from the SOP — adjust if Monday assigned different IDs.
-# Run _discover_columns(board_id) to print actual IDs from a live board.
 
-# Leads Board column IDs (SOP-derived)
-LEADS_COLS = {
-    "company":           "company",
-    "title":             "title",
-    "linkedin":          "linkedin",
-    "phone":             "phone",
-    "email":             "email",
-    "lead_interest":     "lead_interest",
-    "lead_origin":       "lead_origin",
-    "region":            "region",
-    "country":           "country",
-    "status":            "status",
-    "am":                "am",
-    "accuracy_score":    "accuracy_score",
-    "industry":          "industry",
-    "contact_notes":     "contact_notes",
-    "next_contact_date": "date",
+# ── Solution → CRS Division + Vendor mapping ─────────────────────────────────
+SOLUTION_MAP = {
+    # CyberSec keywords → (CRS Division, CyberSec Vendor label)
+    "vectra":          ("CyberSec", "VECTRA"),
+    "ndr":             ("CyberSec", "VECTRA"),
+    "xdr":             ("CyberSec", "VECTRA"),
+    "soc":             ("CyberSec", "VECTRA"),
+    "threat":          ("CyberSec", "VECTRA"),
+    "vrx":             ("CyberSec", "vRx"),
+    "vulnerability":   ("CyberSec", "vRx"),
+    "patch":           ("CyberSec", "vRx"),
+    "vapt":            ("CyberSec", None),        # VAPT has no vendor dropdown
+    "penetration":     ("CyberSec", None),
+    "pentest":         ("CyberSec", None),
+    "smb":             ("CyberSec", "SMBsecure"),
+    "endpoint":        ("CyberSec", "SMBsecure"),
+    "encryption":      ("CyberSec", "Beachheadsecure"),
+    "popia":           ("CyberSec", "SMBsecure"),
+    "beachhead":       ("CyberSec", "Beachheadsecure"),
+    "flare":           ("CyberSec", None),
+    "dark web":        ("CyberSec", None),
+    "ransomware":      ("CyberSec", None),
+    "aikido":          ("CyberSec", None),
+    "sast":            ("CyberSec", None),
+    "application":     ("CyberSec", None),
+    "awareness":       ("CyberSec", "Cyber Awareness Training"),
+    "phishing":        ("CyberSec", "Cyber Awareness Training"),
+    # Training keywords → (CRS Division, Training Vendor label)
+    "ibm":             ("Training", "IBM Training"),
+    "redhat":          ("Training", "Redhat"),
+    "red hat":         ("Training", "Redhat"),
+    "suse":            ("Training", "SUSE"),
+    "comptia":         ("Training", "CompTIA"),
+    "agile":           ("Training", "Agile SAFe Training"),
+    "training":        ("Training", "IBM Training"),   # default training vendor
+    "certification":   ("Training", "IBM Training"),
 }
 
-# Companies Board column IDs
-COMPANIES_COLS = {
-    "account_type":      "account_type",
-    "region":            "region",
-    "industry":          "industry",
-    "website_url":       "website_url",
-    "linkedin_url":      "linkedin_url",
-    "crs_partner_status":"crs_partner_status",
-    "notes":             "company_notes",
-    "email_address":     "email_address",
+def _infer_division(title: str, description: str) -> tuple:
+    """Return (crs_division_label, cybersec_vendor, training_vendor) from text."""
+    text = f"{title} {description}".lower()
+    for kw, (div, vendor) in SOLUTION_MAP.items():
+        if kw in text:
+            if div == "CyberSec":
+                return div, vendor, None
+            else:
+                return div, None, vendor
+    return "CyberSec", None, None   # default
+
+
+# ── Region mapping ─────────────────────────────────────────────────────────────
+REGION_MAP = {
+    "South Africa":  "South Africa",
+    "Kenya":         "Africa and other",
+    "Nigeria":       "Africa and other",
+    "Ghana":         "Africa and other",
+    "Tanzania":      "Africa and other",
+    "Uganda":        "Africa and other",
+    "Zambia":        "Africa and other",
+    "Rwanda":        "Africa and other",
+}
+LOCATION_MAP = {
+    "South Africa": "South Africa",
+    "Kenya":        "Africa",
+    "Nigeria":      "Africa",
+    "Ghana":        "Africa",
+    "Tanzania":     "Africa",
+    "Uganda":       "Africa",
+    "Zambia":       "Africa",
+    "Rwanda":       "Africa",
 }
 
 
+# ── GraphQL helper ─────────────────────────────────────────────────────────────
 def _gql(query: str, variables: dict = None) -> dict:
-    """Execute a Monday GraphQL request. Returns the full response dict."""
     key = st.secrets.get("MONDAY_API_KEY", "")
     if not key:
         raise ValueError("MONDAY_API_KEY not set in Streamlit secrets.")
@@ -80,114 +109,85 @@ def _gql(query: str, variables: dict = None) -> dict:
     return data
 
 
-# ── Column discovery ──────────────────────────────────────────────────────────
-def discover_columns(board_id: str) -> dict:
-    """Return {column_title: column_id} for a board. Use to find real column IDs."""
+# ── Deduplication ──────────────────────────────────────────────────────────────
+def find_tender_by_number(tender_number: str) -> str | None:
+    """Return item_id if this tender number already exists on the board."""
     q = """
-    query ($bid: ID!) {
-      boards(ids: [$bid]) {
-        columns { id title type }
-      }
-    }"""
-    data = _gql(q, {"bid": board_id})
-    cols = data["data"]["boards"][0]["columns"]
-    return {c["title"]: c["id"] for c in cols}
-
-
-# ── Deduplication ─────────────────────────────────────────────────────────────
-def find_item_by_name(board_id: str, name: str) -> str | None:
-    """Return item_id if an item with this name already exists, else None."""
-    q = """
-    query ($bid: ID!, $name: String!) {
+    query ($bid: ID!, $val: String!) {
       items_page_by_column_values(
         board_id: $bid, limit: 5,
-        columns: [{column_id: "name", column_values: [$name]}]
-      ) {
-        items { id name }
-      }
+        columns: [{column_id: "text_mkz9683j", column_values: [$val]}]
+      ) { items { id name } }
     }"""
     try:
-        data = _gql(q, {"bid": board_id, "name": name})
+        data = _gql(q, {"bid": str(TICKETS_BOARD_ID), "val": tender_number})
         items = data["data"]["items_page_by_column_values"]["items"]
         return items[0]["id"] if items else None
     except Exception:
-        # Fallback: search all items (slower but always works)
-        return _find_item_by_name_scan(board_id, name)
+        return None
 
 
-def _find_item_by_name_scan(board_id: str, name: str) -> str | None:
-    """Scan board items for a name match (fallback)."""
-    q = """
-    query ($bid: ID!) {
-      boards(ids: [$bid]) {
-        items_page(limit: 500) { items { id name } }
-      }
-    }"""
-    try:
-        data = _gql(q, {"bid": board_id})
-        items = data["data"]["boards"][0]["items_page"]["items"]
-        name_lower = name.lower()
-        for item in items:
-            if item["name"].lower() == name_lower:
-                return item["id"]
-    except Exception:
-        pass
-    return None
-
-
-# ── Create / update items ─────────────────────────────────────────────────────
-def _cv(col_id: str, value) -> str:
-    """Format a column value for Monday API. Returns JSON string fragment."""
-    return {col_id: value}
-
-
-def create_lead(
-    name: str,
-    company: str = "",
-    title: str = "",
-    email: str = "",
-    phone: str = "",
-    linkedin: str = "",
-    lead_origin: str = "",
-    lead_interest: str = "",
-    region: str = "",
-    country: str = "",
-    notes: str = "",
-    crs_score: int = None,
-    outreach_angle: str = "",
-) -> str | None:
+# ── Main push function ─────────────────────────────────────────────────────────
+def push_tender_to_tickets(tender: dict) -> tuple[str | None, str]:
     """
-    Create a lead on the Leads Board.
-    Deduplicates by name — if it already exists, updates it instead.
-    Returns the Monday item_id.
+    Push a tender to the Outstanding Tickets board → Tenders group.
+    Deduplicates by tender number.
+    Returns (item_id, action) where action is 'created' or 'exists'.
     """
-    board_id   = st.secrets.get("MONDAY_LEADS_BOARD_ID", "")
-    group_id   = st.secrets.get("MONDAY_LEADS_INTAKE_GROUP", "topics")
-    if not board_id:
-        raise ValueError("MONDAY_LEADS_BOARD_ID not set in secrets.")
+    tender_number = str(tender.get("tender_number") or "").strip()
+    title         = str(tender.get("title") or tender.get("description") or "")[:200]
+    description   = str(tender.get("description") or "")
+    department    = str(tender.get("department_name") or "")
+    country       = str(tender.get("country") or "South Africa")
+    closing_date  = str(tender.get("closing_date") or "")[:10]
+    issue_date    = str(tender.get("issue_date") or "")[:10]
+    portal_link   = str(tender.get("portal_link") or "")
+    ai_rationale  = str(tender.get("ai_rationale") or "")[:500]
 
-    # Check for duplicate
-    existing_id = find_item_by_name(board_id, name)
-    if existing_id:
-        # Update instead of creating
-        _update_lead_score(board_id, existing_id, crs_score, outreach_angle, notes)
-        return existing_id
+    # Deduplicate
+    if tender_number:
+        existing = find_tender_by_number(tender_number)
+        if existing:
+            return existing, "exists"
 
-    # Build column values
-    col_vals = {}
-    if company:       col_vals["company"]       = company
-    if title:         col_vals["title"]          = title
-    if email:         col_vals["email"]          = {"email": email, "text": email}
-    if phone:         col_vals["phone"]          = {"phone": phone, "countryShortName": "ZA"}
-    if linkedin:      col_vals["linkedin"]       = {"url": linkedin, "text": linkedin}
-    if lead_origin:   col_vals["lead_origin"]    = {"label": lead_origin}
-    if lead_interest: col_vals["lead_interest"]  = {"label": lead_interest}
-    if region:        col_vals["region"]         = {"label": region}
-    if country:       col_vals["country"]        = country
-    if notes or outreach_angle:
-        col_vals["contact_notes"] = f"{notes}\n\nOutreach: {outreach_angle}".strip()
-    if crs_score is not None:
-        col_vals["accuracy_score"] = crs_score
+    # Infer CRS division and vendor
+    div, cybersec_vendor, training_vendor = _infer_division(title, description)
+
+    region   = REGION_MAP.get(country, "Africa and other")
+    location = LOCATION_MAP.get(country, "Africa")
+
+    # Build column values using real IDs
+    col_vals = {
+        # Tender-specific fields
+        "text_mkz9683j":    tender_number,
+        "long_text_mkz9tze4": f"{description}\n\nDepartment: {department}",
+        "color_mkz91j57":   {"label": "Open Tender"},
+        # Dates — Monday expects YYYY-MM-DD
+        **({"date_mkz9ag0h": {"date": issue_date}}   if issue_date   else {}),
+        **({"date_mkz9kfdr": {"date": closing_date}} if closing_date else {}),
+        # Company
+        "short_text":       department,
+        "short_text541":    department,   # End User = same as department for tenders
+        # Region & location
+        "single_select76":  {"label": region},
+        "single_select05":  {"label": location},
+        # CRS Division
+        "single_select411": {"label": div},
+        # Vendor selection
+        **({"single_select0": {"label": cybersec_vendor}}   if cybersec_vendor   else {}),
+        **({"single_select19": {"label": training_vendor}}  if training_vendor   else {}),
+        # Status → Working on it (initial)
+        "status":           {"label": "Working on it"},
+        # Portal link
+        **({"link_mkz9vz25": {"url": portal_link, "text": "eTenders / Portal"}} if portal_link else {}),
+        # AI notes in Additional Info
+        "long_text_1":      f"AI Fit Score: {tender.get('ai_score','N/A')}/10\n\n{ai_rationale}",
+        # New customer
+        "single_select":    {"label": "New Customer"},
+    }
+
+    # Item name = Tender Number or title
+    item_name = tender_number if tender_number else title[:80]
 
     q = """
     mutation ($bid: ID!, $gid: String!, $name: String!, $cv: JSON!) {
@@ -196,220 +196,17 @@ def create_lead(
       }
     }"""
     data = _gql(q, {
-        "bid":  board_id,
-        "gid":  group_id,
-        "name": name,
+        "bid":  str(TICKETS_BOARD_ID),
+        "gid":  TENDERS_GROUP_ID,
+        "name": item_name,
         "cv":   json.dumps(col_vals),
     })
-    return data["data"]["create_item"]["id"]
+    item_id = data["data"]["create_item"]["id"]
+    return item_id, "created"
 
 
-def _update_lead_score(board_id: str, item_id: str, score: int, outreach: str, notes: str):
-    """Update CRS score and outreach angle on an existing lead."""
-    col_vals = {}
-    if score is not None:
-        col_vals["accuracy_score"] = score
-    if outreach or notes:
-        col_vals["contact_notes"] = f"{notes}\n\nOutreach: {outreach}".strip()
-    if not col_vals:
-        return
-    q = """
-    mutation ($bid: ID!, $iid: ID!, $cv: JSON!) {
-      change_multiple_column_values(board_id: $bid, item_id: $iid, column_values: $cv) { id }
-    }"""
-    _gql(q, {"bid": board_id, "iid": item_id, "cv": json.dumps(col_vals)})
+def get_board_id() -> int:
+    return TICKETS_BOARD_ID
 
-
-def update_lead_columns(board_id: str, item_id: str, col_vals: dict):
-    """Generic column update — pass {column_id: value} dict."""
-    q = """
-    mutation ($bid: ID!, $iid: ID!, $cv: JSON!) {
-      change_multiple_column_values(board_id: $bid, item_id: $iid, column_values: $cv) { id }
-    }"""
-    _gql(q, {"bid": board_id, "iid": item_id, "cv": json.dumps(col_vals)})
-
-
-def create_subitem(parent_item_id: str, subitem_name: str, col_vals: dict = None) -> str | None:
-    """Attach a subitem to an existing item (company/lead)."""
-    q = """
-    mutation ($pid: ID!, $name: String!, $cv: JSON!) {
-      create_subitem(parent_item_id: $pid, item_name: $name, column_values: $cv) { id }
-    }"""
-    data = _gql(q, {
-        "pid":  parent_item_id,
-        "name": subitem_name,
-        "cv":   json.dumps(col_vals or {}),
-    })
-    return data["data"]["create_subitem"]["id"]
-
-
-def create_company(
-    name: str,
-    account_type: str = "End-user",
-    region: str = "",
-    industry: str = "",
-    website: str = "",
-    linkedin: str = "",
-    email: str = "",
-    notes: str = "",
-    partner_status: str = "",
-    group_id: str = None,
-) -> str | None:
-    """
-    Create a company on the Companies Board.
-    Deduplicates by name. Returns item_id.
-    """
-    board_id = st.secrets.get("MONDAY_COMPANIES_BOARD_ID", "")
-    if not board_id:
-        raise ValueError("MONDAY_COMPANIES_BOARD_ID not set in secrets.")
-
-    existing_id = find_item_by_name(board_id, name)
-    if existing_id:
-        return existing_id
-
-    grp = group_id or st.secrets.get("MONDAY_COMPANIES_RESELLERS", "resellers")
-    col_vals = {}
-    if account_type: col_vals["account_type"]      = {"label": account_type}
-    if region:       col_vals["region"]             = {"label": region}
-    if industry:     col_vals["industry"]           = industry
-    if website:      col_vals["website_url"]        = {"url": website, "text": website}
-    if linkedin:     col_vals["linkedin_url"]       = {"url": linkedin, "text": linkedin}
-    if email:        col_vals["email_address"]      = {"email": email, "text": email}
-    if notes:        col_vals["company_notes"]      = notes
-    if partner_status: col_vals["crs_partner_status"] = {"label": partner_status}
-
-    q = """
-    mutation ($bid: ID!, $gid: String!, $name: String!, $cv: JSON!) {
-      create_item(board_id: $bid, group_id: $gid, item_name: $name, column_values: $cv) { id }
-    }"""
-    data = _gql(q, {
-        "bid":  board_id,
-        "gid":  grp,
-        "name": name,
-        "cv":   json.dumps(col_vals),
-    })
-    return data["data"]["create_item"]["id"]
-
-
-# ── High-level CRS-specific pushes ────────────────────────────────────────────
-def push_tender_lead(tender: dict) -> str | None:
-    """
-    Push a high-scoring tender to the Leads Board.
-    Maps tender fields → Monday Leads columns.
-    """
-    solution_map = {
-        "cyber": "Vectra", "soc": "Vectra", "ndr": "Vectra", "xdr": "Vectra",
-        "vulnerability": "vRx", "patch": "vRx", "vapt": "Pentest / VA",
-        "penetration": "Pentest / VA", "pentest": "Pentest / VA",
-        "training": "IBM", "ibm": "IBM", "redhat": "REDHAT", "suse": "REDHAT",
-        "comptia": "IBM", "cloud": "Vectra", "siem": "Vectra",
-        "phishing": "ECCA / CRE", "awareness": "ECCA / CRE",
-        "threat": "Flare", "dark web": "Flare", "ransomware": "Flare",
-        "endpoint": "SMBsecure", "encryption": "BH", "popia": "SMBsecure",
-        "application": "Aikido", "devsec": "Aikido", "sast": "Aikido",
-    }
-    title_lower = (tender.get("title") or "").lower()
-    desc_lower  = (tender.get("description") or "").lower()
-    combined    = f"{title_lower} {desc_lower}"
-    lead_interest = "Vectra"   # default
-    for kw, solution in solution_map.items():
-        if kw in combined:
-            lead_interest = solution
-            break
-
-    country  = tender.get("country", "South Africa")
-    region_map = {
-        "South Africa": "South Africa", "Kenya": "East Africa",
-        "Nigeria": "West Africa", "Ghana": "West Africa",
-        "Tanzania": "East Africa", "Uganda": "East Africa",
-        "Zambia": "Southern Africa", "Rwanda": "East Africa",
-    }
-    region = region_map.get(country, "International")
-
-    return create_lead(
-        name         = tender.get("department_name") or tender.get("title","Unknown")[:80],
-        company      = tender.get("department_name",""),
-        lead_origin  = "Tender Portal",
-        lead_interest= lead_interest,
-        region       = region,
-        country      = country,
-        notes        = f"Tender: {tender.get('tender_number','')} | Closing: {tender.get('closing_date','')}",
-        crs_score    = tender.get("ai_score"),
-        outreach_angle = tender.get("ai_rationale","")[:500],
-    )
-
-
-def push_attack_signal_lead(signal: dict) -> str | None:
-    """
-    Push a high-scoring attack signal (victim org) to Leads Board
-    and attach the attack detail as a subitem.
-    """
-    victim  = signal.get("victim_org","")
-    if not victim or victim.lower() in ("unknown",""):
-        return None
-
-    attack_map = {
-        "ransomware":  "Flare",
-        "data breach": "SMBsecure",
-        "phishing":    "ECCA / CRE",
-        "ddos":        "Vectra",
-        "malware":     "vRx",
-        "unknown":     "Vectra",
-    }
-    attack_type   = (signal.get("attack_type") or "unknown").lower()
-    lead_interest = attack_map.get(attack_type, "Vectra")
-
-    item_id = create_lead(
-        name          = victim,
-        company       = victim,
-        title         = signal.get("contact_title","CISO"),
-        lead_origin   = "Cyber Attack Signal",
-        lead_interest = lead_interest,
-        notes         = f"Attack type: {attack_type}\nSource: {signal.get('source','')}\nDate: {signal.get('published','')}",
-        crs_score     = signal.get("crs_score"),
-        outreach_angle= signal.get("outreach_angle",""),
-    )
-
-    # Attach attack detail as subitem
-    if item_id:
-        try:
-            subitem_name = f"{attack_type.title()} — {signal.get('published','recent')}"
-            create_subitem(item_id, subitem_name, {
-                "text": signal.get("title","")[:200],
-            })
-        except Exception:
-            pass  # subitems require board to have subitem column — non-fatal
-
-    return item_id
-
-
-def push_apollo_contact(person: dict) -> str | None:
-    """Push an Apollo contact to the Leads Board."""
-    name = (person.get("name") or "").strip()
-    if not name:
-        return None
-    return create_lead(
-        name          = name,
-        company       = person.get("company",""),
-        title         = person.get("title",""),
-        email         = person.get("email",""),
-        phone         = person.get("phone",""),
-        linkedin      = person.get("linkedin",""),
-        lead_origin   = "Apollo Contact Search",
-        crs_score     = person.get("crs_score"),
-    )
-
-
-def push_partner_company(partner: dict) -> str | None:
-    """Push an AI-recommended partner to the Companies Board (Resellers group)."""
-    name = (partner.get("company") or partner.get("name","")).strip()
-    if not name:
-        return None
-    return create_company(
-        name         = name,
-        account_type = partner.get("partnership_type","Reseller").split("/")[0].strip(),
-        region       = partner.get("country",""),
-        notes        = f"AI Partnership Recommendation:\n{partner.get('why',partner.get('why_aligned',''))}\n\nOutreach: {partner.get('outreach_angle','')}",
-        partner_status = "Prospect",
-        group_id     = st.secrets.get("MONDAY_COMPANIES_RESELLERS","resellers"),
-    )
+def get_tenders_group_id() -> str:
+    return TENDERS_GROUP_ID
