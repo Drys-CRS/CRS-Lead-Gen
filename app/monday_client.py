@@ -525,8 +525,17 @@ def _ensure_scheduler():
 st.set_page_config(page_title="CRS Competitive Intelligence", layout="wide")
 
 # ── Keep-alive: reload every 3 hours (10 800 000 ms) ──────────────────────────
+# Keep-alive: st_autorefresh must only be rendered once per session.
+# Streamlit reruns the whole script on every interaction — calling it
+# unconditionally causes a duplicate key error. The fragment=True approach
+# isn't available in all versions, so we use a unique per-session key instead.
 if _AUTOREFRESH_AVAILABLE:
-    st_autorefresh(interval=10_800_000, key="keepalive")
+    _refresh_key = f"keepalive_{st.session_state.get('_session_id', 'default')}"
+    if "_session_id" not in st.session_state:
+        import uuid as _uuid
+        st.session_state["_session_id"] = str(_uuid.uuid4())[:8]
+        _refresh_key = f"keepalive_{st.session_state['_session_id']}"
+    st_autorefresh(interval=10_800_000, key=_refresh_key, debounce=True)
 
 # ── Start background scheduler (once per process) ─────────────────────────────
 _ensure_scheduler()
