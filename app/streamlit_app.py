@@ -351,43 +351,108 @@ _ensure_scheduler()
 #    Gemini uses this when scoring and matching.
 # ─────────────────────────────────────────────
 CRS_PROFILE = """
-Company: Cyber Retaliator Solutions (CRS)
-Head Office: Centurion, South Africa. Training centres in Centurion, Midrand, Sandton, Cape Town.
-Profile: Value Added Cyber Security Distributor and Authorized Training Delivery Partner
-operating globally with 20+ years of experience. Serves reseller, managed services, and
-system integration channels across Africa.
+Company: Cyber Retaliator Solutions (CRS) — #RetaliatorNation
+Tagline: "The Bug Stops Here."
+Head Office: Eco Court Office Park, Suite C4, 340 Witch-Hazel Street, Centurion, South Africa
+Training Centres: Centurion, Midrand, Sandton, Cape Town
+Experience: 25+ years in Cyber Security. Channel-focused Value-Added Distributor.
+Authorised training partner for IBM, RedHat, SUSE, CompTIA, Agile SAFe.
 
-── TECHNICAL TRAINING (Authorized Delivery Partner) ──
-- IBM Technical Training (incl. z/OS, IBM i, IBM Power, mainframe skills)
-- Red Hat Learning (RHEL, OpenShift, certifications: RHCSA, RHCE)
+── TECHNICAL TRAINING ──
+- IBM Technical Training (z/OS, IBM i, IBM Power, Mainframe)
+- Red Hat Learning (RHEL, OpenShift — RHCSA, RHCE certifications)
 - SUSE Technical Product Training
-- CompTIA programmes (A+, Network+, Security+, CySA+ — recruiting, training, certifying students)
-- Agile training
-- AI / emerging technology training
+- CompTIA (A+, Network+, Security+, CySA+)
+- Agile SAFe Training (scaling Agile in large organisations)
 
-── CYBER SECURITY SOLUTIONS (Distribution & Services) ──
-- Vectra AI: XDR/NDR/ITDR/CDR — AI-powered network & identity threat detection and response,
-  SOC enablement, M365/AWS/Azure AD attack detection
-- vRx (Vicarius): vulnerability management + patch management, auto-remediation
-- Strobes Security: CTEM platform — attack surface management, pentesting-as-a-service (PTaaS),
-  risk-based vulnerability management, application security posture management
-- Aikido: developer-first AppSec — SAST, DAST, SCA, secrets detection, IaC scanning,
-  container scanning, cloud posture (CSPM), AI code review
-- Flare: threat exposure management — dark web monitoring, leaked credential detection,
-  brand protection, supply chain ransomware monitoring, takedown services
-- BeachheadSecure / SMBsecure: endpoint encryption (BitLocker/FileVault), data access control,
-  remote wipe, USB port control, MFA, POPIA compliance reporting
-- Telivy: cyber risk discovery & attack surface management for MSSPs
-- BlueFlag Security: identity-centric SDLC / software supply chain security
-- Cyber Risk Essentials: phishing simulation & cyber awareness training
-- VAPT services: third-party vulnerability and penetration testing through the channel
+── CYBER SECURITY DISTRIBUTION (full portfolio) ──
+VECTRA AI — XDR/NDR/CDR/ITDR platform
+  Leader in 2025 Gartner Magic Quadrant for NDR
+  Target: 500+ concurrent IPs, 250+ internal accounts, medium-large orgs
+  Modules: NDR, CDR for AWS/M365/Azure AD, ITDR, MDR, Recall, Stream
+  Keywords: AI-powered XDR, NDR, SIEM optimisation, SOC modernisation, MITRE
+
+vRx (Vicarius) — Strategic Exposure Remediation Platform
+  Target: 100+ endpoints, replacing Patch/VM tools
+  Features: continuous vulnerability detection, X-TAGS prioritisation,
+  patch management (Win/Mac/Linux), auto-actions, patchless protection
+  Keywords: vulnerability management, patch management, MTTR reduction
+
+Strobes Security — AI-Driven CTEM Platform
+  Target: Enterprise 1000+ assets, CISOs consolidating risk exposure
+  Modules: ASM, PTaaS (1 credit = 8 pentest hours), RBVM, ASPM
+  Keywords: attack surface management, pentesting, threat exposure, CTEM
+
+Aikido — Developer-Centric AppSec Platform
+  Target: Any org with a dev team; replaces Snyk/Orca/Veracode
+  Features: SAST, DAST, SCA, secrets, IaC, container, CSPM, AI autofix
+  Pricing: Bundles of users (Basic/Pro/Custom for MSSPs)
+  Keywords: DevSecOps, code security, SBOM, shift-left, CI/CD
+
+Flare — Dark Web Monitoring & Threat Exposure Management
+  Target: Orgs needing threat intel, leaked credential monitoring
+  Features: dark web monitoring, GitHub leak detection, SIEM integration,
+  AI Assist, Entra ID response, takedown services (sold individually or in bands of 10)
+  Pricing: per number of employees with commitment tier discounts
+  Keywords: threat intelligence, dark web, ransomware, credential exposure
+
+BeachheadSecure — Endpoint Data Security & Encryption
+  Target: SMBs not wanting E3/E5 costs; compliance-driven orgs
+  Products: Core/Premium (encryption + RiskResponder), Server MFA,
+  Mobile, Outlook Plugin (PDF email encryption + Check4Phish)
+  Keywords: POPIA compliance, encryption, MFA, data protection, device kill/wipe
+
+SMBsecure — All-in-One SMB Cyber Protection
+  Target: Small-medium businesses, FSPs, compliance-driven SMEs
+  Features: BitLocker/FileVault encryption, MDM, Outlook email encryption,
+  phishing defence, SAT, dark web monitoring, Cyber Warranty
+  Warranty: R1M data breach, R500K extortion (ransomware), R250K BEC cover
+  Packages: ESSENTIAL, STANDARD, ADVANCED, StarterPack/ComplianceSuite
+  Keywords: POPIA, encryption, cyber warranty, SMB, MFA, phishing
+
+Telivy — Cyber Security Auditing for MSSPs
+  Target: MSSPs providing cyber audits at scale
+  Features: attack surface assessment, dark web scan, M365/Google Workspace,
+  PII identification, vulnerability assessment, financial risk calculator
+  Pricing: Prospecting Module (unlimited assessments) + Risk Monitoring Endpoints
+  Keywords: MSSP, cyber audit, attack surface, vulnerability assessment
+
+Strobes PTaaS — Penetration Testing as a Service
+  Priced per credit (1 credit = 8 pentest hours); requires scoping form
+  Types: network, web app, API, mobile, cloud config, red team
+
+VAPT Services — CRS Own Penetration Testing
+  Scoped: internal/external IPs, web apps, domains
+  Models: CAPEX (once-off) or OPEX (ongoing subscription)
+  Keywords: penetration testing, whitebox, blackbox, greybox, compliance
+
+Cyber Risk Essentials (CRE) — Managed Cyber Awareness Program
+  Components: phishing simulations (every 3-5 weeks), online training,
+  instructor-led quarterly sessions, executive lunch-and-learns (half-yearly)
+  Vendors: GoldPhish, Prventi
+  Keywords: phishing simulation, security awareness, human firewall, SAT
+
+BlueFlag Security — SDLC Identity & Supply Chain Security
+  Target: mid-large enterprises with dev teams, DevSecOps, IP-heavy orgs
+  Features: least privilege enforcement, identity hygiene, insider threat detection,
+  continuous CI/CD monitoring, AI-driven identity intelligence
+  Keywords: SDLC security, software supply chain, DevOps, identity, least privilege
+
+Standss (SendGuard/SendConfirm) — Email GRC
+  Features: confirm recipients/attachments before send, DLP rules, unsend, audit logs
+  Target: orgs with high email reliance, SMBs, compliance-driven
 
 ── TARGET MARKETS ──
-Government, financial services, healthcare, education, enterprises across Africa.
-Strong fit: tenders for cybersecurity solutions/services, technical training delivery
-(especially IBM/RedHat/SUSE/CompTIA), SOC services, vulnerability management,
-security awareness, and POPIA/ISO 27001 compliance support.
-Weak fit: pure hardware supply, civil works, non-ICT goods.
+Government (all levels, all African countries), financial services, banking,
+healthcare, education, telcos, mining, enterprises with dev teams.
+Strong fit: cybersecurity solutions, technical training (IBM/RH/SUSE/CompTIA),
+SOC/MDR services, vulnerability management, POPIA compliance, MSSP tooling.
+Weak fit: pure hardware, civil construction, non-ICT goods/services.
+
+── PARTNER INCENTIVES ──
+CompTIA vouchers for partners on annual deals ($2,600+ qualifies for exam voucher)
+MDF: quarterly for MSSPs, annually for others
+Account managers: Takealot vouchers ($800–$2,650+ deals)
 """
 
 # ─────────────────────────────────────────────
@@ -826,12 +891,27 @@ def _usage_sidebar():
 # ─────────────────────────────────────────────
 @st.cache_data(ttl=300)
 def fetch_tenders():
+    """Fetch OPEN tenders only from sa_tenders (non-irrelevant)."""
     try:
-        response = supabase.table("sa_tenders").select("*").execute()
+        response = supabase.table("sa_tenders").select("*")            .neq("status", "Awarded")            .neq("is_irrelevant", True)            .execute()
         return pd.DataFrame(response.data)
     except Exception as e:
-        st.error(f"Error fetching data: {e}")
+        st.error(f"Error fetching open tenders: {e}")
         return pd.DataFrame()
+
+@st.cache_data(ttl=300)
+def fetch_awarded_tenders():
+    """Fetch awarded tenders from the dedicated awarded_tenders table."""
+    try:
+        response = supabase.table("awarded_tenders").select("*").execute()
+        return pd.DataFrame(response.data)
+    except Exception as e:
+        # Fallback: try old sa_tenders if migration not yet run
+        try:
+            r2 = supabase.table("sa_tenders").select("*").eq("status", "Awarded").execute()
+            return pd.DataFrame(r2.data)
+        except Exception:
+            return pd.DataFrame()
 
 # ─────────────────────────────────────────────
 # 6. AI HELPERS
@@ -1050,6 +1130,31 @@ def _is_relevant(text: str) -> bool:
     lower = text.lower()
     return any(p.search(lower) for p in _KW_PATTERNS)
 
+def _upsert_awarded(records: list, country: str, label: str, status_container):
+    """Upsert awarded tenders into the dedicated awarded_tenders table.
+    Never deletes — history accumulates indefinitely."""
+    if not records:
+        return 0
+    ok, failed, first_err = 0, 0, None
+    for r in records:
+        # Remove status field — awarded_tenders table doesn't need it
+        row = {k: v for k, v in r.items() if k != "status"}
+        try:
+            supabase.table("awarded_tenders").upsert(
+                row, on_conflict="tender_number,department_name,country"
+            ).execute()
+            ok += 1
+        except Exception as e:
+            failed += 1
+            if first_err is None:
+                first_err = str(e)[:200]
+    msg = f"  ✅ {country} — {label}: {ok} saved to awarded_tenders"
+    if failed:
+        msg += f" | ❌ {failed} failed (first: {first_err})"
+    status_container(msg)
+    return ok
+
+
 def _upsert(records: list, country: str, label: str, status_container):
     if not records:
         return 0
@@ -1175,8 +1280,8 @@ def scrape_south_africa(out):
             start += len(batch)
             if start >= int(data2.get("recordsTotal", 0)):
                 break
-        # UPSERT only — never wipe awarded history
-        _upsert(awarded_records, country, "Awarded (12-month)", out)
+        # Write to dedicated awarded_tenders table — never wiped
+        _upsert_awarded(awarded_records, country, "Awarded (12-month)", out)
 
     except Exception as e:
         out(f"  ❌ {country} error: {e}")
@@ -1318,8 +1423,8 @@ def scrape_ocds_country(country: str, out):
     supabase.table("sa_tenders").delete().eq("status", "Open").eq("country", country).execute()
     _upsert(open_records, country, "Open", out)
 
-    # Awarded records: UPSERT only — never wipe, history accumulates
-    _upsert(awarded_records, country, f"Awarded (12-month, {len(awarded_records)} records)", out)
+    # Write to dedicated awarded_tenders table — never wiped
+    _upsert_awarded(awarded_records, country, f"Awarded (12-month, {len(awarded_records)} records)", out)
 
 
 def run_all_scrapers():
@@ -1557,8 +1662,9 @@ with tab1:
                         except Exception as e:
                             st.error(f"Monday push failed: {e}")
         with action_col2:
-            if st.button("🗑️ Mark as Irrelevant", key=f"del_{t['tender_number']}"):
-                supabase.table("sa_tenders").delete().eq("tender_number", t["tender_number"]).execute()
+            if st.button("🚫 Mark as Irrelevant", key=f"del_{t['tender_number']}",
+                             help="Hides this tender — it stays in the database but won't appear again"):
+                supabase.table("sa_tenders").update({"is_irrelevant": True})                    .eq("tender_number", t["tender_number"]).execute()
                 st.cache_data.clear()
                 st.rerun()
 
@@ -1569,31 +1675,35 @@ with tab1:
 with tab2:
     st.subheader("🤝 Potential CRS Channel Partners")
     st.write(
-        "These companies are winning ICT and security tenders across Africa. "
-        "Gemini analyses their win patterns to recommend which ones CRS should approach "
-        "as resellers, integration partners, or training sub-contractors."
+        "Companies winning ICT and security tenders across Africa — "
+        "AI recommends which ones CRS should approach as resellers, "
+        "integration partners, or training sub-contractors."
     )
 
-    awarded_df = df_filtered[df_filtered["status"] == "Awarded"].copy()
+    # Load from dedicated awarded_tenders table (never wiped on refresh)
+    awarded_df = fetch_awarded_tenders()
 
-    # Apply 12-month date range filter
-    if "issue_date" in awarded_df.columns:
-        try:
-            # Convert sidebar date objects and df column all to pd.Timestamp for safe comparison
-            _from_ts = pd.Timestamp(awarded_date_from)
-            _to_ts   = pd.Timestamp(awarded_date_to)
-            _dates   = pd.to_datetime(awarded_df["issue_date"], errors="coerce")
-            awarded_df = awarded_df[_dates.isna() | ((_dates >= _from_ts) & (_dates <= _to_ts))]
-        except Exception:
-            pass  # if date filtering fails, show all records rather than crash
-
-    if competitor_search:
-        awarded_df = awarded_df[
-            awarded_df["winning_bidder"].str.contains(competitor_search, case=False, na=False)
-        ]
+    if not awarded_df.empty:
+        # Apply country filter
+        if selected_countries and "country" in awarded_df.columns:
+            awarded_df = awarded_df[awarded_df["country"].isin(selected_countries)]
+        # Apply date range filter
+        if "issue_date" in awarded_df.columns:
+            try:
+                _from_ts = pd.Timestamp(awarded_date_from)
+                _to_ts   = pd.Timestamp(awarded_date_to)
+                _dates   = pd.to_datetime(awarded_df["issue_date"], errors="coerce")
+                awarded_df = awarded_df[_dates.isna() | ((_dates >= _from_ts) & (_dates <= _to_ts))]
+            except Exception:
+                pass
+        # Apply competitor search
+        if competitor_search and "winning_bidder" in awarded_df.columns:
+            awarded_df = awarded_df[
+                awarded_df["winning_bidder"].str.contains(competitor_search, case=False, na=False)
+            ]
 
     if awarded_df.empty:
-        st.info("No awarded tenders in the current filters. Run a data refresh to populate this tab.")
+        st.info("No awarded tenders found. Run a data refresh to populate — awarded tenders are stored permanently and never wiped.")
     else:
         # ── AI Partner Analysis ──────────────────────────────────────────────
         col_run, col_info = st.columns([2, 5])
