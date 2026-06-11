@@ -160,7 +160,7 @@ def scrape_non_ocds_countries(out):
     from datetime import datetime, timezone, timedelta
 
     today = datetime.now(timezone.utc).date().isoformat()
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=365)).date().isoformat()
+    cutoff = "2015-01-01"  # as far back as WB/UNDP APIs hold data
 
     # ── Map country names to World Bank country codes ──────────────────────
     WB_COUNTRY_CODES = {
@@ -217,6 +217,9 @@ def scrape_non_ocds_countries(out):
                         "category":        notice_type,
                         "portal_link":     portal,
                         "country":         country,
+                        "contact_person":  str(n.get("contact_name") or "")[:200],
+                        "contact_email":   str(n.get("contact_email") or "")[:200],
+                        "contact_phone":   str(n.get("contact_phone") or "")[:50],
                     }
 
                     status = str(n.get("status") or "").lower()
@@ -282,6 +285,9 @@ def scrape_non_ocds_countries(out):
                         "compliance_requirements": "See UNDP portal",
                         "status":                  "Open",
                         "award_status":            "Published",
+                        "contact_person":          str(n.get("contact_name") or n.get("contact") or "")[:200],
+                        "contact_email":           str(n.get("contact_email") or n.get("email") or "")[:200],
+                        "contact_phone":           str(n.get("contact_phone") or n.get("phone") or "")[:50],
                     })
                 if undp_open:
                     _upsert(undp_open, country, "UNDP Open", lambda m: None)
@@ -806,8 +812,8 @@ def _call_groq(prompt: str) -> str:
     return _clean(resp.choices[0].message.content)
 
 def _call_cerebras(prompt: str) -> str:
-    """Call Cerebras — tries gpt-oss-120b first, falls back to zai-glm-4.7."""
-    for model in ["gpt-oss-120b", "zai-glm-4.7"]:
+    """Call Cerebras — current free-tier models as of June 2026."""
+    for model in ["llama-3.3-70b", "llama3.1-8b", "qwen3-32b"]:
         try:
             resp = cerebras_ai.chat.completions.create(
                 model=model,
@@ -988,13 +994,13 @@ def _call_ai_grounded(prompt: str) -> str:
 
 
 def ai_analyse_partners(awarded_df) -> list:
-    """Given a dataframe of awarded tenders, ask Gemini to identify which winning
-    companies look like strong CRS channel partners and explain why."""
-    # Build a concise data summary — cap at 60 rows to stay within token limits
-    sample = awarded_df[["winning_bidder", "title", "country", "award_value"]].dropna(
-        subset=["winning_bidder"]
-    ).head(60)
-
+    """Analyse awarded tender winners to identify CRS channel partner candidates.
+    Uses full context: tender number, department, title, value, country."""
+    # Include all relevant columns — department and tender_number are key context
+    avail_cols = [c for c in ["winning_bidder","tender_number","department_name",
+                               "title","country","award_value","issue_date"]
+                  if c in awarded_df.columns]
+    sample = awarded_df[avail_cols].dropna(subset=["winning_bidder"]).head(80)
     rows_text = sample.to_csv(index=False)
 
     prompt = f"""You are a channel-partner strategist for Cyber Retaliator Solutions (CRS).
@@ -1002,36 +1008,49 @@ def ai_analyse_partners(awarded_df) -> list:
 CRS PROFILE:
 {CRS_PROFILE}
 
-Below is a CSV of companies that have been winning government and public-sector tenders
-in Africa for technology, security, and ICT-related work. Your job is to identify which
-of these companies CRS should approach as a channel partner, reseller, or systems
-integrator — companies that are already winning deals in the right space but may be
-missing CRS's vendor portfolio (Vectra, vRx, Aikido, Flare, SMBsecure, BeachheadSecure,
-IBM/RedHat/SUSE/CompTIA training, VAPT services).
+PARTNER CLASSIFICATION DEFINITIONS (use these exactly):
+- System Integrator (SI): Designs and implements complex ICT systems; typically wins
+  large multi-component tenders; integrates hardware, software, networking, security.
+- Managed Service Provider (MSP): Runs ongoing IT/security operations for clients;
+  wins contracts for managed services, monitoring, helpdesk, SOC-as-a-service.
+- Value Added Reseller (VAR): Resells technology solutions with some customisation;
+  wins supply-and-install or supply-and-support tenders.
+- Training Provider: Wins training, skills development, capacity building, learnerships.
+- Consulting/Advisory: Wins strategy, assessment, audit, project management tenders.
+- End-user (Government/Parastatal): The issuing department itself — not a partner prospect.
 
-AWARDED TENDER DATA:
+AWARDED TENDER DATA (includes tender number, issuing department, title, value):
 {rows_text}
 
-For each recommended company, assess:
-1. Why they align with CRS's portfolio based on the tenders they're winning
-2. Partnership type that makes sense (reseller, referral, integration partner, training sub-contractor)
-3. A realistic outreach angle in one sentence
+TASK: For each winning bidder that is an ICT/security company (not end-user), assess:
+1. Which partner classification fits them best based on the tenders they WIN
+2. Which CRS solutions they are most likely missing and would benefit from
+3. A specific outreach angle referencing the actual tenders they have won
 
-Return ONLY a JSON array (no other text). Each element:
+PROPOSED SOLUTIONS must come only from CRS's portfolio:
+VECTRA (NDR/XDR), vRx (vulnerability/patch), Strobes (CTEM/ASM/PTaaS),
+Aikido (AppSec/DevSecOps), Flare (dark web/threat intel), BeachheadSecure (encryption/MFA),
+SMBsecure (SMB protection/POPIA), Telivy (MSSP audit), BlueFlag (SDLC security),
+Standss/SendGuard (email GRC), CRE/GoldPhish/Prventi (cyber awareness),
+VAPT (CRS own pentest services), IBM/RedHat/SUSE/CompTIA/Agile SAFe training.
+
+Return ONLY a JSON array. Each element:
 {{
-  "company": "company name",
+  "company": "exact company name",
   "country": "country",
-  "tenders_won": <integer — count from the data>,
-  "partnership_type": "reseller / referral / integration partner / training sub-contractor",
-  "why_aligned": "1-2 sentences on fit",
-  "outreach_angle": "one sentence — what CRS should lead with",
-  "urgency": "high / medium / low"
+  "tenders_won": <count from data>,
+  "key_tenders": ["tender_number or title 1", "tender_number or title 2"],
+  "issuing_departments": ["dept name 1", "dept name 2"],
+  "partner_classification": "System Integrator | MSP | VAR | Training Provider | Consulting/Advisory",
+  "proposed_solutions": ["Solution1", "Solution2", "Solution3"],
+  "why_aligned": "2-3 sentences referencing specific tenders and departments they serve",
+  "outreach_angle": "one sentence — lead with a specific tender they won",
+  "urgency": "high | medium | low",
+  "estimated_deal_size": "small (<$10k) | medium ($10k-$100k) | large (>$100k)"
 }}
 
-Return the top 10-15 most promising companies. Exclude companies that only won
-non-ICT tenders (construction, catering, stationery, vehicles, etc.).
-Only return the JSON array.
-"""
+Return top 15 most promising. Exclude pure end-users and non-ICT companies.
+Only return the JSON array."""
     raw = _call_ai(prompt)
     parsed = json.loads(raw)
     return parsed if isinstance(parsed, list) else []
@@ -1250,6 +1269,19 @@ Score this tender on fit for the company on a scale of 1–10, where:
 - 7–9 = Strong fit, worth serious consideration
 - 4–6 = Partial fit, marginal opportunity
 - 1–3 = Poor fit, likely not worth pursuing
+
+LEAD TYPE DEFINITIONS for scored_companies:
+- System Integrator (SI): builds/integrates complex ICT environments
+- MSP: runs managed IT/security services for clients  
+- VAR: resells and installs technology with support
+- End-user: organisation that buys and uses technology internally
+- Training Provider: delivers IT/cyber training and certifications
+- Consulting/Advisory: strategy, assessments, audits
+
+PROPOSED SOLUTIONS must come from CRS portfolio only:
+VECTRA, vRx, Strobes, Aikido, Flare, BeachheadSecure, SMBsecure, Telivy,
+BlueFlag, SendGuard, CRE/GoldPhish/Prventi, VAPT,
+IBM Training, RedHat Training, SUSE Training, CompTIA, Agile SAFe Training.
 
 Return ONLY a valid JSON object:
 {{
@@ -1491,7 +1523,7 @@ def scrape_south_africa(out):
     out(f"🇿🇦 Scraping {country}…")
     from datetime import datetime, timedelta
 
-    cutoff = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
+    cutoff = "2015-01-01"  # eTenders holds data back to ~2015
 
     try:
         # ── OPEN tenders (replace fully — these change daily) ────────────────
@@ -1520,6 +1552,9 @@ def scrape_south_africa(out):
                     "portal_link": "https://www.etenders.gov.za/Home/opportunities?id=1",
                     "issue_date": t.get("date_Published"),
                     "closing_date": t.get("closing_Date"),
+                    "contact_person": str(t.get("contactPerson") or t.get("contact_person") or "")[:200],
+                    "contact_email":  str(t.get("contactEmail")  or t.get("contact_email")  or t.get("email") or "")[:200],
+                    "contact_phone":  str(t.get("contactPhone")  or t.get("contact_phone")  or t.get("phone") or "")[:50],
                     "status": "Open", "award_status": "Published", "country": country,
                 })
             start += len(batch)
@@ -1562,12 +1597,15 @@ def scrape_south_africa(out):
                     "description": t.get("description", ""),
                     "status": "Awarded", "winning_bidder": winner,
                     "award_value": str(amount), "country": country,
+                    "contact_person": str(t.get("contactPerson") or t.get("contact_person") or "")[:200],
+                    "contact_email":  str(t.get("contactEmail")  or t.get("contact_email")  or t.get("email") or "")[:200],
+                    "contact_phone":  str(t.get("contactPhone")  or t.get("contact_phone")  or t.get("phone") or "")[:50],
                 })
             start += len(batch)
             if start >= int(data2.get("recordsTotal", 0)):
                 break
         # Write to dedicated awarded_tenders table — never wiped
-        _upsert_awarded(awarded_records, country, "Awarded (12-month)", out)
+        _upsert_awarded(awarded_records, country, "Awarded (all history)", out)
 
     except Exception as e:
         out(f"  ❌ {country} error: {e}")
@@ -1632,11 +1670,10 @@ def _download_ocds_year(pub_id: int, year: int):
 
 
 def scrape_ocds_country(country: str, out):
-    """Pull 12 months of open + awarded tenders for one country from the OCDS registry.
-    - Downloads current year AND previous year files and merges them.
+    """Pull all available awarded tenders for one country from the OCDS registry.
+    - Downloads current year back to 2015 and merges them.
     - Open records replace existing ones (stale tenders close daily).
     - Awarded records are UPSERTED only — history is never wiped.
-    - Awards older than 12 months are filtered out before upserting.
     """
     import json as _json
     from datetime import datetime, timezone, timedelta
@@ -1646,18 +1683,19 @@ def scrape_ocds_country(country: str, out):
 
     now = datetime.now(timezone.utc)
     today = now.date().isoformat()
-    cutoff = (now - timedelta(days=365)).date().isoformat()
+    cutoff = "2015-01-01"  # collect all available history
     current_year = now.year
 
-    # Collect lines from both years so we span the full 12-month window
+    # Download all available years from current back to 2015
     all_lines = []
-    for yr in [current_year, current_year - 1]:
+    for yr in range(current_year, 2014, -1):
         yr_lines = _download_ocds_year(pub_id, yr)
         if yr_lines:
             all_lines.extend(yr_lines)
-            out(f"  ℹ️ {country} {yr}: {len(yr_lines):,} records downloaded")
-        else:
-            out(f"  ℹ️ {country}: no data for {yr}")
+            out(f"  ℹ️ {country} {yr}: {len(yr_lines):,} records")
+        # Stop going further back once two consecutive years return nothing
+        elif yr < current_year - 1:
+            break
 
     if not all_lines:
         out(f"  ❌ {country}: no data available from registry")
@@ -1688,6 +1726,17 @@ def scrape_ocds_country(country: str, out):
         start_date = (period.get("startDate") or rel.get("date", ""))[:10]
         awards     = rel.get("awards") or []
 
+        # Extract contact info from OCDS parties array
+        _contact_person, _contact_email, _contact_phone = "", "", ""
+        for party in (rel.get("parties") or []):
+            if party.get("roles") and any(r in ["buyer","procuringEntity"]
+                                           for r in party.get("roles",[])):
+                cp = party.get("contactPoint") or {}
+                _contact_person = str(cp.get("name") or "")[:200]
+                _contact_email  = str(cp.get("email") or "")[:200]
+                _contact_phone  = str(cp.get("telephone") or "")[:50]
+                break
+
         base = {
             "tender_number":   str(tender_id)[:100],
             "department_name": str(buyer)[:200],
@@ -1696,6 +1745,9 @@ def scrape_ocds_country(country: str, out):
             "category":        str(category),
             "portal_link":     f"https://data.open-contracting.org/en/publication/{pub_id}",
             "country":         country,
+            "contact_person":  _contact_person,
+            "contact_email":   _contact_email,
+            "contact_phone":   _contact_phone,
         }
 
         # Open: not yet closed, not cancelled
@@ -1737,7 +1789,7 @@ def scrape_ocds_country(country: str, out):
     _upsert(open_records, country, "Open", out)
 
     # Write to dedicated awarded_tenders table — never wiped
-    _upsert_awarded(awarded_records, country, f"Awarded (12-month, {len(awarded_records)} records)", out)
+    _upsert_awarded(awarded_records, country, f"Awarded (all history, {len(awarded_records)} records)", out)
 
 
 def run_all_scrapers():
@@ -1855,7 +1907,7 @@ selected_countries = st.sidebar.multiselect(
 # Date range filter for awarded tenders (12-month history)
 st.sidebar.header("Awarded Date Range")
 from datetime import date, timedelta
-default_from = date.today() - timedelta(days=365)
+default_from = date(2015, 1, 1)  # show all available history by default
 awarded_date_from = st.sidebar.date_input("From", value=default_from)
 awarded_date_to   = st.sidebar.date_input("To",   value=date.today())
 
@@ -1960,6 +2012,18 @@ with tab1:
         st.write(f"**Description:** {t.get('description', 'N/A')}")
         st.write(f"**Compliance Requirements:** {t.get('compliance_requirements', 'N/A')}")
         st.write(f"**Closing Date:** {t.get('closing_date', 'N/A')}")
+
+        # Contact info for enquiries
+        _cp = t.get("contact_person","")
+        _ce = t.get("contact_email","")
+        _ph = t.get("contact_phone","")
+        if any([_cp, _ce, _ph]):
+            with st.expander("📞 Enquiry Contact", expanded=True):
+                cinfo = []
+                if _cp: cinfo.append(f"**Person:** {_cp}")
+                if _ce: cinfo.append(f"**Email:** {_ce}")
+                if _ph: cinfo.append(f"**Phone:** {_ph}")
+                st.write("  |  ".join(cinfo))
 
         # AI rationale
         if pd.notna(t.get("ai_rationale")):
@@ -2095,14 +2159,41 @@ with tab2:
             # Expandable cards — one per partner
             for p in sorted(partners, key=lambda x: {"high": 0, "medium": 1, "low": 2}.get(x.get("urgency","low"), 2)):
                 urgency_icon = URGENCY_ICON.get(p.get("urgency", "low"), "⚪")
-                ptype = p.get("partnership_type", "")
+                ptype = p.get("partner_classification") or p.get("partnership_type", "")
                 company = p.get("company", "Unknown")
                 country = p.get("country", "")
                 wins = p.get("tenders_won", "?")
+                deal_size = p.get("estimated_deal_size", "")
 
                 with st.expander(
-                    f"{urgency_icon} **{company}** — {country}  |  {wins} wins  |  {ptype}"
+                    f"{urgency_icon} **{company}** — {country}  |  {wins} wins  |  {ptype}  |  {deal_size}"
                 ):
+                    # Partner classification badge
+                    ptype_colors = {
+                        "System Integrator": "🔷",
+                        "MSP": "🟣",
+                        "VAR": "🟦",
+                        "Training Provider": "🟩",
+                        "Consulting/Advisory": "🟧",
+                    }
+                    ptype_icon = ptype_colors.get(ptype, "⚪")
+                    st.write(f"**{ptype_icon} Partner Type:** {ptype}")
+
+                    # Proposed solutions
+                    solutions = p.get("proposed_solutions", [])
+                    if solutions:
+                        st.write(f"**💡 Proposed CRS Solutions:** {' · '.join(solutions)}")
+
+                    # Key tenders won
+                    key_tenders = p.get("key_tenders", [])
+                    if key_tenders:
+                        st.write(f"**📋 Key Tenders Won:** {', '.join(str(t) for t in key_tenders[:3])}")
+
+                    # Departments served
+                    depts = p.get("issuing_departments", [])
+                    if depts:
+                        st.write(f"**🏛️ Departments Served:** {', '.join(str(d) for d in depts[:3])}")
+
                     st.write(f"**Why aligned:** {p.get('why_aligned', '')}")
                     st.info(f"💬 Outreach angle: {p.get('outreach_angle', '')}")
 
@@ -2746,6 +2837,8 @@ Return ONLY a valid JSON object:
     {{
       "name": "company",
       "crs_score": 1-10,
+      "lead_type": "System Integrator | MSP | VAR | Training Provider | End-user | Consulting/Advisory",
+      "proposed_solutions": ["Solution1", "Solution2"],
       "why": "why CRS should target them now — link to attack signals where relevant",
       "outreach_angle": "one specific sentence",
       "urgency": "high/medium/low"
@@ -2833,15 +2926,52 @@ Return ONLY a valid JSON object:
                 st.error(f"AI analysis failed: {e}")
                 ai_leads = {}
 
+            # Merge with previous results — append new, don't overwrite
+            prev = st.session_state.get("lead_results", {})
+            def _merge_list(key, new_items, id_field="name"):
+                """Append new items not already in previous list."""
+                old_items = prev.get(key, [])
+                existing = {str(x.get(id_field,""))[:60] for x in old_items}
+                additions = [x for x in new_items
+                             if str(x.get(id_field,""))[:60] not in existing]
+                return old_items + additions
+
+            merged_signals  = _merge_list("signals", all_signals, "title")
+            merged_contacts = _merge_list("apollo_contacts", apollo_contacts)
+            merged_orgs     = _merge_list("apollo_orgs", apollo_orgs)
+            merged_people   = _merge_list("top_people", top_people)
+
             st.session_state["lead_results"] = {
-                "signals":         all_signals,
-                "apollo_contacts": apollo_contacts,
-                "apollo_orgs":     apollo_orgs,
-                "top_people":      top_people,
+                "signals":         merged_signals,
+                "apollo_contacts": merged_contacts,
+                "apollo_orgs":     merged_orgs,
+                "top_people":      merged_people,
                 "jse":             jse_list,
-                "enriched":        enriched,
+                "enriched":        {**prev.get("enriched",{}), **enriched},
                 "ai":              ai_leads,
             }
+            st.toast(f"✅ Appended: +{len(all_signals)} signals, +{len(apollo_contacts)} contacts, +{len(apollo_orgs)} orgs")
+
+            # Persist scored companies to Supabase for history
+            scored_cos = ai_leads.get("scored_companies", [])
+            if scored_cos:
+                try:
+                    rows = [{
+                        "company":            str(c.get("name",""))[:200],
+                        "country":            str(c.get("country",""))[:100],
+                        "lead_type":          str(c.get("lead_type",""))[:100],
+                        "crs_score":          c.get("crs_score"),
+                        "proposed_solutions": json.dumps(c.get("proposed_solutions",[])),
+                        "why":                str(c.get("why",""))[:500],
+                        "outreach_angle":     str(c.get("outreach_angle",""))[:500],
+                        "urgency":            str(c.get("urgency",""))[:20],
+                        "source":             "Lead Intelligence",
+                    } for c in scored_cos if c.get("name")]
+                    supabase.table("lead_intelligence_history").upsert(
+                        rows, on_conflict="company,country"
+                    ).execute()
+                except Exception:
+                    pass  # table may not exist yet
 
     # ────────────────────────────────────────────────────────────────────────
     # DISPLAY RESULTS
@@ -2872,13 +3002,29 @@ Return ONLY a valid JSON object:
         if scored_cos:
             scored_cos_sorted = sorted(scored_cos, key=lambda x: x.get("crs_score",0), reverse=True)
             st.subheader(f"🏢 Companies — CRS Relevance Ranked ({len(scored_cos_sorted)})")
+            LEAD_TYPE_ICON = {
+                "System Integrator": "🔷",
+                "MSP": "🟣",
+                "VAR": "🟦",
+                "End-user": "🏛️",
+                "Training Provider": "🟩",
+                "Consulting/Advisory": "🟧",
+            }
             for co in scored_cos_sorted:
-                score = co.get("crs_score", 0)
-                icon  = URGENCY.get(co.get("urgency","low"), "⚪")
-                badge = "🟢" if score >= 8 else "🟡" if score >= 5 else "🔴"
+                score     = co.get("crs_score", 0)
+                icon      = URGENCY.get(co.get("urgency","low"), "⚪")
+                badge     = "🟢" if score >= 8 else "🟡" if score >= 5 else "🔴"
+                lead_type = co.get("lead_type", "")
+                lt_icon   = LEAD_TYPE_ICON.get(lead_type, "⚪")
                 with st.expander(
-                    f"{badge} **{co.get('name','')}** — CRS Score {score}/10  {icon} {co.get('urgency','').capitalize()}"
+                    f"{badge} **{co.get('name','')}** — {lt_icon} {lead_type}  |  Score {score}/10  {icon} {co.get('urgency','').capitalize()}"
                 ):
+                    # Lead type + solutions on one line
+                    solutions = co.get("proposed_solutions", [])
+                    c1, c2 = st.columns([1,2])
+                    c1.write(f"**{lt_icon} Lead Type:** {lead_type}")
+                    if solutions:
+                        c2.write(f"**💡 Proposed:** {' · '.join(solutions)}")
                     st.write(f"**Why now:** {co.get('why','')}")
                     st.info(f"💬 Outreach angle: {co.get('outreach_angle','')}")
                     enr = res.get("enriched",{}).get(co.get("name",""), {})
