@@ -8,3 +8,5 @@ beautifulsoup4
 groq
 cerebras-cloud-sdk
 openai
+apscheduler
+streamlit-autorefresh
