@@ -2105,7 +2105,7 @@ with tab2:
                     pushed = 0
                     for p in partners:
                         try:
-                            _monday_legacy_push_partner_company(p)
+                            push_tender_to_monday({**p, "title": p.get("company",""), "tender_number": "", "department_name": p.get("company",""), "ai_rationale": p.get("why","") + " " + p.get("outreach_angle",""), "country": p.get("country","South Africa")})
                             pushed += 1
                         except Exception:
                             pass
@@ -3037,7 +3037,8 @@ Return ONLY a valid JSON object:
 
         with push_col2:
             if st.button("📤 Push Priority Contacts to Apollo CRM", key="btn_apollo_contacts"):
-                push_people = top_contacts if top_contacts else all_people[:10]
+                _tc = ai_out.get("scored_contacts", []) if "lead_results" in st.session_state else []
+                push_people = _tc if _tc else all_people[:10]
                 if push_people:
                     saved = 0
                     account_ids = st.session_state.get("apollo_account_ids", {})
@@ -3066,7 +3067,7 @@ Return ONLY a valid JSON object:
                     pushed = 0
                     for s in high_sigs:
                         try:
-                            _monday_legacy_push_attack_signal_lead(s)
+                            push_tender_to_monday({"title": s.get("title",""), "tender_number": f"ATK-{s.get('victim_org','')[:20]}", "department_name": s.get("victim_org",""), "description": s.get("outreach_angle",""), "ai_score": s.get("crs_score"), "ai_rationale": s.get("outreach_angle",""), "country": "Africa", "portal_link": s.get("url","")})
                             pushed += 1
                         except Exception:
                             pass
@@ -3078,7 +3079,7 @@ Return ONLY a valid JSON object:
                     pushed = 0
                     for p in contacts:
                         try:
-                            _monday_legacy_push_apollo_contact(p)
+                            push_tender_to_monday({"title": p.get("title",""), "tender_number": f"APL-{p.get('name','')[:20]}", "department_name": p.get("company",""), "description": p.get("title",""), "ai_score": p.get("crs_score"), "ai_rationale": f"Apollo contact: {p.get('name','')} | {p.get('title','')}", "country": p.get("country","South Africa")})
                             pushed += 1
                         except Exception:
                             pass
@@ -3090,13 +3091,15 @@ Return ONLY a valid JSON object:
                     pushed = 0
                     for co in [c for c in top_cos if (c.get("crs_score") or 0) >= 7]:
                         try:
-                            _monday_legacy_create_lead(
-                                name=co.get("name",""), company=co.get("name",""),
-                                lead_origin="AI Lead Discovery",
-                                notes=co.get("why",""),
-                                outreach_angle=co.get("outreach_angle",""),
-                                crs_score=co.get("crs_score"),
-                            )
+                            push_tender_to_monday({
+                                "title": co.get("name",""),
+                                "tender_number": f"LED-{co.get('name','')[:20]}",
+                                "department_name": co.get("name",""),
+                                "description": co.get("why",""),
+                                "ai_score": co.get("crs_score"),
+                                "ai_rationale": co.get("outreach_angle",""),
+                                "country": "Africa",
+                            })
                             pushed += 1
                         except Exception:
                             pass
@@ -3263,7 +3266,18 @@ with tab6:
         disc_board_id = st.text_input("Enter a Monday Board ID to inspect:", placeholder="1234567890")
         if st.button("🔍 Discover Column IDs", key="btn_discover_cols") and disc_board_id:
             try:
-                cols = _monday_legacy_discover_columns(disc_board_id)
+                # Column discovery via direct GraphQL
+                cols = {}
+                import requests as _req
+                q = """query ($bid: ID!) { boards(ids:[$bid]) { columns { id title type } } }"""
+                _key = st.secrets.get("MONDAY_API_KEY","")
+                _r = _req.post("https://api.monday.com/v2",
+                    json={"query": q, "variables": {"bid": disc_board_id}},
+                    headers={"Authorization": _key, "Content-Type": "application/json", "API-Version": "2024-01"},
+                    timeout=15)
+                if _r.ok:
+                    for c in _r.json().get("data",{}).get("boards",[{}])[0].get("columns",[]):
+                        cols[c.get("title","")] = c.get("id","")
                 st.write("**Column title → Column ID mapping:**")
                 st.dataframe(
                     pd.DataFrame(list(cols.items()), columns=["Title","Column ID"]),
