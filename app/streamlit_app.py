@@ -17,7 +17,8 @@ try:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from monday_client import (
         push_tender_to_monday,
-        get_ticket_board_id, get_leads_board_id,
+        push_partner_to_companies,
+        get_ticket_board_id, get_leads_board_id, get_companies_board_id,
     )
     _MONDAY_AVAILABLE = bool(st.secrets.get("MONDAY_API_KEY") if hasattr(st, 'secrets') else False)
 except ImportError:
@@ -2232,19 +2233,24 @@ with tab2:
                     st.write(f"**Why aligned:** {p.get('why_aligned', '')}")
                     st.info(f"💬 Outreach angle: {p.get('outreach_angle', '')}")
 
-            # Push partner recommendations to Monday Companies board
-            if _MONDAY_AVAILABLE and "partner_analysis" in st.session_state:
-                partners = st.session_state["partner_analysis"]
-                if st.button("📋 Push Partners to Monday Companies Board", key="btn_push_partners",
-                             help="Add recommended companies as Resellers in Monday.com"):
-                    pushed = 0
-                    for p in partners:
-                        try:
-                            push_tender_to_monday({**p, "title": p.get("company",""), "tender_number": "", "department_name": p.get("company",""), "ai_rationale": p.get("why","") + " " + p.get("outreach_angle",""), "country": p.get("country","South Africa")})
-                            pushed += 1
-                        except Exception:
-                            pass
-                    st.success(f"✅ {pushed} companies pushed to Monday.com Companies board")
+                    # Per-company Monday push button
+                    if _MONDAY_AVAILABLE:
+                        btn_key = f"push_co_{company[:30].replace(' ','_')}"
+                        if st.button(f"📋 Push to Monday Companies", key=btn_key,
+                                     help="Create or update this company on the 2.1 - Companies board"):
+                            with st.spinner(f"Pushing {company}…"):
+                                try:
+                                    result = push_partner_to_companies(p)
+                                    action = result.get("action","?")
+                                    item_id = result.get("item_id","")
+                                    if action == "created":
+                                        st.success(f"✅ **{company}** created on Companies board (ID: {item_id})")
+                                    elif action == "updated":
+                                        st.success(f"✅ **{company}** already exists — AI analysis added as update (ID: {item_id})")
+                                    else:
+                                        st.info(f"ℹ️ {company}: {action}")
+                                except Exception as e:
+                                    st.error(f"Push failed: {e}")
 
             st.divider()
 

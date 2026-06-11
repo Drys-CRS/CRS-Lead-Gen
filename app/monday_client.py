@@ -235,7 +235,15 @@ def push_tender_to_monday(tender: dict) -> dict:
             "single_select05":   {"label": location if location in ("South Africa", "Africa") else "Africa"},
             "single_select411":  {"label": div},
             "single_select":     {"label": "New Customer"},
-            "long_text_1":       f"AI Fit Score: {ai_score}/10\n\n{ai_rationale}",
+            "long_text_1":       (
+            f"AI Fit Score: {ai_score}/10\n\n{ai_rationale}\n\n"
+            + (f"Enquiry Contact: {tender.get('contact_person','')}\n"
+               if tender.get('contact_person') else "")
+            + (f"Email: {tender.get('contact_email','')}\n"
+               if tender.get('contact_email') else "")
+            + (f"Phone: {tender.get('contact_phone','')}\n"
+               if tender.get('contact_phone') else "")
+        ),
         }
         if cs_vendor:
             ticket_cols["single_select0"]  = {"label": cs_vendor}
@@ -315,3 +323,181 @@ def get_ticket_board_id() -> int:
 
 def get_leads_board_id() -> int:
     return LEADS_BOARD_ID
+
+def get_companies_board_id() -> int:
+    return COMPANIES_BOARD_ID
+
+
+# ── COMPANIES BOARD constants (verified 2026-06-11) ───────────────────────────
+COMPANIES_BOARD_ID   = 3172010618   # "2.1 - Companies"
+COMPANIES_GROUP_ID   = "new_group42980"  # "Companies" group
+
+# Account Type column labels (status, id=status)
+_ACCT_TYPE_MAP = {
+    "System Integrator":  "Reseller / MSP",   # id=13
+    "MSP":                "Reseller / MSP",   # id=13
+    "VAR":                "Reseller / MSP",   # id=13
+    "Training Provider":  "IBM/RH Reseller",  # id=0
+    "End-user":           "End-User",          # id=19
+    "Consulting/Advisory":"Reseller / MSP",   # id=13
+}
+
+# Region mapping
+_REGION_MAP_CO = {
+    "South Africa": "ZA", "Kenya": "Africa", "Nigeria": "Africa",
+    "Ghana": "Africa", "Tanzania": "Africa", "Uganda": "Africa",
+    "Zambia": "Africa", "Rwanda": "Africa", "Botswana": "Africa",
+    "Namibia": "Africa", "Zimbabwe": "Africa", "Mozambique": "Africa",
+    "Malawi": "Africa", "Angola": "Africa", "Ethiopia": "Africa",
+    "Egypt": "Africa", "Sudan": "Africa",
+}
+
+# Industry dropdown — map partner classification to closest industry label id
+_INDUSTRY_MAP = {
+    "System Integrator":   9,   # "System Integrator"
+    "MSP":                 22,  # "Managed Services"
+    "VAR":                 1,   # "Tech"
+    "Training Provider":   30,  # "Training"
+    "End-user":            13,  # "Government"
+    "Consulting/Advisory": 11,  # "Consultants"
+}
+
+
+def _find_company_by_name(name: str) -> str | None:
+    """Search Companies board for an existing item by name. Returns item_id or None."""
+    q = """
+    query ($bid: ID!, $term: String!) {
+      items_page_by_column_values(board_id: $bid, limit: 5,
+        columns: [{column_id: "name", column_values: [$term]}]
+      ) { items { id name } }
+    }"""
+    try:
+        data = _gql(q, {"bid": str(COMPANIES_BOARD_ID), "term": name})
+        items = data["data"]["items_page_by_column_values"]["items"]
+        # Also try partial match via search
+        if not items:
+            # Fallback: search endpoint
+            q2 = """query ($bid: ID!, $term: String!) {
+              items_page(board_id: $bid, limit: 10, query_params: {rules: []}) {
+                items { id name }
+              }
+            }"""
+            # Use items search instead
+            q3 = """
+            query ($bid: ID!) {
+              boards(ids: [$bid]) {
+                items_page(limit: 500, query_params: {rules: []}) {
+                  items { id name }
+                }
+              }
+            }"""
+            # Simple: just return None if not found by exact name
+            return None
+        # Check for close match
+        for item in items:
+            if name.lower()[:30] in item["name"].lower() or item["name"].lower()[:30] in name.lower():
+                return item["id"]
+        return items[0]["id"] if items else None
+    except Exception:
+        return None
+
+
+def _add_monday_update(item_id: str, board_id: int, text: str):
+    """Add a text update (comment) to an existing item."""
+    q = """
+    mutation ($iid: ID!, $body: String!) {
+      create_update(item_id: $iid, body: $body) { id }
+    }"""
+    _gql(q, {"iid": item_id, "body": text})
+
+
+def push_partner_to_companies(partner: dict) -> dict:
+    """
+    Push a partner recommendation to the 2.1 - Companies board.
+    - Searches for existing company by name
+    - If found: adds an update (comment) with the AI analysis — never overwrites
+    - If not found: creates the company then adds the analysis as the first update
+
+    Returns {"item_id": ..., "action": "updated" | "created", "company": ...}
+    """
+    company_name  = str(partner.get("company") or "").strip()
+    country       = str(partner.get("country") or "South Africa")
+    ptype         = str(partner.get("partner_classification") or
+                        partner.get("partnership_type") or "")
+    solutions     = partner.get("proposed_solutions") or []
+    why           = str(partner.get("why_aligned") or "")
+    outreach      = str(partner.get("outreach_angle") or "")
+    urgency       = str(partner.get("urgency") or "")
+    key_tenders   = partner.get("key_tenders") or []
+    depts         = partner.get("issuing_departments") or []
+    deal_size     = str(partner.get("estimated_deal_size") or "")
+
+    if not company_name:
+        raise ValueError("partner must have a company name")
+
+    # Build the update text (rich analysis note)
+    nl = "\n"
+    bullet_solutions = nl.join(f"- {s}" for s in solutions)
+    bullet_tenders   = ", ".join(str(t) for t in key_tenders[:5]) if key_tenders else ""
+    bullet_depts     = ", ".join(str(d) for d in depts[:3]) if depts else ""
+    _ts = _sched_dt_str()
+
+    update_body = (
+        f"**CRS AI Partner Analysis** | {_ts}{nl}{nl}"
+        f"**Partner Type:** {ptype}{nl}"
+        f"**Country:** {country} | **Urgency:** {urgency.upper()} | **Deal Size:** {deal_size}{nl}{nl}"
+        f"**Proposed CRS Solutions:**{nl}{bullet_solutions}{nl}{nl}"
+        f"**Why Aligned:**{nl}{why}{nl}{nl}"
+        f"**Outreach Angle:**{nl}{outreach}"
+    )
+    if bullet_tenders:
+        update_body += f"{nl}{nl}**Key Tenders Won:** {bullet_tenders}"
+    if bullet_depts:
+        update_body += f"{nl}**Departments Served:** {bullet_depts}"
+
+        # Check if company already exists
+    existing_id = _find_company_by_name(company_name)
+
+    if existing_id:
+        # Company exists — just add the update, never modify existing data
+        _add_monday_update(existing_id, COMPANIES_BOARD_ID, update_body)
+        return {"item_id": existing_id, "action": "updated", "company": company_name}
+
+    # Company does not exist — create it with full column values
+    acct_type = _ACCT_TYPE_MAP.get(ptype, "Reseller / MSP")
+    region    = _REGION_MAP_CO.get(country, "Africa")
+    industry_id = _INDUSTRY_MAP.get(ptype, 9)
+
+    col_vals = {
+        "status":      {"label": acct_type},
+        "status7":     {"label": region},
+        "crs_division":{"label": "CyberSec" if ptype != "Training Provider" else "Training"},
+        "label1":      {"label": "Not Contacted"},
+        "text3":       f"Source: CRS Dashboard AI Analysis | Partner Type: {ptype} | Urgency: {urgency}",
+        "industry":    str(industry_id),
+    }
+
+    q = """
+    mutation ($bid: ID!, $gid: String!, $name: String!, $cv: JSON!) {
+      create_item(board_id: $bid, group_id: $gid, item_name: $name, column_values: $cv) {
+        id
+      }
+    }"""
+    data = _gql(q, {
+        "bid":  str(COMPANIES_BOARD_ID),
+        "gid":  COMPANIES_GROUP_ID,
+        "name": company_name,
+        "cv":   json.dumps(col_vals),
+    })
+    new_id = data["data"]["create_item"]["id"]
+
+    # Add the full analysis as the first update
+    _add_monday_update(new_id, COMPANIES_BOARD_ID, update_body)
+
+    return {"item_id": new_id, "action": "created", "company": company_name}
+
+
+def _sched_dt_str() -> str:
+    """Return current datetime as a readable string."""
+    import datetime
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
