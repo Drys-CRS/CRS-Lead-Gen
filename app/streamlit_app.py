@@ -1203,7 +1203,8 @@ def fetch_tenders():
 
 @st.cache_data(ttl=300)
 def fetch_awarded_tenders():
-    """Fetch awarded tenders from the dedicated awarded_tenders table."""
+    """Fetch awarded tenders from the dedicated awarded_tenders table.
+    Uses select("*") — returns all 5000+ records regardless of open-tender country filter."""
     try:
         response = supabase.table("awarded_tenders").select("*").execute()
         df = pd.DataFrame(response.data)
@@ -1217,6 +1218,15 @@ def fetch_awarded_tenders():
             return pd.DataFrame(r2.data)
         except Exception:
             return pd.DataFrame()
+
+@st.cache_data(ttl=600)
+def fetch_awarded_countries() -> list:
+    """Get distinct countries from awarded_tenders — separate from open tender countries."""
+    try:
+        r = supabase.table("awarded_tenders").select("country").execute()
+        return sorted({row["country"] for row in r.data if row.get("country")})
+    except Exception:
+        return []
 
 # ─────────────────────────────────────────────
 # 6. AI HELPERS
@@ -2086,28 +2096,52 @@ with tab2:
     # Load from dedicated awarded_tenders table (never wiped on refresh)
     awarded_df = fetch_awarded_tenders()
 
+    # ── Tab 2 has its own independent filters (not tied to open-tender sidebar) ──
+    awarded_all_countries = fetch_awarded_countries()
+
+    t2_col1, t2_col2, t2_col3 = st.columns([2, 2, 2])
+    with t2_col1:
+        t2_countries = st.multiselect(
+            "Filter by Country",
+            options=awarded_all_countries or ALL_TARGET_COUNTRIES,
+            default=[],   # empty = show all
+            key="t2_country_filter",
+            help=f"{len(awarded_all_countries)} countries in awarded history"
+        )
+    with t2_col2:
+        t2_date_from = st.date_input("Awarded From", value=date(2015, 1, 1),
+                                      key="t2_date_from")
+        t2_date_to   = st.date_input("Awarded To",   value=date.today(),
+                                      key="t2_date_to")
+    with t2_col3:
+        t2_bidder = st.text_input("Filter by Winning Bidder", key="t2_bidder",
+                                   placeholder="e.g. Dimension Data")
+
     if not awarded_df.empty:
-        # Apply country filter
-        if selected_countries and "country" in awarded_df.columns:
-            awarded_df = awarded_df[awarded_df["country"].isin(selected_countries)]
-        # Apply date range filter
+        # Country filter — only apply if user explicitly selected countries
+        if t2_countries and "country" in awarded_df.columns:
+            awarded_df = awarded_df[awarded_df["country"].isin(t2_countries)]
+        # Date range filter
         if "issue_date" in awarded_df.columns:
             try:
-                _from_ts = pd.Timestamp(awarded_date_from)
-                _to_ts   = pd.Timestamp(awarded_date_to)
+                _from_ts = pd.Timestamp(t2_date_from)
+                _to_ts   = pd.Timestamp(t2_date_to)
                 _dates   = pd.to_datetime(awarded_df["issue_date"], errors="coerce")
                 awarded_df = awarded_df[_dates.isna() | ((_dates >= _from_ts) & (_dates <= _to_ts))]
             except Exception:
                 pass
-        # Apply competitor search
-        if competitor_search and "winning_bidder" in awarded_df.columns:
+        # Bidder search
+        if t2_bidder and "winning_bidder" in awarded_df.columns:
             awarded_df = awarded_df[
-                awarded_df["winning_bidder"].str.contains(competitor_search, case=False, na=False)
+                awarded_df["winning_bidder"].str.contains(t2_bidder, case=False, na=False)
             ]
 
     if awarded_df.empty:
         st.info("No awarded tenders found. Run a data refresh to populate — awarded tenders are stored permanently and never wiped.")
     else:
+        total_awarded = len(awarded_df)
+        n_countries   = awarded_df["country"].nunique() if "country" in awarded_df.columns else "?"
+        st.success(f"📊 **{total_awarded:,} awarded tenders** across **{n_countries} countries** (use filters above to narrow down)")
         # ── AI Partner Analysis ──────────────────────────────────────────────
         col_run, col_info = st.columns([2, 5])
         with col_run:
@@ -2124,8 +2158,9 @@ with tab2:
                 _record_op("partner_analysis")
         with col_info:
             st.caption(
-                f"Based on {len(awarded_df[awarded_df['winning_bidder'].notna()])} awarded tenders "
-                f"across {awarded_df['country'].nunique() if 'country' in awarded_df.columns else '?'} countries."
+                f"Analysing {len(awarded_df[awarded_df['winning_bidder'].notna()]):,} awarded tenders "
+                f"across {awarded_df['country'].nunique() if 'country' in awarded_df.columns else '?'} countries "
+                f"— increase the sample by adjusting filters above."
             )
 
         if run_analysis:
