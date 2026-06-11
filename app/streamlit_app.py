@@ -996,65 +996,113 @@ def _call_ai_grounded(prompt: str) -> str:
 
 def ai_analyse_partners(awarded_df) -> list:
     """Analyse awarded tender winners to identify CRS channel partner candidates.
-    Uses full context: tender number, department, title, value, country."""
-    # Include all relevant columns — department and tender_number are key context
-    avail_cols = [c for c in ["winning_bidder","tender_number","department_name",
-                               "title","country","award_value","issue_date"]
-                  if c in awarded_df.columns]
-    sample = awarded_df[avail_cols].dropna(subset=["winning_bidder"]).head(80)
-    rows_text = sample.to_csv(index=False)
 
-    prompt = f"""You are a channel-partner strategist for Cyber Retaliator Solutions (CRS).
+    Pre-aggregates data per company before sending to AI to keep the prompt
+    compact and the response reliably parseable.
+    """
+    import re as _re
 
-CRS PROFILE:
-{CRS_PROFILE}
+    df = awarded_df.dropna(subset=["winning_bidder"]).copy()
+    if df.empty:
+        return []
 
-PARTNER CLASSIFICATION DEFINITIONS (use these exactly):
-- System Integrator (SI): Designs and implements complex ICT systems; typically wins
-  large multi-component tenders; integrates hardware, software, networking, security.
-- Managed Service Provider (MSP): Runs ongoing IT/security operations for clients;
-  wins contracts for managed services, monitoring, helpdesk, SOC-as-a-service.
-- Value Added Reseller (VAR): Resells technology solutions with some customisation;
-  wins supply-and-install or supply-and-support tenders.
-- Training Provider: Wins training, skills development, capacity building, learnerships.
-- Consulting/Advisory: Wins strategy, assessment, audit, project management tenders.
-- End-user (Government/Parastatal): The issuing department itself — not a partner prospect.
+    # ── Pre-aggregate: group by company so each company = one row ──────────
+    agg_rows = []
+    grouped = df.groupby("winning_bidder", sort=False)
+    for company, grp in grouped:
+        company = str(company).strip()
+        if not company or len(company) < 3:
+            continue
+        country  = str(grp["country"].mode().iloc[0]) if "country" in grp else "Unknown"
+        titles   = grp["title"].dropna().str[:60].tolist()[:3] if "title" in grp else []
+        depts    = grp["department_name"].dropna().str[:50].unique().tolist()[:2] if "department_name" in grp else []
+        t_nums   = grp["tender_number"].dropna().str[:30].tolist()[:2] if "tender_number" in grp else []
+        agg_rows.append({
+            "company":  company[:80],
+            "country":  country[:50],
+            "wins":     len(grp),
+            "titles":   " | ".join(titles),
+            "depts":    " | ".join(depts),
+            "ref_nos":  " | ".join(t_nums),
+        })
 
-AWARDED TENDER DATA (includes tender number, issuing department, title, value):
-{rows_text}
+    # Sort by wins desc, take top 40 unique companies for analysis
+    agg_rows.sort(key=lambda x: x["wins"], reverse=True)
+    agg_rows = agg_rows[:40]
 
-TASK: For each winning bidder that is an ICT/security company (not end-user), assess:
-1. Which partner classification fits them best based on the tenders they WIN
-2. Which CRS solutions they are most likely missing and would benefit from
-3. A specific outreach angle referencing the actual tenders they have won
+    # Build compact table string — much smaller than raw CSV
+    lines = ["company|country|wins|sample_tenders|departments|ref_numbers"]
+    for r in agg_rows:
+        lines.append(f"{r['company']}|{r['country']}|{r['wins']}|{r['titles']}|{r['depts']}|{r['ref_nos']}")
+    table_text = "\n".join(lines)
 
-PROPOSED SOLUTIONS must come only from CRS's portfolio:
-VECTRA (NDR/XDR), vRx (vulnerability/patch), Strobes (CTEM/ASM/PTaaS),
-Aikido (AppSec/DevSecOps), Flare (dark web/threat intel), BeachheadSecure (encryption/MFA),
-SMBsecure (SMB protection/POPIA), Telivy (MSSP audit), BlueFlag (SDLC security),
-Standss/SendGuard (email GRC), CRE/GoldPhish/Prventi (cyber awareness),
-VAPT (CRS own pentest services), IBM/RedHat/SUSE/CompTIA/Agile SAFe training.
+    prompt = f"""You are a channel-partner analyst for Cyber Retaliator Solutions (CRS), a cyber security distributor and IBM/RedHat/SUSE/CompTIA training partner based in South Africa.
 
-Return ONLY a JSON array. Each element:
-{{
-  "company": "exact company name",
-  "country": "country",
-  "tenders_won": <count from data>,
-  "key_tenders": ["tender_number or title 1", "tender_number or title 2"],
-  "issuing_departments": ["dept name 1", "dept name 2"],
-  "partner_classification": "System Integrator | MSP | VAR | Training Provider | Consulting/Advisory",
-  "proposed_solutions": ["Solution1", "Solution2", "Solution3"],
-  "why_aligned": "2-3 sentences referencing specific tenders and departments they serve",
-  "outreach_angle": "one sentence — lead with a specific tender they won",
-  "urgency": "high | medium | low",
-  "estimated_deal_size": "small (<$10k) | medium ($10k-$100k) | large (>$100k)"
-}}
+CRS VENDOR PORTFOLIO: VECTRA (NDR/XDR), vRx (vuln/patch mgmt), Strobes (CTEM/PTaaS), Aikido (AppSec), Flare (dark web intel), BeachheadSecure (encryption/MFA), SMBsecure (SMB/POPIA), Telivy (MSSP audit), BlueFlag (SDLC), Standss/SendGuard (email GRC), CRE/GoldPhish (cyber awareness), VAPT services, IBM/RedHat/SUSE/CompTIA/Agile training.
 
-Return top 15 most promising. Exclude pure end-users and non-ICT companies.
-Only return the JSON array."""
+PARTNER TYPES: System Integrator | MSP | VAR | Training Provider | Consulting/Advisory | End-user
+
+AGGREGATED TENDER WIN DATA (pipe-delimited):
+{table_text}
+
+Identify the TOP 12 companies CRS should approach as channel partners or resellers. Focus on ICT/security companies — exclude government departments, construction, catering, cleaning, vehicles, stationery.
+
+Return ONLY a valid JSON array, no markdown, no explanation. Each object:
+{{"company":"name","country":"country","tenders_won":N,"partner_classification":"type","proposed_solutions":["sol1","sol2"],"key_tenders":["ref1","ref2"],"issuing_departments":["dept1"],"why_aligned":"1-2 sentences","outreach_angle":"1 sentence","urgency":"high|medium|low","estimated_deal_size":"small|medium|large"}}"""
+
     raw = _call_ai(prompt)
-    parsed = json.loads(raw)
-    return parsed if isinstance(parsed, list) else []
+
+    # ── Robust JSON extraction ──────────────────────────────────────────────
+    # Strip markdown fences
+    raw = _re.sub(r"^```json[\s]*|^```[\s]*|```$", "", raw.strip(), flags=_re.MULTILINE).strip()
+    # Extract first [...] array if there's surrounding text
+    m = _re.search(r"\[.*\]", raw, _re.DOTALL)
+    if m:
+        raw = m.group(0)
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, list) else []
+    except json.JSONDecodeError:
+        # Try to salvage partial response — parse as many complete objects as possible
+        objects = _re.findall(r'\{[^{}]+\}', raw, _re.DOTALL)
+        results = []
+        for obj in objects:
+            try:
+                results.append(json.loads(obj))
+            except Exception:
+                pass
+        return results
+
+
+_FENCE_RE = None
+
+def _safe_json(raw: str, expect_list: bool = True):
+    """Robustly parse a JSON string from AI output.
+    Strips markdown fences, extracts first [...] or {...}, handles partial output."""
+    import re as _re
+    global _FENCE_RE
+    if _FENCE_RE is None:
+        _FENCE_RE = _re.compile(r"^```json\s*|^```\s*|```$", _re.MULTILINE)
+    raw = _FENCE_RE.sub("", raw.strip()).strip()
+    # Try to extract array or object
+    pattern = r"\[.*\]" if expect_list else r"\{.*\}"
+    m = _re.search(pattern, raw, _re.DOTALL)
+    if m:
+        raw = m.group(0)
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        # Salvage complete objects from partial output
+        objects = _re.findall(r'\{[^{}]+\}', raw, _re.DOTALL)
+        results = []
+        for obj in objects:
+            try:
+                results.append(json.loads(obj))
+            except Exception:
+                pass
+        if expect_list:
+            return results
+        return results[0] if results else {}
 
 
 def ai_discover_tenders(countries: list, focus: str) -> list:
@@ -1092,7 +1140,7 @@ any current ones, return tenders from organisations' known procurement pages wit
 closing_date null and note "verify on portal" in the description. Maximum 15 results.
 """
     raw = _call_ai_grounded(prompt)
-    parsed = json.loads(raw)
+    parsed = _safe_json(raw, expect_list=True)
     return parsed if isinstance(parsed, list) else []
 
 # ─────────────────────────────────────────────
@@ -1257,7 +1305,7 @@ TENDER TEXT:
 {raw_text}
 """
     raw = _call_ai(prompt)
-    return json.loads(raw)
+    return _safe_json(raw, expect_list=False)
 
 
 def ai_score_tender(tender: dict) -> dict:
