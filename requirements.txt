@@ -1,12 +1,11 @@
 streamlit
 pandas
 supabase
-python-dotenv
-google-generativeai
 requests
 beautifulsoup4
+apscheduler
+streamlit-autorefresh
+google-generativeai
 groq
 cerebras-cloud-sdk
 openai
-apscheduler
-streamlit-autorefresh
