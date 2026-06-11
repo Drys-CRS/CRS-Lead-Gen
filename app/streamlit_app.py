@@ -163,28 +163,42 @@ def _call_gemini(prompt: str, retries: int = 3) -> str:
 
 def _call_ai(prompt: str) -> str:
     """Smart cascade: Groq → Cerebras → Gemini.
-    Tries each provider in order; skips unavailable or rate-limited ones.
+    Skips any provider that has exhausted its daily budget.
     Raises only if ALL providers fail."""
     providers = []
-    if groq_ai:
+    if groq_ai and _provider_budget_ok("Groq"):
         providers.append(("Groq", _call_groq))
-    if cerebras_ai:
+    elif groq_ai:
+        st.toast("⚠️ Groq daily limit reached — skipping")
+    if cerebras_ai and _provider_budget_ok("Cerebras"):
         providers.append(("Cerebras", _call_cerebras))
-    providers.append(("Gemini", _call_gemini))
+    elif cerebras_ai:
+        st.toast("⚠️ Cerebras daily limit reached — skipping")
+    if _provider_budget_ok("Gemini"):
+        providers.append(("Gemini", _call_gemini))
+    else:
+        st.toast("⚠️ Gemini daily limit reached — skipping")
+
+    if not providers:
+        raise RuntimeError(
+            "All AI providers have hit their daily limits. "
+            "Limits reset at midnight. Come back tomorrow or upgrade your API plan."
+        )
 
     last_err = None
     for name, fn in providers:
         try:
             result = fn(prompt)
+            _increment_usage(name)   # track successful call
             return result
         except Exception as e:
             last_err = e
             err_str = str(e)
             if _is_rate_limit(err_str):
                 st.toast(f"⏳ {name} rate limit hit — trying next provider…")
-                continue  # try next provider
+                _increment_usage(name)  # count it even if failed — quota was consumed
+                continue
             else:
-                # Hard error (auth, model not found, etc.) — skip this provider
                 st.toast(f"⚠️ {name} error: {err_str[:80]} — trying next provider…")
                 continue
     raise RuntimeError(
@@ -306,6 +320,98 @@ closing_date null and note "verify on portal" in the description. Maximum 15 res
     raw = _call_ai_grounded(prompt)
     parsed = json.loads(raw)
     return parsed if isinstance(parsed, list) else []
+
+# ─────────────────────────────────────────────
+# 4b. AI USAGE TRACKER
+# Tracks per-provider daily request counts in Supabase so limits persist
+# across browser sessions. Falls back to session-state-only if table missing.
+# ─────────────────────────────────────────────
+import datetime as _dt
+
+# Free-tier daily limits (requests/day)
+_AI_DAILY_LIMITS = {
+    "Groq":     1000,   # 1 000 req/day on free tier
+    "Cerebras": 500,    # conservative — actual is token-based (~1M tokens/day)
+    "Gemini":   20,     # 20 req/day on 2.5 Flash free tier
+}
+# Minimum minutes between full AI operations (score-all, partner analysis, lead discovery)
+_AI_OP_COOLDOWN_MINUTES = {
+    "score_all":         5,
+    "partner_analysis":  10,
+    "lead_discovery":    15,   # burns 2 calls (stage1 + stage2)
+    "tender_parser":     1,
+    "tender_discovery":  10,
+}
+
+def _today_str() -> str:
+    return _dt.date.today().isoformat()
+
+def _get_usage() -> dict:
+    """Load today's usage counts. Returns {provider: count}."""
+    today = _today_str()
+    if "ai_usage" not in st.session_state or st.session_state.get("ai_usage_date") != today:
+        st.session_state["ai_usage"] = {p: 0 for p in _AI_DAILY_LIMITS}
+        st.session_state["ai_usage_date"] = today
+        st.session_state["ai_last_ops"] = {}
+        # Try to load persisted count from Supabase
+        try:
+            row = supabase.table("ai_usage_log").select("*").eq("usage_date", today).execute()
+            if row.data:
+                for entry in row.data:
+                    provider = entry.get("provider","")
+                    if provider in st.session_state["ai_usage"]:
+                        st.session_state["ai_usage"][provider] = entry.get("count", 0)
+        except Exception:
+            pass  # table may not exist yet — session state only
+    return st.session_state["ai_usage"]
+
+def _increment_usage(provider: str):
+    """Increment usage counter for a provider and persist to Supabase."""
+    usage = _get_usage()
+    usage[provider] = usage.get(provider, 0) + 1
+    try:
+        today = _today_str()
+        supabase.table("ai_usage_log").upsert(
+            {"usage_date": today, "provider": provider, "count": usage[provider]},
+            on_conflict="usage_date,provider"
+        ).execute()
+    except Exception:
+        pass  # non-critical — session state already updated
+
+def _check_cooldown(op_key: str) -> tuple[bool, int]:
+    """Returns (can_run, minutes_remaining). Updates last-op timestamp if can_run."""
+    if "ai_last_ops" not in st.session_state:
+        st.session_state["ai_last_ops"] = {}
+    cooldown_mins = _AI_OP_COOLDOWN_MINUTES.get(op_key, 5)
+    last = st.session_state["ai_last_ops"].get(op_key)
+    if last is None:
+        return True, 0
+    elapsed = (_dt.datetime.now() - last).total_seconds() / 60
+    if elapsed >= cooldown_mins:
+        return True, 0
+    return False, int(cooldown_mins - elapsed) + 1
+
+def _record_op(op_key: str):
+    """Record that an AI operation just ran."""
+    if "ai_last_ops" not in st.session_state:
+        st.session_state["ai_last_ops"] = {}
+    st.session_state["ai_last_ops"][op_key] = _dt.datetime.now()
+
+def _provider_budget_ok(provider: str) -> bool:
+    """True if this provider still has daily budget remaining."""
+    usage = _get_usage()
+    return usage.get(provider, 0) < _AI_DAILY_LIMITS.get(provider, 999)
+
+def _usage_sidebar():
+    """Render a compact usage meter in the sidebar."""
+    usage = _get_usage()
+    st.sidebar.markdown("**AI Usage Today**")
+    for provider, limit in _AI_DAILY_LIMITS.items():
+        used  = usage.get(provider, 0)
+        pct   = min(used / limit, 1.0)
+        color = "🟢" if pct < 0.7 else "🟡" if pct < 0.9 else "🔴"
+        st.sidebar.caption(f"{color} {provider}: {used}/{limit}")
+
 
 # ─────────────────────────────────────────────
 # 5. DATA FETCHING
@@ -855,6 +961,7 @@ st.title("🛡️ CRS Competitive Intelligence Dashboard")
 
 st.sidebar.header("Controls")
 st.sidebar.caption(_provider_status())
+_usage_sidebar()
 if st.sidebar.button("🔄 Refresh All Countries"):
     run_all_scrapers()
     st.cache_data.clear()
@@ -920,11 +1027,20 @@ with tab1:
     with col_left:
         st.subheader(f"Open Opportunities ({len(open_df)})")
     with col_right:
-        if st.button("🤖 Score All with AI", help="Run AI fit scoring on all open tenders"):
-            ai_match_tenders(open_df)   # scores are written to Supabase inside
+        _can_score, _score_wait = _check_cooldown("score_all")
+        _score_btn = st.button(
+            "🤖 Score All with AI",
+            help=f"Run AI fit scoring on all open tenders",
+            disabled=not _can_score
+        )
+        if not _can_score:
+            st.caption(f"⏳ Available in {_score_wait} min")
+        if _score_btn and _can_score:
+            _record_op("score_all")
+            ai_match_tenders(open_df)
             st.cache_data.clear()
             st.success("Scoring complete! Reloading…")
-            st.rerun()  # reload from DB so table shows fresh scores
+            st.rerun()
 
     # Sort by score if available
     if "ai_score" in open_df.columns and open_df["ai_score"].notna().any():
@@ -1024,10 +1140,16 @@ with tab2:
         # ── AI Partner Analysis ──────────────────────────────────────────────
         col_run, col_info = st.columns([2, 5])
         with col_run:
+            _can_analyse, _analyse_wait = _check_cooldown("partner_analysis")
             run_analysis = st.button(
                 "🤖 Analyse Partners with AI",
-                help="Gemini reviews all awarded tender winners and recommends partner candidates"
+                help="Gemini reviews all awarded tender winners and recommends partner candidates",
+                disabled=not _can_analyse
             )
+            if not _can_analyse:
+                st.caption(f"⏳ Available in {_analyse_wait} min")
+            if run_analysis:
+                _record_op("partner_analysis")
         with col_info:
             st.caption(
                 f"Based on {len(awarded_df[awarded_df['winning_bidder'].notna()])} awarded tenders "
@@ -1190,7 +1312,11 @@ with tab4:
                   "IBM / Red Hat / CompTIA technical training, vulnerability management",
         )
 
-    if st.button("🔎 Discover Tenders", disabled=not disc_countries):
+    _can_discover, _discover_wait = _check_cooldown("tender_discovery")
+    if not _can_discover:
+        st.caption(f"⏳ Tender discovery available in {_discover_wait} min")
+    if st.button("🔎 Discover Tenders", disabled=(not disc_countries or not _can_discover)):
+        _record_op("tender_discovery")
         with st.spinner("Gemini is searching the web — this can take up to a minute…"):
             try:
                 found = ai_discover_tenders(disc_countries, disc_focus)
@@ -1306,7 +1432,15 @@ with tab5:
             value=False
         )
 
-    run_leads = st.button("🎯 Find Leads", type="primary", disabled=not lead_countries)
+    _can_leads, _leads_wait = _check_cooldown("lead_discovery")
+    if not _can_leads:
+        st.caption(f"⏳ Lead discovery available in {_leads_wait} min (burns 2 AI calls)")
+    run_leads = st.button(
+        "🎯 Find Leads", type="primary",
+        disabled=(not lead_countries or not _can_leads)
+    )
+    if run_leads:
+        _record_op("lead_discovery")
 
     # ────────────────────────────────────────────────────────────────────────
     # HELPER FUNCTIONS (scoped inside tab so they share session state)
@@ -1316,72 +1450,90 @@ with tab5:
         key = st.secrets.get("APOLLO_API_KEY", "")
         return {"x-api-key": key, "Content-Type": "application/json", "accept": "application/json"}
 
-    # African country/region terms appended to every search to geo-filter signals
+    # ── Cyber attack signal keywords ─────────────────────────────────────────
+    _ATTACK_KEYWORDS = [
+        "ransomware", "cyberattack", "cyber attack", "data breach", "hacked",
+        "malware", "phishing attack", "security breach", "data leak",
+        "ransomware attack", "cyber incident", "network intrusion",
+        "compromised", "stolen data", "extortion", "DDoS attack",
+    ]
     _AFRICA_GEO_TERMS = [
         "South Africa", "Kenya", "Nigeria", "Ghana", "Tanzania", "Uganda",
         "Zambia", "Rwanda", "Africa", "African", "Johannesburg", "Cape Town",
-        "Nairobi", "Lagos", "Accra",
-    ]
-    _AFRICA_SUBREDDITS = [
-        "r/southafrica", "r/africa", "r/Nigeria", "r/Kenya", "r/Ghana",
-        "r/cybersecurity", "r/netsec", "r/sysadmin", "r/networking",
-        "r/ITManagers", "r/msp",
+        "Nairobi", "Lagos", "Accra", "Pretoria", "Durban",
     ]
 
-    def _search_reddit_signals(keywords: list, limit: int = 15) -> list:
-        """Search Reddit for African buying-signal posts. No key needed."""
+    def _search_attack_news(countries: list, limit: int = 30) -> list:
+        """NewsAPI — African cyber attack news. Each article = a company in distress."""
         import requests
+        key = st.secrets.get("NEWSAPI_KEY", "")
         results = []
-        # Build query: focus keywords + Africa geo filter
-        kw_part  = " OR ".join(f'"{k}"' for k in keywords[:3])
-        geo_part = " OR ".join(f'"{g}"' for g in _AFRICA_GEO_TERMS[:5])
-        query    = f"({kw_part}) ({geo_part})"
-        url = "https://www.reddit.com/search.json"
-        params = {"q": query, "sort": "new", "t": "year", "limit": limit, "type": "link"}
+
+        # Two complementary queries for maximum coverage
+        _geo = " OR ".join(countries[:4] + ["Africa"])
+        queries = [
+            f"(ransomware OR cyberattack OR hacked OR breach) AND ({_geo})",
+            f"(malware OR phishing OR ransomware OR DDoS) AND ({_geo})",
+        ]
+
+        if key:
+            for q in queries:
+                try:
+                    r = requests.get("https://newsapi.org/v2/everything", params={
+                        "q": q, "sortBy": "publishedAt", "language": "en",
+                        "pageSize": limit // 2, "apiKey": key,
+                    }, timeout=15)
+                    if r.ok:
+                        for a in r.json().get("articles", []):
+                            results.append({
+                                "source":      f"News: {a.get('source',{}).get('name','')}",
+                                "title":       a.get("title", ""),
+                                "url":         a.get("url", ""),
+                                "body":        (a.get("description") or "")[:400],
+                                "published":   a.get("publishedAt", "")[:10],
+                                "victim_org":  "",   # filled by AI
+                                "attack_type": "",   # filled by AI
+                                "crs_score":   None,
+                                "contact_title": "",
+                            })
+                except Exception as e:
+                    st.toast(f"NewsAPI error: {e}")
+
+        # Reddit fallback / supplement — no key needed
         try:
-            r = requests.get(url, params=params,
-                             headers={"User-Agent": "CRS-LeadGen/1.0"}, timeout=15)
+            import requests as _req
+            geo_part = " OR ".join(f'"{g}"' for g in _AFRICA_GEO_TERMS[:5])
+            atk_part = " OR ".join(f'"{k}"' for k in _ATTACK_KEYWORDS[:5])
+            q = f"({atk_part}) ({geo_part})"
+            r = _req.get("https://www.reddit.com/search.json",
+                         params={"q": q, "sort": "new", "t": "year",
+                                 "limit": 15, "type": "link"},
+                         headers={"User-Agent": "CRS-LeadGen/1.0"}, timeout=15)
             if r.ok:
                 for post in r.json().get("data", {}).get("children", []):
                     d = post.get("data", {})
                     results.append({
-                        "source": f"Reddit r/{d.get('subreddit','')}",
-                        "title": d.get("title", ""),
-                        "url": f"https://reddit.com{d.get('permalink','')}",
-                        "text": d.get("selftext", "")[:300],
-                        "published": "",
-                        "crs_score": None,
+                        "source":      f"Reddit r/{d.get('subreddit','')}",
+                        "title":       d.get("title", ""),
+                        "url":         f"https://reddit.com{d.get('permalink','')}",
+                        "body":        d.get("selftext", "")[:400],
+                        "published":   "",
+                        "victim_org":  "",
+                        "attack_type": "",
+                        "crs_score":   None,
+                        "contact_title": "",
                     })
         except Exception as e:
             st.toast(f"Reddit fetch error: {e}")
-        return results
 
-    def _search_news(keywords: list, countries: list, limit: int = 20) -> list:
-        """NewsAPI free tier — African tech & cyber news, geo-filtered."""
-        import requests
-        key = st.secrets.get("NEWSAPI_KEY", "")
-        if not key:
-            return []
-        kw_part  = " OR ".join(f'"{k}"' for k in keywords[:3])
-        geo_part = " OR ".join(f'"{c}"' for c in (countries + ["Africa"])[:4])
-        full_query = f"({kw_part}) AND ({geo_part})"
-        try:
-            r = requests.get("https://newsapi.org/v2/everything", params={
-                "q": full_query, "sortBy": "publishedAt", "language": "en",
-                "pageSize": limit, "apiKey": key,
-            }, timeout=15)
-            if r.ok:
-                return [{
-                    "source": f"News: {a.get('source',{}).get('name','')}",
-                    "title": a.get("title",""),
-                    "url": a.get("url",""),
-                    "text": a.get("description","") or "",
-                    "published": a.get("publishedAt","")[:10],
-                    "crs_score": None,
-                } for a in r.json().get("articles", [])]
-        except Exception as e:
-            st.toast(f"NewsAPI error: {e}")
-        return []
+        # Deduplicate by title
+        seen, deduped = set(), []
+        for s in results:
+            key_str = s["title"][:60]
+            if key_str not in seen:
+                seen.add(key_str)
+                deduped.append(s)
+        return deduped
 
     def _jse_ict_companies() -> list:
         """Return a curated list of JSE-listed ICT / financial services companies
@@ -1575,16 +1727,22 @@ with tab5:
         return {}
 
     def _ai_score_leads(signals: list, people: list, companies: list, focus: list) -> dict:
-        """Score every signal, company and person for CRS relevance, then recommend targets."""
+        """
+        Two-stage AI analysis:
+        Stage 1 — Parse each attack signal: extract victim org, attack type, CRS fit score,
+                   and the specific contact title CRS should reach out to.
+        Stage 2 — Rank companies and contacts, produce outreach strategy.
+        """
         nl = "\n"
 
-        # Safe field access — JSE has 'sector', Apollo orgs have 'industry'
         def _co_label(c):
-            sector = c.get("sector") or c.get("industry") or "unknown sector"
-            return f"- {c.get('name','?')} ({sector})"
+            sector = c.get("sector") or c.get("industry") or "?"
+            return f"- {c.get('name','?')} ({sector}, {c.get('country','')})"
 
-        signal_summary  = nl.join(
-            f"- [{s.get('source','?')}] {s.get('title','')[:120]}" for s in signals[:25]
+        # Build signal list with body text for richer extraction
+        signal_lines = nl.join(
+            f"[{i+1}] TITLE: {s.get('title','')[:150]}\n    BODY: {s.get('body','')[:200]}"
+            for i, s in enumerate(signals[:20])
         )
         company_summary = nl.join(_co_label(c) for c in companies[:30])
         people_summary  = nl.join(
@@ -1592,53 +1750,112 @@ with tab5:
             for p in people[:25]
         )
 
-        prompt = f"""You are a B2B sales strategist for Cyber Retaliator Solutions (CRS).
+        # ── STAGE 1 prompt: parse attack signals ──────────────────────────
+        stage1_prompt = f"""You are a cyber threat analyst and sales strategist for CRS (Cyber Retaliator Solutions).
 
-CRS PROFILE:
-{CRS_PROFILE}
+CRS sells: {", ".join(focus[:8])} and more. Full profile: {CRS_PROFILE[:400]}
 
-SOLUTION FOCUS: {", ".join(focus)}
+TASK: For each news/Reddit item below, extract:
+1. The VICTIM ORGANISATION (company/government body that was attacked) — if named
+2. The ATTACK TYPE (ransomware / data breach / phishing / DDoS / malware / unknown)
+3. CRS FIT SCORE 1-10: how relevant is this incident for CRS to approach the victim?
+   (10 = CRS has a direct solution for this exact attack type, victim is likely in market now)
+4. CONTACT TITLE: the specific job title at the victim org CRS should reach out to
+   (e.g. "CISO", "IT Director", "Head of Cybersecurity" — be specific to the attack type)
+5. OUTREACH ANGLE: one sentence — what CRS should say to get a meeting
 
-ALL DATA IS AFRICA-FOCUSED. Score every item 1-10 for CRS relevance where:
-10 = perfect fit (active buying signal + CRS can directly solve the need)
-7-9 = strong fit
-4-6 = moderate fit
-1-3 = weak/indirect fit
+ATTACK SIGNALS (Africa-focused):
+{signal_lines or "None found."}
 
-BUYING SIGNALS (Reddit + News — Africa):
-{signal_summary or "None found."}
+Return ONLY a JSON array — one object per signal, in the same order:
+[
+  {{
+    "index": 1,
+    "victim_org": "Company name or null if not identifiable",
+    "attack_type": "ransomware|data breach|phishing|DDoS|malware|unknown",
+    "crs_score": 1-10,
+    "contact_title": "specific job title to target",
+    "outreach_angle": "one sentence CRS pitch"
+  }}
+]
+Only return the JSON array.
+"""
+        try:
+            stage1_raw    = _call_ai(stage1_prompt)
+            parsed_signals = json.loads(stage1_raw)
+            if not isinstance(parsed_signals, list):
+                parsed_signals = []
+        except Exception:
+            parsed_signals = []
 
-COMPANIES IN SCOPE (JSE + Apollo orgs):
+        # Back-fill extracted fields onto original signal dicts
+        for item in parsed_signals:
+            idx = item.get("index", 0) - 1
+            if 0 <= idx < len(signals):
+                signals[idx]["victim_org"]    = item.get("victim_org") or ""
+                signals[idx]["attack_type"]   = item.get("attack_type") or ""
+                signals[idx]["crs_score"]     = item.get("crs_score")
+                signals[idx]["contact_title"] = item.get("contact_title") or ""
+                signals[idx]["outreach_angle"]= item.get("outreach_angle") or ""
+
+        # ── STAGE 2 prompt: company + contact strategy ────────────────────
+        # Build a concise attack summary for context
+        attack_summary = nl.join(
+            f"- {s.get('victim_org','unknown org')} | {s.get('attack_type','')} | Score {s.get('crs_score','?')}/10"
+            for s in sorted(signals, key=lambda x: x.get("crs_score") or 0, reverse=True)[:10]
+        )
+
+        stage2_prompt = f"""You are a B2B sales strategist for CRS (Cyber Retaliator Solutions).
+
+CRS PROFILE: {CRS_PROFILE[:600]}
+
+RECENT AFRICAN CYBER ATTACKS (with CRS fit scores):
+{attack_summary or "None found."}
+
+COMPANIES IN SCOPE (JSE + Apollo):
 {company_summary or "None."}
 
-DECISION-MAKERS (Apollo contacts + top people):
+DECISION-MAKERS (Apollo):
 {people_summary or "None found."}
 
-Return ONLY a valid JSON object with these exact keys:
+Return ONLY a valid JSON object:
 {{
-  "scored_signals": [
-    {{"title": "signal title (first 80 chars)", "crs_score": 1-10, "reason": "one sentence"}}
-  ],
   "scored_companies": [
-    {{"name": "company", "crs_score": 1-10, "why": "1-2 sentences", "outreach_angle": "one sentence", "urgency": "high/medium/low"}}
+    {{
+      "name": "company",
+      "crs_score": 1-10,
+      "why": "why CRS should target them now — link to attack signals where relevant",
+      "outreach_angle": "one specific sentence",
+      "urgency": "high/medium/low"
+    }}
   ],
   "scored_contacts": [
-    {{"name": "person", "title": "title", "company": "company", "crs_score": 1-10, "why_first": "one sentence", "linkedin": "url or null"}}
+    {{
+      "name": "person name",
+      "title": "job title",
+      "company": "company",
+      "crs_score": 1-10,
+      "why_first": "one sentence",
+      "linkedin": "url or null"
+    }}
   ],
-  "top_companies": ["name1", "name2", "name3", "name4", "name5"],
-  "top_contacts":  ["name1", "name2", "name3"],
-  "follow_up_actions": ["action 1", "action 2", "action 3"],
-  "overall_market_signal": "2-3 sentence summary of what the data tells CRS about the African market right now"
+  "top_companies": ["name1","name2","name3","name4","name5"],
+  "top_contacts":  ["name1","name2","name3"],
+  "follow_up_actions": ["action 1","action 2","action 3"],
+  "overall_market_signal": "2-3 sentences on what the African attack landscape tells CRS right now"
 }}
 """
-        raw = _call_ai(prompt)
-        result = json.loads(raw)
+        try:
+            stage2_raw = _call_ai(stage2_prompt)
+            result     = json.loads(stage2_raw)
+        except Exception as e:
+            result = {"scored_companies": [], "scored_contacts": [],
+                      "top_companies": [], "top_contacts": [],
+                      "follow_up_actions": [], "overall_market_signal": str(e)}
 
-        # Back-fill crs_score onto the original signal/people dicts for display
-        score_map_signals  = {s.get("title","")[:80]: s.get("crs_score") for s in result.get("scored_signals",[])}
-        score_map_contacts = {c.get("name",""):        c.get("crs_score") for c in result.get("scored_contacts",[])}
-        for s in signals:
-            s["crs_score"] = score_map_signals.get(s.get("title","")[:80])
+        # Back-fill contact scores onto people list
+        score_map_contacts = {c.get("name",""): c.get("crs_score")
+                              for c in result.get("scored_contacts",[])}
         for p in people:
             p["crs_score"] = score_map_contacts.get(p.get("name",""))
 
@@ -1650,11 +1867,9 @@ Return ONLY a valid JSON object with these exact keys:
     if run_leads:
         with st.spinner("🔍 Gathering signals from Reddit, news, Apollo, and JSE data…"):
 
-            # 1. Buying signals — Reddit + News (no credits)
-            reddit_signals = _search_reddit_signals(solution_focus)
-            news_signals   = _search_news(solution_focus, lead_countries)
-            all_signals    = reddit_signals + news_signals
-            st.toast(f"📡 {len(all_signals)} buying signals collected")
+            # 1. Cyber attack signals — Africa-focused (Reddit + NewsAPI)
+            all_signals = _search_attack_news(lead_countries)
+            st.toast(f"📡 {len(all_signals)} African cyber attack signals collected")
 
             # 2. Apollo CRM contacts (contacts/search — searches your existing CRM)
             apollo_contacts = _apollo_search_contacts(job_titles, lead_countries)
@@ -1716,7 +1931,7 @@ Return ONLY a valid JSON object with these exact keys:
 
         # ── Summary metrics ──────────────────────────────────────────────
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Buying Signals",    len(res.get("signals",[])))
+        m1.metric("Attack Signals",    len(res.get("signals",[])))
         m2.metric("Apollo CRM Contacts", len(res.get("apollo_contacts",[])))
         m3.metric("Apollo Orgs Found", len(res.get("apollo_orgs",[])))
         m4.metric("JSE Companies",     len(res.get("jse",[])))
@@ -1809,20 +2024,76 @@ Return ONLY a valid JSON object with these exact keys:
         st.divider()
 
         # ── Buying signals ───────────────────────────────────────────────
-        st.subheader(f"📡 Buying Signals — Africa ({len(res.get('signals',[]))})")
+        st.subheader(f"⚡ African Cyber Attack Signals ({len(res.get('signals',[]))})")
+        st.caption("Each signal = a company that was attacked and likely needs CRS solutions now.")
         if res.get("signals"):
             sig_df = pd.DataFrame(res["signals"])
-            show_sig_cols = [c for c in ["crs_score","source","title","published","url"]
-                             if c in sig_df.columns]
+            # Sort by CRS score desc
             if "crs_score" in sig_df.columns:
                 sig_df = sig_df.sort_values("crs_score", ascending=False, na_position="last")
-            sig_df = sig_df[show_sig_cols].rename(columns={
-                "crs_score":"CRS Score","source":"Source",
-                "title":"Title","published":"Date","url":"URL"
+
+            # Show attack-specific columns
+            attack_cols = ["crs_score","victim_org","attack_type","contact_title","published","title","url"]
+            show_cols = [c for c in attack_cols if c in sig_df.columns]
+            display_sig_df = sig_df[show_cols].rename(columns={
+                "crs_score":     "CRS Score",
+                "victim_org":    "Victim Org",
+                "attack_type":   "Attack Type",
+                "contact_title": "Contact to Find",
+                "published":     "Date",
+                "title":         "Headline",
+                "url":           "URL",
             })
-            st.dataframe(sig_df, use_container_width=True, hide_index=True)
+            st.dataframe(display_sig_df, use_container_width=True, hide_index=True)
+
+            # Expandable detail cards for high-score signals
+            high_signals = [s for s in res["signals"] if (s.get("crs_score") or 0) >= 7]
+            if high_signals:
+                st.write(f"**🔴 {len(high_signals)} high-priority attack signals — expand for outreach angles:**")
+                for s in high_signals:
+                    badge = "🟢" if (s.get("crs_score") or 0) >= 9 else "🟡"
+                    label = (
+                        f"{badge} **{s.get('victim_org') or 'Unknown org'}** — "
+                        f"{s.get('attack_type','').upper()}  |  Score {s.get('crs_score','?')}/10"
+                    )
+                    with st.expander(label):
+                        st.write(f"**Headline:** {s.get('title','')}")
+                        st.write(f"**Contact to find:** {s.get('contact_title','')}")
+                        if s.get("outreach_angle"):
+                            st.info(f"💬 {s['outreach_angle']}")
+                        if s.get("url"):
+                            st.markdown(f"[🔗 Source]({s['url']})")
+
+                        # Quick Apollo contact search button for this specific org
+                        btn_key = f"find_{s.get('victim_org','')[:20]}_{s.get('crs_score')}"
+                        if s.get("victim_org") and st.button(
+                            f"🔍 Find {s.get('contact_title','contact')} at {s.get('victim_org','')} in Apollo",
+                            key=btn_key
+                        ):
+                            with st.spinner("Searching Apollo contacts…"):
+                                found = _apollo_search_contacts(
+                                    [s.get("contact_title","CISO")],
+                                    lead_countries
+                                )
+                                # Filter to this org if possible
+                                org_name = s.get("victim_org","").lower()
+                                org_matches = [
+                                    p for p in found
+                                    if org_name and org_name[:10] in (p.get("company","")).lower()
+                                ] or found[:5]
+
+                            if org_matches:
+                                st.write(f"**Found {len(org_matches)} contact(s):**")
+                                for p in org_matches:
+                                    cols = st.columns([3,2,2])
+                                    cols[0].write(f"**{p.get('name','')}**")
+                                    cols[1].write(p.get("title",""))
+                                    if p.get("linkedin"):
+                                        cols[2].markdown(f"[LinkedIn]({p['linkedin']})")
+                            else:
+                                st.info("No contacts found in Apollo CRM for this org — try the full contact search above.")
         else:
-            st.info("No signals found — try broader focus terms or add a NewsAPI key.")
+            st.info("No attack signals found. Add a NewsAPI key in secrets for best results (newsapi.org — free).")
 
         st.divider()
 
