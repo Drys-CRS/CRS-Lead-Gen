@@ -97,6 +97,8 @@ def check_provider_health() -> dict:
         ("Cerebras",   _call_cerebras,   cerebras_ai),
         ("OpenRouter", _call_openrouter, openrouter_ai),
         ("GitHub",     _call_github,     github_ai),
+        ("NVIDIA",     _call_nvidia,     nvidia_ai),
+        ("DeepSeek",   _call_deepseek,   deepseek_ai),
         ("Gemini",     _call_gemini,     True),   # Gemini always has a key
     ]
 
@@ -771,11 +773,41 @@ def init_github_models():
     except Exception:
         return None
 
+@st.cache_resource
+def init_nvidia_nim():
+    try:
+        from openai import OpenAI
+        key = st.secrets.get("NVIDIA_API_KEY", "")
+        if not key:
+            return None
+        return OpenAI(
+            api_key=key,
+            base_url="https://integrate.api.nvidia.com/v1",
+        )
+    except Exception:
+        return None
+
+@st.cache_resource
+def init_deepseek():
+    try:
+        from openai import OpenAI
+        key = st.secrets.get("DEEPSEEK_API_KEY", "")
+        if not key:
+            return None
+        return OpenAI(
+            api_key=key,
+            base_url="https://api.deepseek.com",
+        )
+    except Exception:
+        return None
+
 ai            = init_gemini()
 groq_ai       = init_groq()
 cerebras_ai   = init_cerebras()
 openrouter_ai = init_openrouter()
 github_ai     = init_github_models()
+nvidia_ai     = init_nvidia_nim()
+deepseek_ai   = init_deepseek()
 
 # GitHub Models — best free models available (no card, uses your GitHub token)
 # GitHub Models — verified IDs June 2026 (case-sensitive on Azure endpoint)
@@ -803,10 +835,12 @@ _OPENROUTER_FREE_MODELS = [
 # ── Provider status shown in sidebar ──
 def _provider_status() -> str:
     parts = []
-    parts.append("🟢 Groq"       if groq_ai        else "⚪ Groq (no key)")
-    parts.append("🟢 Cerebras"   if cerebras_ai     else "⚪ Cerebras (no key)")
-    parts.append("🟢 OpenRouter" if openrouter_ai   else "⚪ OpenRouter (no key)")
-    parts.append("🟢 GitHub"     if github_ai       else "⚪ GitHub (no token)")
+    parts.append("🟢 Groq"        if groq_ai        else "⚪ Groq (no key)")
+    parts.append("🟢 Cerebras"    if cerebras_ai     else "⚪ Cerebras (no key)")
+    parts.append("🟢 OpenRouter"  if openrouter_ai   else "⚪ OpenRouter (no key)")
+    parts.append("🟢 GitHub"      if github_ai       else "⚪ GitHub (no token)")
+    parts.append("🟢 NVIDIA NIM"  if nvidia_ai       else "⚪ NVIDIA NIM (no key)")
+    parts.append("🟢 DeepSeek"    if deepseek_ai     else "⚪ DeepSeek (no key)")
     parts.append("🟢 Gemini")
     return " · ".join(parts)
 
@@ -951,6 +985,10 @@ def _call_ai(prompt: str) -> str:
         providers.append(("OpenRouter", _call_openrouter))
     if github_ai and _provider_budget_ok("GitHub"):
         providers.append(("GitHub", _call_github))
+    if nvidia_ai and _provider_budget_ok("NVIDIA"):
+        providers.append(("NVIDIA", _call_nvidia))
+    if deepseek_ai and _provider_budget_ok("DeepSeek"):
+        providers.append(("DeepSeek", _call_deepseek))
     if _provider_budget_ok("Gemini"):
         providers.append(("Gemini", _call_gemini))
     else:
@@ -1153,6 +1191,59 @@ def _safe_json(raw: str, expect_list: bool = True):
         return results[0] if results else {}
 
 
+def _call_nvidia(prompt: str) -> str:
+    """Call NVIDIA NIM — 100+ open-weight models, 40 RPM free tier.
+    Primary: meta/llama-3.3-70b-instruct
+    Fallback: mistralai/mistral-large-2411, nvidia/llama-3.3-nemotron-super-49b-v1
+    """
+    for model in [
+        "meta/llama-3.3-70b-instruct",
+        "mistralai/mistral-large-2411",
+        "nvidia/llama-3.3-nemotron-super-49b-v1",
+    ]:
+        try:
+            resp = nvidia_ai.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+                max_tokens=1500,
+            )
+            text = (resp.choices[0].message.content or "").strip()
+            if text:
+                return _clean(text)
+        except Exception as e:
+            err = str(e)
+            if any(x in err for x in ["404", "not found", "unknown", "unavailable"]):
+                continue
+            raise
+    raise RuntimeError("All NVIDIA NIM models failed")
+
+
+def _call_deepseek(prompt: str) -> str:
+    """Call DeepSeek API — 5M free tokens on signup, very low cost after.
+    deepseek-v4-flash: fast, cheap ($0.28/M input)
+    deepseek-v4-pro: frontier quality (~GPT-5 class)
+    Note: deepseek-chat/deepseek-reasoner deprecated 2026-07-24, use v4 names.
+    """
+    for model in ["deepseek-v4-flash", "deepseek-v4-pro"]:
+        try:
+            resp = deepseek_ai.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+                max_tokens=1500,
+            )
+            text = (resp.choices[0].message.content or "").strip()
+            if text:
+                return _clean(text)
+        except Exception as e:
+            err = str(e)
+            if any(x in err for x in ["404", "not found", "unknown", "insufficient"]):
+                continue
+            raise
+    raise RuntimeError("All DeepSeek models failed")
+
+
 def ai_discover_tenders(countries: list, focus: str) -> list:
     """Use Gemini + Google Search to discover private-sector and parastatal
     tenders/RFPs not covered by government portals. Returns a list of dicts."""
@@ -1202,8 +1293,10 @@ import datetime as _dt
 _AI_DAILY_LIMITS = {
     "Groq":       1000,   # 1 000 req/day on free tier
     "Cerebras":   500,    # conservative — token-based (~1M tokens/day)
-    "OpenRouter": 200,    # ~200 req/day on :free models (updated from search)
+    "OpenRouter": 200,    # ~200 req/day on :free models
     "GitHub":     150,    # 150 req/day on free GitHub Copilot tier
+    "NVIDIA":     200,    # ~40 RPM, ~1000 credits/day free tier
+    "DeepSeek":   500,    # 5M free tokens on signup, then very cheap
     "Gemini":     20,     # 20 req/day on 2.5 Flash free tier
 }
 # Minimum minutes between full AI operations (score-all, partner analysis, lead discovery)
@@ -3732,6 +3825,25 @@ with tab6:
             "to `Drys-CRS/CRS-Lead-Gen` on GitHub. "
             "Streamlit Cloud auto-deploys on commit."
         )
+
+    # ── New provider keys needed ──────────────────────────────────────────────
+    with st.expander("🔑 New Provider API Keys — add to Streamlit Secrets", expanded=False):
+        st.markdown("""
+Add these to your Streamlit Cloud secrets to enable the new AI providers:
+
+```toml
+# NVIDIA NIM — free 1000 credits on signup, 40 RPM, 100+ models
+# Sign up at: https://build.nvidia.com/settings/api-keys
+NVIDIA_API_KEY = "nvapi-..."
+
+# DeepSeek — 5M free tokens on signup, very cheap after ($0.28/M input)
+# Sign up at: https://platform.deepseek.com/api_keys
+DEEPSEEK_API_KEY = "sk-..."
+```
+
+**Cascade order after adding keys:**
+Groq → Cerebras → OpenRouter → GitHub → **NVIDIA** → **DeepSeek** → Gemini
+        """)
         gh_msg = st.text_input(
             "Commit message (optional)",
             placeholder="e.g. feat: add partner classification",
