@@ -1147,13 +1147,17 @@ def fetch_tenders():
         return pd.DataFrame()
 
 @st.cache_data(ttl=300)
+@st.cache_data(ttl=300)
 def fetch_awarded_tenders():
     """Fetch awarded tenders from the dedicated awarded_tenders table."""
     try:
         response = supabase.table("awarded_tenders").select("*").execute()
-        return pd.DataFrame(response.data)
-    except Exception as e:
-        # Fallback: try old sa_tenders if migration not yet run
+        df = pd.DataFrame(response.data)
+        if df.empty:
+            raise ValueError("awarded_tenders table is empty or missing")
+        return df
+    except Exception:
+        # Fallback: try old sa_tenders awarded rows if migration not yet run
         try:
             r2 = supabase.table("sa_tenders").select("*").eq("status", "Awarded").execute()
             return pd.DataFrame(r2.data)
@@ -1852,6 +1856,7 @@ with tab1:
         _can_score, _score_wait = _check_cooldown("score_all")
         _score_btn = st.button(
             "🤖 Score All with AI",
+            key="btn_score_all",
             help=f"Run AI fit scoring on all open tenders",
             disabled=not _can_score
         )
@@ -2010,6 +2015,7 @@ with tab2:
             _can_analyse, _analyse_wait = _check_cooldown("partner_analysis")
             run_analysis = st.button(
                 "🤖 Analyse Partners with AI",
+                key="btn_analyse_partners",
                 help="Gemini reviews all awarded tender winners and recommends partner candidates",
                 disabled=not _can_analyse
             )
@@ -2068,7 +2074,7 @@ with tab2:
             # Push partner recommendations to Monday Companies board
             if _MONDAY_AVAILABLE and "partner_analysis" in st.session_state:
                 partners = st.session_state["partner_analysis"]
-                if st.button("📋 Push Partners to Monday Companies Board",
+                if st.button("📋 Push Partners to Monday Companies Board", key="btn_push_partners",
                              key="mon_partners",
                              help="Add recommended companies as Resellers in Monday.com"):
                     pushed = 0
@@ -2111,7 +2117,7 @@ with tab3:
         placeholder="e.g. TENDER NUMBER: GT/GDARD/001/2025\nDepartment of Agriculture...\nClosing Date: 30 July 2025..."
     )
 
-    if st.button("🔍 Parse Tender", disabled=not raw_input.strip()):
+    if st.button("🔍 Parse Tender", key="btn_parse_tender", disabled=not raw_input.strip()):
         with st.spinner("Extracting structured fields…"):
             try:
                 parsed = ai_parse_tender(raw_input)
@@ -2155,7 +2161,7 @@ with tab3:
     # Save button — only show after a successful parse
     if "parsed_tender" in st.session_state:
         st.divider()
-        if st.button("💾 Save to Database"):
+        if st.button("💾 Save to Database", key="btn_save_parsed"):
             try:
                 record = st.session_state["parsed_tender"]
                 supabase.table("sa_tenders").upsert(record, on_conflict="tender_number").execute()
@@ -2197,7 +2203,7 @@ with tab4:
     _can_discover, _discover_wait = _check_cooldown("tender_discovery")
     if not _can_discover:
         st.caption(f"⏳ Tender discovery available in {_discover_wait} min")
-    if st.button("🔎 Discover Tenders", disabled=(not disc_countries or not _can_discover)):
+    if st.button("🔎 Discover Tenders", key="btn_discover_tenders", disabled=(not disc_countries or not _can_discover)):
         _record_op("tender_discovery")
         with st.spinner("Gemini is searching the web — this can take up to a minute…"):
             try:
@@ -2223,7 +2229,7 @@ with tab4:
 
         save_col1, save_col2 = st.columns(2)
         with save_col1:
-            if st.button("💾 Save All to Database"):
+            if st.button("💾 Save All to Database", key="btn_save_all_discovered"):
                 import hashlib
                 saved = 0
                 for t in st.session_state["discovered"]:
@@ -2253,7 +2259,7 @@ with tab4:
                 del st.session_state["discovered"]
                 st.cache_data.clear()
         with save_col2:
-            if st.button("🗑️ Discard Results"):
+            if st.button("🗑️ Discard Results", key="btn_discard_discovered"):
                 del st.session_state["discovered"]
                 st.rerun()
 
@@ -2318,7 +2324,7 @@ with tab5:
     if not _can_leads:
         st.caption(f"⏳ Lead discovery available in {_leads_wait} min (burns 2 AI calls)")
     run_leads = st.button(
-        "🎯 Find Leads", type="primary",
+        "🎯 Find Leads", key="btn_find_leads", type="primary",
         disabled=(not lead_countries or not _can_leads)
     )
     if run_leads:
@@ -2994,7 +3000,7 @@ Return ONLY a valid JSON object:
         push_col1, push_col2 = st.columns(2)
 
         with push_col1:
-            if st.button("📤 Push Top Companies to Apollo Accounts"):
+            if st.button("📤 Push Top Companies to Apollo Accounts", key="btn_apollo_companies"):
                 push_cos = top_cos[:10] if top_cos else res.get("apollo_orgs",[])[:10]
                 if push_cos:
                     with st.spinner("Creating accounts in Apollo…"):
@@ -3005,7 +3011,7 @@ Return ONLY a valid JSON object:
                     st.info("Run a lead search first to populate target companies.")
 
         with push_col2:
-            if st.button("📤 Push Priority Contacts to Apollo CRM"):
+            if st.button("📤 Push Priority Contacts to Apollo CRM", key="btn_apollo_contacts"):
                 push_people = top_contacts if top_contacts else all_people[:10]
                 if push_people:
                     saved = 0
@@ -3028,7 +3034,7 @@ Return ONLY a valid JSON object:
             push_col1, push_col2, push_col3 = st.columns(3)
 
             with push_col1:
-                if st.button("🚨 Push Attack Signals (≥7) to Monday"):
+                if st.button("🚨 Push Attack Signals (≥7) to Monday", key="btn_mon_attack"):
                     signals = res.get("signals", [])
                     high_sigs = [s for s in signals if (s.get("crs_score") or 0) >= 7
                                  and s.get("victim_org")]
@@ -3042,7 +3048,7 @@ Return ONLY a valid JSON object:
                     st.success(f"✅ {pushed} attack signal leads pushed")
 
             with push_col2:
-                if st.button("👤 Push Apollo Contacts to Monday"):
+                if st.button("👤 Push Apollo Contacts to Monday", key="btn_mon_contacts"):
                     contacts = all_people[:10]
                     pushed = 0
                     for p in contacts:
@@ -3054,7 +3060,7 @@ Return ONLY a valid JSON object:
                     st.success(f"✅ {pushed} contacts pushed")
 
             with push_col3:
-                if st.button("🏢 Push Target Companies (≥7) to Monday"):
+                if st.button("🏢 Push Target Companies (≥7) to Monday", key="btn_mon_companies"):
                     top_cos = ai_out.get("scored_companies", [])
                     pushed = 0
                     for co in [c for c in top_cos if (c.get("crs_score") or 0) >= 7]:
@@ -3107,7 +3113,7 @@ with tab6:
     st.subheader("🩺 Provider Health")
     col_h1, col_h2 = st.columns([1, 3])
     with col_h1:
-        if st.button("🔁 Re-check Now"):
+        if st.button("🔁 Re-check Now", key="btn_recheck_health"):
             with st.spinner("Pinging all providers…"):
                 st.session_state["provider_health"] = check_provider_health()
             st.rerun()
@@ -3230,7 +3236,7 @@ with tab6:
         st.subheader("🔍 Monday.com Column ID Discovery")
         st.caption("Use this to find the real column IDs for your boards before they're configured.")
         disc_board_id = st.text_input("Enter a Monday Board ID to inspect:", placeholder="1234567890")
-        if st.button("🔍 Discover Column IDs") and disc_board_id:
+        if st.button("🔍 Discover Column IDs", key="btn_discover_cols") and disc_board_id:
             try:
                 cols = _monday_legacy_discover_columns(disc_board_id)
                 st.write("**Column title → Column ID mapping:**")
