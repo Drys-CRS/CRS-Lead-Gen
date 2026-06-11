@@ -6,10 +6,319 @@ import re
 import google.generativeai as genai
 from supabase import create_client
 
+# ─────────────────────────────────────────────────────────────────────────────
+# AUTONOMOUS PIPELINE — Provider health checks, scheduled runner, keep-alive
+# ─────────────────────────────────────────────────────────────────────────────
+import threading as _threading
+import datetime as _sched_dt
+
+try:
+    from apscheduler.schedulers.background import BackgroundScheduler as _BGScheduler
+    from apscheduler.triggers.cron import CronTrigger as _CronTrigger
+    _APSCHEDULER_AVAILABLE = True
+except ImportError:
+    _APSCHEDULER_AVAILABLE = False
+
+try:
+    from streamlit_autorefresh import st_autorefresh
+    _AUTOREFRESH_AVAILABLE = True
+except ImportError:
+    _AUTOREFRESH_AVAILABLE = False
+
+# ── Provider health check ─────────────────────────────────────────────────────
+_HEALTH_PROBE = "Reply with the single word: ok"
+
+def check_provider_health() -> dict:
+    """Ping each provider with a minimal prompt. Returns {name: {available, latency_ms}}."""
+    import time as _t
+    results = {}
+
+    def _probe(name, fn):
+        t0 = _t.time()
+        try:
+            fn(_HEALTH_PROBE)
+            results[name] = {"available": True,  "latency_ms": int((_t.time()-t0)*1000), "error": None}
+        except Exception as e:
+            results[name] = {"available": False, "latency_ms": None, "error": str(e)[:200]}
+
+    probes = []
+    # Build probe list — use direct provider functions, not the cascade
+    # We access the provider clients lazily to avoid circular init issues
+    if "groq_ai" in dir() and groq_ai:
+        probes.append(("Groq",       _call_groq))
+    if "cerebras_ai" in dir() and cerebras_ai:
+        probes.append(("Cerebras",   _call_cerebras))
+    if "openrouter_ai" in dir() and openrouter_ai:
+        probes.append(("OpenRouter", _call_openrouter))
+    probes.append(("Gemini", _call_gemini))
+
+    threads = [_threading.Thread(target=_probe, args=(n, f)) for n, f in probes]
+    for th in threads: th.start()
+    for th in threads: th.join(timeout=15)
+
+    # Persist to Supabase
+    try:
+        rows = [
+            {"provider": k, "available": v["available"],
+             "latency_ms": v.get("latency_ms"), "error": v.get("error")}
+            for k, v in results.items()
+        ]
+        supabase.table("provider_health_log").insert(rows).execute()
+    except Exception:
+        pass
+
+    return results
+
+
+def _reset_daily_usage():
+    """Called at midnight — wipes session-state usage counters so limits reset."""
+    if "ai_usage" in st.session_state:
+        for k in st.session_state["ai_usage"]:
+            st.session_state["ai_usage"][k] = 0
+    st.session_state["ai_usage_date"] = _sched_dt.date.today().isoformat()
+    st.session_state["ai_last_ops"]   = {}
+
+
+# ── Autonomous pipeline job ────────────────────────────────────────────────────
+def _pipeline_log(msg: str):
+    """Silent logger — writes to Supabase pipeline_runs table if a run is active."""
+    run_id = st.session_state.get("_pipeline_run_id")
+    if run_id:
+        try:
+            supabase.table("pipeline_runs").update(
+                {"error_log": supabase.table("pipeline_runs")
+                 .select("error_log").eq("id", run_id).execute()
+                 .data[0].get("error_log","") + f"\n{msg}"}
+            ).eq("id", run_id).execute()
+        except Exception:
+            pass
+
+
+def run_pipeline(trigger: str = "scheduled"):
+    """
+    Full autonomous pipeline:
+    1. Scrape all countries
+    2. Score all new open tenders → append to tender_score_history
+    3. Run partner analysis → append to partner_recommendation_history
+    4. Collect attack signals + score → append to attack_signal_history
+    5. Mark pipeline_run as complete
+    """
+    import time as _pt
+    t_start = _pt.time()
+    log_lines = []
+    counters  = {"tenders_scraped": 0, "tenders_scored": 0,
+                 "signals_found": 0,   "partners_found": 0}
+
+    def out(msg):
+        log_lines.append(msg)
+
+    # Create pipeline run record
+    try:
+        run_row = supabase.table("pipeline_runs").insert(
+            {"trigger": trigger, "status": "running"}
+        ).execute()
+        run_id = run_row.data[0]["id"]
+        st.session_state["_pipeline_run_id"] = run_id
+    except Exception as e:
+        run_id = None
+        out(f"Could not create run record: {e}")
+
+    try:
+        # ── 1. Scrape ──────────────────────────────────────────────────────
+        out("Starting scrape…")
+        scrape_south_africa(out)
+        for country in OCDS_REGISTRY:
+            if country != "South Africa":
+                try:
+                    scrape_ocds_country(country, out)
+                except Exception as e:
+                    out(f"  ❌ {country}: {e}")
+        st.cache_data.clear()
+
+        # Reload fresh data
+        tenders_df = fetch_tenders()
+        if not tenders_df.empty:
+            counters["tenders_scraped"] = len(tenders_df)
+
+            # ── 2. Score open tenders ─────────────────────────────────────
+            out("Scoring open tenders…")
+            open_df = tenders_df[tenders_df["status"] == "Open"].copy()
+            for col in ["ai_score", "ai_rationale"]:
+                if col not in open_df.columns:
+                    open_df[col] = None
+            unscored = open_df[open_df["ai_score"].isna()]
+            score_rows = []
+            for _, row in unscored.iterrows():
+                try:
+                    scored = ai_score_tender(row.to_dict())
+                    supabase.table("sa_tenders").update({
+                        "ai_score": scored["score"],
+                        "ai_rationale": scored["rationale"],
+                    }).eq("tender_number", row["tender_number"]).execute()
+                    score_rows.append({
+                        "tender_number": str(row.get("tender_number", ""))[:100],
+                        "department":    str(row.get("department_name", ""))[:200],
+                        "title":         str(row.get("title", ""))[:200],
+                        "country":       str(row.get("country", "")),
+                        "closing_date":  str(row.get("closing_date", ""))[:10] or None,
+                        "ai_score":      scored["score"],
+                        "ai_rationale":  scored["rationale"],
+                        "status":        "Open",
+                    })
+                    counters["tenders_scored"] += 1
+                    _time.sleep(2)  # throttle
+                except Exception as e:
+                    out(f"  Scoring error {row.get('tender_number')}: {e}")
+            if score_rows:
+                try:
+                    supabase.table("tender_score_history").insert(score_rows).execute()
+                except Exception as e:
+                    out(f"  History insert error: {e}")
+
+            # ── 3. Partner analysis ───────────────────────────────────────
+            out("Running partner analysis…")
+            try:
+                awarded_df = tenders_df[tenders_df["status"] == "Awarded"].copy()
+                if not awarded_df.empty:
+                    partners = ai_analyse_partners(awarded_df)
+                    partner_rows = []
+                    for p in partners:
+                        partner_rows.append({
+                            "company":          str(p.get("company",""))[:200],
+                            "country":          str(p.get("country",""))[:100],
+                            "crs_score":        p.get("crs_score") or p.get("urgency_score"),
+                            "why":              str(p.get("why_aligned",""))[:500],
+                            "outreach_angle":   str(p.get("outreach_angle",""))[:500],
+                            "urgency":          str(p.get("urgency",""))[:20],
+                            "partnership_type": str(p.get("partnership_type",""))[:100],
+                        })
+                    if partner_rows:
+                        supabase.table("partner_recommendation_history").insert(partner_rows).execute()
+                        counters["partners_found"] = len(partner_rows)
+            except Exception as e:
+                out(f"  Partner analysis error: {e}")
+
+            # ── 4. Attack signals ─────────────────────────────────────────
+            out("Collecting attack signals…")
+            try:
+                signals = _search_attack_news(["South Africa","Kenya","Nigeria","Ghana"])
+                if signals:
+                    # AI-parse them
+                    nl = "\n"
+                    signal_lines = nl.join(
+                        f"[{i+1}] TITLE: {s.get('title','')[:150]}\n    BODY: {s.get('body','')[:200]}"
+                        for i, s in enumerate(signals[:20])
+                    )
+                    stage1_prompt = f"""For each item, extract victim_org, attack_type (ransomware|data breach|phishing|DDoS|malware|unknown), crs_score 1-10, contact_title, outreach_angle.
+CRS sells: cybersecurity solutions, IBM/RedHat/SUSE/CompTIA training, Vectra NDR/XDR, vulnerability management, SIEM, SOC services, penetration testing.
+Items:
+{signal_lines}
+Return JSON array only: [{{"index":1,"victim_org":"...","attack_type":"...","crs_score":N,"contact_title":"...","outreach_angle":"..."}}]"""
+                    try:
+                        raw   = _call_ai(stage1_prompt)
+                        parsed = json.loads(raw)
+                        for item in parsed:
+                            idx = item.get("index",0) - 1
+                            if 0 <= idx < len(signals):
+                                signals[idx].update({
+                                    "victim_org":    item.get("victim_org",""),
+                                    "attack_type":   item.get("attack_type",""),
+                                    "crs_score":     item.get("crs_score"),
+                                    "contact_title": item.get("contact_title",""),
+                                    "outreach_angle":item.get("outreach_angle",""),
+                                })
+                    except Exception:
+                        pass
+
+                    signal_rows = [{
+                        "source":         s.get("source",""),
+                        "title":          str(s.get("title",""))[:300],
+                        "victim_org":     str(s.get("victim_org",""))[:200],
+                        "attack_type":    str(s.get("attack_type",""))[:50],
+                        "crs_score":      s.get("crs_score"),
+                        "contact_title":  str(s.get("contact_title",""))[:100],
+                        "outreach_angle": str(s.get("outreach_angle",""))[:500],
+                        "url":            str(s.get("url",""))[:500],
+                        "published":      str(s.get("published",""))[:20],
+                        "country_context":"Africa",
+                    } for s in signals]
+                    supabase.table("attack_signal_history").insert(signal_rows).execute()
+                    counters["signals_found"] = len(signal_rows)
+            except Exception as e:
+                out(f"  Signal collection error: {e}")
+
+    except Exception as e:
+        out(f"Pipeline failed: {e}")
+        if run_id:
+            supabase.table("pipeline_runs").update(
+                {"status": "failed", "error_log": "\n".join(log_lines),
+                 "duration_secs": int(_pt.time() - t_start)}
+            ).eq("id", run_id).execute()
+        return
+
+    # ── Mark complete ──────────────────────────────────────────────────────────
+    if run_id:
+        try:
+            supabase.table("pipeline_runs").update({
+                "status":           "complete",
+                "tenders_scraped":  counters["tenders_scraped"],
+                "tenders_scored":   counters["tenders_scored"],
+                "signals_found":    counters["signals_found"],
+                "partners_found":   counters["partners_found"],
+                "error_log":        "\n".join(log_lines[-20:]),
+                "duration_secs":    int(_pt.time() - t_start),
+            }).eq("id", run_id).execute()
+        except Exception:
+            pass
+
+    st.session_state.pop("_pipeline_run_id", None)
+    _reset_daily_usage()
+    out(f"Pipeline complete in {int(_pt.time()-t_start)}s")
+
+
+# ── APScheduler setup (runs once per Streamlit process) ───────────────────────
+_SCHEDULER_KEY = "_crs_scheduler_started"
+
+def _ensure_scheduler():
+    """Start the background scheduler if not already running in this process."""
+    if not _APSCHEDULER_AVAILABLE:
+        return
+    if st.session_state.get(_SCHEDULER_KEY):
+        return
+    try:
+        scheduler = _BGScheduler(timezone="Africa/Johannesburg")
+        # Daily pipeline at 02:00 SAST (off-peak, after midnight credit reset)
+        scheduler.add_job(
+            lambda: run_pipeline("scheduled"),
+            _CronTrigger(hour=2, minute=0),
+            id="daily_pipeline",
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
+        # Daily usage reset at 00:01 SAST
+        scheduler.add_job(
+            _reset_daily_usage,
+            _CronTrigger(hour=0, minute=1),
+            id="daily_reset",
+            replace_existing=True,
+        )
+        scheduler.start()
+        st.session_state[_SCHEDULER_KEY] = True
+    except Exception as e:
+        st.session_state[_SCHEDULER_KEY] = f"failed: {e}"
+
+
 # ─────────────────────────────────────────────
 # 1. PAGE CONFIG
 # ─────────────────────────────────────────────
 st.set_page_config(page_title="CRS Competitive Intelligence", layout="wide")
+
+# ── Keep-alive: reload every 3 hours (10 800 000 ms) ──────────────────────────
+if _AUTOREFRESH_AVAILABLE:
+    st_autorefresh(interval=10_800_000, key="keepalive")
+
+# ── Start background scheduler (once per process) ─────────────────────────────
+_ensure_scheduler()
 
 # ─────────────────────────────────────────────
 # 2. CRS COMPANY PROFILE
@@ -1041,6 +1350,18 @@ if st.sidebar.button("🔄 Refresh All Countries"):
     st.cache_data.clear()
     st.rerun()
 
+if st.sidebar.button("🚀 Run Full Pipeline Now"):
+    with st.spinner("Running full pipeline…"):
+        run_pipeline("manual")
+    st.cache_data.clear()
+    st.success("Pipeline complete!")
+    st.rerun()
+
+if st.sidebar.button("🩺 Check Provider Health"):
+    with st.spinner("Pinging providers…"):
+        health = check_provider_health()
+    st.session_state["provider_health"] = health
+
 # Load data first so sidebar filters can use it
 tenders_df = fetch_tenders()
 
@@ -1083,12 +1404,13 @@ if selected_countries and "country" in df_filtered.columns:
     df_filtered = df_filtered[df_filtered["country"].isin(selected_countries)]
 
 # ─────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "📢 Open Opportunities",
     "🏆 Competitive Intelligence",
     "🤖 AI Tender Parser",
     "🔎 AI Discovery (Private Sector)",
-    "🎯 Lead Intelligence"
+    "🎯 Lead Intelligence",
+    "⚙️ Pipeline & Health"
 ])
 
 # ══════════════════════════════════════════════
@@ -2218,3 +2540,153 @@ Return ONLY a valid JSON object:
                 "⬇️ Export All Contacts as CSV",
                 data=csv, file_name="crs_leads.csv", mime="text/csv"
             )
+
+# ══════════════════════════════════════════════
+# TAB 6 — PIPELINE & HEALTH
+# ══════════════════════════════════════════════
+with tab6:
+    st.subheader("⚙️ Pipeline & Health")
+
+    # ── Scheduler status ──────────────────────────────────────────────────────
+    sched_status = st.session_state.get(_SCHEDULER_KEY)
+    if not _APSCHEDULER_AVAILABLE:
+        st.warning("APScheduler not installed — add `apscheduler` to requirements.txt to enable scheduled runs.")
+    elif sched_status is True:
+        st.success("✅ Scheduler running — daily pipeline fires at 02:00 SAST, usage resets at 00:01 SAST.")
+    elif sched_status and str(sched_status).startswith("failed"):
+        st.error(f"❌ Scheduler failed to start: {sched_status}")
+    else:
+        st.info("⏳ Scheduler not yet started — will start on next page load.")
+
+    ka_status = "✅ Active" if _AUTOREFRESH_AVAILABLE else "⚠️ Not installed (add `streamlit-autorefresh`)"
+    st.info(f"🔄 Keep-alive (3-hour reload): {ka_status}")
+
+    st.divider()
+
+    # ── Provider health ───────────────────────────────────────────────────────
+    st.subheader("🩺 Provider Health")
+    col_h1, col_h2 = st.columns([1, 3])
+    with col_h1:
+        if st.button("🔁 Re-check Now"):
+            with st.spinner("Pinging all providers…"):
+                st.session_state["provider_health"] = check_provider_health()
+            st.rerun()
+
+    health = st.session_state.get("provider_health", {})
+    if health:
+        h_cols = st.columns(len(health))
+        for i, (name, info) in enumerate(health.items()):
+            with h_cols[i]:
+                if info["available"]:
+                    st.metric(name, "✅ Online", f"{info.get('latency_ms','?')} ms")
+                else:
+                    st.metric(name, "❌ Offline", info.get("error","")[:40])
+    else:
+        st.caption("Click 'Check Provider Health' in the sidebar or 'Re-check Now' above.")
+
+    # Recent health log from Supabase
+    try:
+        health_log = supabase.table("provider_health_log")             .select("*").order("checked_at", desc=True).limit(20).execute()
+        if health_log.data:
+            hl_df = pd.DataFrame(health_log.data)[
+                ["checked_at","provider","available","latency_ms","error"]
+            ]
+            hl_df["checked_at"] = pd.to_datetime(hl_df["checked_at"]).dt.strftime("%Y-%m-%d %H:%M")
+            st.dataframe(hl_df, use_container_width=True, hide_index=True)
+    except Exception:
+        pass
+
+    st.divider()
+
+    # ── Pipeline run history ──────────────────────────────────────────────────
+    st.subheader("📋 Pipeline Run History")
+    try:
+        runs = supabase.table("pipeline_runs")             .select("*").order("run_at", desc=True).limit(10).execute()
+        if runs.data:
+            runs_df = pd.DataFrame(runs.data)[[
+                "run_at","trigger","status","tenders_scraped",
+                "tenders_scored","signals_found","partners_found","duration_secs"
+            ]]
+            runs_df["run_at"] = pd.to_datetime(runs_df["run_at"]).dt.strftime("%Y-%m-%d %H:%M")
+            st.dataframe(runs_df, use_container_width=True, hide_index=True)
+
+            # Show error log for last failed run
+            failed = [r for r in runs.data if r.get("status") == "failed"]
+            if failed:
+                with st.expander(f"❌ Last failed run — {failed[0].get('run_at','')}"):
+                    st.code(failed[0].get("error_log","no log"))
+        else:
+            st.info("No pipeline runs yet. Click 'Run Full Pipeline Now' in the sidebar to start.")
+    except Exception as e:
+        st.warning(f"Could not load run history: {e}")
+
+    st.divider()
+
+    # ── History tables ────────────────────────────────────────────────────────
+    st.subheader("📊 Historical Data")
+    hist_tabs = st.tabs(["Scored Tenders", "Attack Signals", "Partner Recommendations"])
+
+    with hist_tabs[0]:
+        try:
+            rows = supabase.table("tender_score_history")                 .select("*").order("run_at", desc=True).limit(100).execute()
+            if rows.data:
+                df = pd.DataFrame(rows.data)
+                df["run_at"] = pd.to_datetime(df["run_at"]).dt.strftime("%Y-%m-%d")
+                show = [c for c in ["run_at","ai_score","country","title","department","closing_date"]
+                        if c in df.columns]
+                df = df[show].sort_values("ai_score", ascending=False, na_position="last")
+                st.caption(f"{len(df)} scored tender records")
+                st.dataframe(df, use_container_width=True, hide_index=True)
+            else:
+                st.info("No scored tender history yet.")
+        except Exception as e:
+            st.warning(f"Could not load: {e}")
+
+    with hist_tabs[1]:
+        try:
+            rows = supabase.table("attack_signal_history")                 .select("*").order("run_at", desc=True).limit(200).execute()
+            if rows.data:
+                df = pd.DataFrame(rows.data)
+                df["run_at"] = pd.to_datetime(df["run_at"]).dt.strftime("%Y-%m-%d")
+                show = [c for c in ["run_at","crs_score","victim_org","attack_type",
+                                     "contact_title","title","published"]
+                        if c in df.columns]
+                df = df[show].sort_values("crs_score", ascending=False, na_position="last")
+                st.caption(f"{len(df)} attack signal records")
+                st.dataframe(df, use_container_width=True, hide_index=True)
+            else:
+                st.info("No attack signal history yet.")
+        except Exception as e:
+            st.warning(f"Could not load: {e}")
+
+    with hist_tabs[2]:
+        try:
+            rows = supabase.table("partner_recommendation_history")                 .select("*").order("run_at", desc=True).limit(100).execute()
+            if rows.data:
+                df = pd.DataFrame(rows.data)
+                df["run_at"] = pd.to_datetime(df["run_at"]).dt.strftime("%Y-%m-%d")
+                show = [c for c in ["run_at","urgency","company","country",
+                                     "partnership_type","outreach_angle"]
+                        if c in df.columns]
+                st.caption(f"{len(df)} partner recommendation records")
+                st.dataframe(df[show], use_container_width=True, hide_index=True)
+            else:
+                st.info("No partner recommendations yet.")
+        except Exception as e:
+            st.warning(f"Could not load: {e}")
+
+    st.divider()
+
+    # ── Manual pipeline trigger with progress ─────────────────────────────────
+    st.subheader("🚀 Manual Pipeline Run")
+    st.caption("Runs the full pipeline immediately: scrape → score → partner analysis → attack signals.")
+    if st.button("▶️ Run Pipeline Now", key="pipeline_manual_tab"):
+        log_container = st.empty()
+        log_lines_tab = []
+        def _tab_out(msg):
+            log_lines_tab.append(msg)
+            log_container.markdown("\n\n".join(log_lines_tab[-20:]))
+        with st.spinner("Pipeline running…"):
+            run_pipeline("manual")
+        st.cache_data.clear()
+        st.success("Done! Refresh the other tabs to see updated data.")
