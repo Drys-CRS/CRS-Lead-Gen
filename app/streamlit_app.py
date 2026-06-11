@@ -748,7 +748,20 @@ def init_openrouter():
 def init_github_models():
     try:
         from openai import OpenAI
-        key = st.secrets.get("GITHUB_TOKEN")
+        # Try direct bracket access first (handles all TOML layouts),
+        # then .get() fallback, then GH_PAT alias
+        key = ""
+        for k in ("GITHUB_TOKEN", "GH_PAT", "github_token"):
+            try:
+                v = st.secrets[k]
+                if v:
+                    key = str(v).strip()
+                    break
+            except Exception:
+                pass
+        if not key:
+            key = (st.secrets.get("GITHUB_TOKEN") or
+                   st.secrets.get("GH_PAT") or "").strip()
         if not key:
             return None
         return OpenAI(
@@ -813,8 +826,12 @@ def _call_groq(prompt: str) -> str:
     return _clean(resp.choices[0].message.content)
 
 def _call_cerebras(prompt: str) -> str:
-    """Call Cerebras — current free-tier models as of June 2026."""
-    for model in ["llama-3.3-70b", "llama3.1-8b", "qwen3-32b"]:
+    """Call Cerebras. Current public models per inference-docs.cerebras.ai June 2026:
+      gpt-oss-120b  (production, reasoning model)
+      zai-glm-4.7   (preview, high quality)
+    All Llama/Qwen models removed from public endpoints as of May 2026.
+    """
+    for model in ["gpt-oss-120b", "zai-glm-4.7"]:
         try:
             resp = cerebras_ai.chat.completions.create(
                 model=model,
@@ -823,14 +840,17 @@ def _call_cerebras(prompt: str) -> str:
                 max_tokens=1500,
             )
             msg  = resp.choices[0].message
-            text = msg.content or getattr(msg, "reasoning_content", None) or ""
+            text = (getattr(msg, "content", None) or
+                    getattr(msg, "reasoning_content", None) or "").strip()
             if text:
                 return _clean(text)
         except Exception as e:
-            if "404" in str(e) or "does not exist" in str(e):
-                continue   # model unavailable — try next
-            raise          # real error — propagate
-    raise ValueError("Both Cerebras models returned empty content or are unavailable.")
+            err = str(e)
+            if any(x in err for x in ["404", "does not exist", "not found",
+                                        "deprecated", "unavailable"]):
+                continue
+            raise
+    raise ValueError("All Cerebras models unavailable — check inference-docs.cerebras.ai")
 
 def _call_github(prompt: str) -> str:
     """Call GitHub Models — free with any GitHub account, OpenAI-compatible."""
@@ -1561,8 +1581,18 @@ _GH_FILES = {
 }
 
 def _gh_headers() -> dict:
-    token = (st.secrets.get("GITHUB_TOKEN") or
-             st.secrets.get("GH_PAT") or "").strip()
+    token = ""
+    for k in ("GITHUB_TOKEN", "GH_PAT", "github_token"):
+        try:
+            v = st.secrets[k]
+            if v:
+                token = str(v).strip()
+                break
+        except Exception:
+            pass
+    if not token:
+        token = (st.secrets.get("GITHUB_TOKEN") or
+                 st.secrets.get("GH_PAT") or "").strip()
     if not token:
         raise ValueError("No GitHub token found. Add GITHUB_TOKEN to Streamlit secrets.")
     return {
