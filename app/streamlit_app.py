@@ -136,14 +136,24 @@ def _call_groq(prompt: str) -> str:
     return _clean(resp.choices[0].message.content)
 
 def _call_cerebras(prompt: str) -> str:
-    """Call Cerebras (gpt-oss-120b). Raises on any error."""
-    resp = cerebras_ai.chat.completions.create(
-        model="gpt-oss-120b",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.2,
-        max_tokens=1500,
-    )
-    return _clean(resp.choices[0].message.content)
+    """Call Cerebras — tries gpt-oss-120b first, falls back to zai-glm-4.7."""
+    for model in ["gpt-oss-120b", "zai-glm-4.7"]:
+        try:
+            resp = cerebras_ai.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+                max_tokens=1500,
+            )
+            msg  = resp.choices[0].message
+            text = msg.content or getattr(msg, "reasoning_content", None) or ""
+            if text:
+                return _clean(text)
+        except Exception as e:
+            if "404" in str(e) or "does not exist" in str(e):
+                continue   # model unavailable — try next
+            raise          # real error — propagate
+    raise ValueError("Both Cerebras models returned empty content or are unavailable.")
 
 def _call_gemini(prompt: str, retries: int = 3) -> str:
     """Call Gemini with backoff. Raises after all retries."""
