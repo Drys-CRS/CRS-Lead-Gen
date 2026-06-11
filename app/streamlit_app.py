@@ -136,9 +136,9 @@ def _call_groq(prompt: str) -> str:
     return _clean(resp.choices[0].message.content)
 
 def _call_cerebras(prompt: str) -> str:
-    """Call Cerebras (llama3.1-70b). Raises on any error."""
+    """Call Cerebras (llama-3.3-70b). Raises on any error."""
     resp = cerebras_ai.chat.completions.create(
-        model="llama3.1-70b",
+        model="llama-3.3-70b",
         messages=[{"role": "user", "content": prompt}],
         temperature=0.2,
         max_tokens=1500,
