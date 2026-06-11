@@ -1450,49 +1450,84 @@ TENDER TEXT:
 
 
 def ai_score_tender(tender: dict) -> dict:
-    """Score a tender 1-10 for fit against CRS profile. Returns {score, rationale}."""
-    prompt = f"""You are a bid/no-bid analyst for a South African technology and security company.
+    """Score a tender 1-10 as a CRS partner opportunity.
+    
+    Logic: CRS does NOT respond to tenders directly. Instead, CRS identifies
+    in-country partners (SIs, MSPs, VARs, Training Providers) who can respond
+    to the tender and who CRS should approach to supply the relevant products/services.
+    
+    Returns {score, rationale, partner_type, proposed_solutions, outreach_angle}.
+    """
+    country = tender.get("country", "South Africa")
+    title   = tender.get("title", "N/A")
+    dept    = tender.get("department_name", "N/A")
+    desc    = tender.get("description", "N/A")
+    value   = tender.get("award_value", "Unknown")
+    closing = tender.get("closing_date", "N/A")
+    compliance = tender.get("compliance_requirements", "N/A")
 
-COMPANY PROFILE:
-{CRS_PROFILE}
+    prompt = (
+        "You are a channel-partner strategist for Cyber Retaliator Solutions (CRS), "
+        "a South African cyber security distributor and training partner.\n\n"
+        "IMPORTANT: CRS does NOT respond to tenders directly. "
+        "CRS sells through in-country channel partners "
+        "(System Integrators, MSPs, VARs, Training Providers, Consultancies). "
+        "Your job is to score this tender as a PARTNER OPPORTUNITY — "
+        "i.e. how urgently should CRS find and activate a local partner to respond to this tender "
+        "on behalf of CRS's vendor portfolio?\n\n"
+        "CRS VENDOR PORTFOLIO (solutions to propose through partners):\n"
+        "VECTRA (NDR/XDR/ITDR), vRx (vuln/patch mgmt), Strobes (CTEM/PTaaS/ASM), "
+        "Aikido (AppSec/DevSecOps), Flare (dark web/threat intel), "
+        "BeachheadSecure (encryption/MFA/POPIA), SMBsecure (SMB all-in-one), "
+        "Telivy (MSSP audit), BlueFlag (SDLC security), Standss/SendGuard (email GRC), "
+        "CRE/GoldPhish/Prventi (cyber awareness/SAT), VAPT (pentest services), "
+        "IBM/RedHat/SUSE/CompTIA/Agile SAFe training.\n\n"
+        f"TENDER:\n"
+        f"Country: {country}\n"
+        f"Title: {title}\n"
+        f"Department: {dept}\n"
+        f"Description: {desc}\n"
+        f"Compliance: {compliance}\n"
+        f"Closing Date: {closing}\n"
+        f"Value: {value}\n\n"
+        "SCORING GUIDE (partner opportunity score 1-10):\n"
+        "9-10 = High-value ICT/security tender — CRS must urgently find/activate a local partner\n"
+        "7-8  = Good fit — worth proactively contacting existing in-country partners\n"
+        "5-6  = Partial fit — one or two CRS solutions relevant, lower priority\n"
+        "3-4  = Weak fit — mostly non-ICT but has a technology component\n"
+        "1-2  = Not relevant — construction, catering, vehicles, stationery, etc.\n\n"
+        "PARTNER TYPE DEFINITIONS:\n"
+        "System Integrator: large ICT integration and implementation projects\n"
+        "MSP: managed services, SOC, monitoring, helpdesk contracts\n"
+        "VAR: supply and install of hardware/software\n"
+        "Training Provider: training, skills development, learnerships\n"
+        "Consulting/Advisory: assessments, audits, strategy, GRC\n\n"
+        "Return ONLY a valid JSON object, no markdown, no extra text:\n"
+        '{"score":<1-10>,'
+        '"rationale":"2-3 sentences: why this is a partner opportunity, which CRS solutions fit, urgency",'
+        '"partner_type":"System Integrator|MSP|VAR|Training Provider|Consulting/Advisory",'
+        '"proposed_solutions":["sol1","sol2"],'
+        '"outreach_angle":"one sentence — what CRS should say to a local partner to get them to respond"}'
+    )
 
-TENDER:
-Title: {tender.get('title', 'N/A')}
-Department: {tender.get('department_name', 'N/A')}
-Description: {tender.get('description', 'N/A')}
-Compliance Requirements: {tender.get('compliance_requirements', 'N/A')}
-Closing Date: {tender.get('closing_date', 'N/A')}
-Value: {tender.get('award_value', 'Unknown')}
-
-Score this tender on fit for the company on a scale of 1–10, where:
-- 10 = Perfect match, must bid
-- 7–9 = Strong fit, worth serious consideration
-- 4–6 = Partial fit, marginal opportunity
-- 1–3 = Poor fit, likely not worth pursuing
-
-LEAD TYPE DEFINITIONS for scored_companies:
-- System Integrator (SI): builds/integrates complex ICT environments
-- MSP: runs managed IT/security services for clients  
-- VAR: resells and installs technology with support
-- End-user: organisation that buys and uses technology internally
-- Training Provider: delivers IT/cyber training and certifications
-- Consulting/Advisory: strategy, assessments, audits
-
-PROPOSED SOLUTIONS must come from CRS portfolio only:
-VECTRA, vRx, Strobes, Aikido, Flare, BeachheadSecure, SMBsecure, Telivy,
-BlueFlag, SendGuard, CRE/GoldPhish/Prventi, VAPT,
-IBM Training, RedHat Training, SUSE Training, CompTIA, Agile SAFe Training.
-
-Return ONLY a valid JSON object:
-{{
-  "score": <integer 1-10>,
-  "rationale": "<2-3 sentence explanation covering fit, risks, and recommendation>"
-}}
-
-No text outside the JSON.
-"""
     raw = _call_ai(prompt)
-    return json.loads(raw)
+    try:
+        result = _safe_json(raw, expect_list=False)
+        if not isinstance(result, dict):
+            result = {}
+    except Exception:
+        result = {}
+
+    # Normalise — ensure score is always present
+    if "score" not in result:
+        # Try to extract score from raw text as fallback
+        import re as _re
+        m = _re.search(r'"score"[\s]*:[\s]*(\d+)', raw)
+        result["score"] = int(m.group(1)) if m else 5
+    if "rationale" not in result:
+        result["rationale"] = raw[:300] if raw else "No rationale returned."
+
+    return result
 
 
 # Seconds between scoring calls — Groq allows 30 RPM so 2s is safe; Gemini-only needs 13s
@@ -1529,14 +1564,21 @@ def ai_match_tenders(open_df: pd.DataFrame) -> pd.DataFrame:
 
         try:
             scored = ai_score_tender(row.to_dict())
+            import json as _bj
+            _rat_json = _bj.dumps({
+                "rationale":          scored.get("rationale", ""),
+                "partner_type":       scored.get("partner_type", ""),
+                "proposed_solutions": scored.get("proposed_solutions", []),
+                "outreach_angle":     scored.get("outreach_angle", ""),
+            })
             results.append({
                 "tender_number": row["tender_number"],
-                "ai_score": scored["score"],
-                "ai_rationale": scored["rationale"],
+                "ai_score":      scored["score"],
+                "ai_rationale":  _rat_json,
             })
             supabase.table("sa_tenders").update({
-                "ai_score": scored["score"],
-                "ai_rationale": scored["rationale"],
+                "ai_score":    scored["score"],
+                "ai_rationale": _rat_json,
             }).eq("tender_number", row["tender_number"]).execute()
         except Exception as e:
             results.append({
@@ -1610,9 +1652,21 @@ def format_tender_card(t) -> str:
     if t.get('contact_phone'):
         lines.append(f"Contact Phone: {t.get('contact_phone')}")
     if t.get('ai_score'):
-        lines.append(f"AI Fit Score: {t.get('ai_score')}/10")
+        lines.append(f"Partner Opportunity Score: {t.get('ai_score')}/10")
     if t.get('ai_rationale'):
-        lines.append(f"AI Rationale: {t.get('ai_rationale')}")
+        _rat_raw = t.get('ai_rationale', '')
+        try:
+            import json as _fj
+            _rp = _fj.loads(_rat_raw) if str(_rat_raw).strip().startswith("{") else {}
+        except Exception:
+            _rp = {}
+        if _rp:
+            if _rp.get('partner_type'):       lines.append(f"Partner Type: {_rp['partner_type']}")
+            if _rp.get('proposed_solutions'): lines.append(f"Proposed Solutions: {', '.join(_rp['proposed_solutions'])}")
+            if _rp.get('rationale'):          lines.append(f"Rationale: {_rp['rationale']}")
+            if _rp.get('outreach_angle'):     lines.append(f"Outreach Angle: {_rp['outreach_angle']}")
+        else:
+            lines.append(f"Analysis: {_rat_raw}")
     if t.get('portal_link'):
         lines.append(f"Portal Link: {t.get('portal_link')}")
     return "\n".join(lines)
@@ -2447,9 +2501,9 @@ with tab1:
     if "ai_score" in open_df.columns and open_df["ai_score"].notna().any():
         open_df = open_df.sort_values("ai_score", ascending=False, na_position="last")
 
-    # Build display frame — Fit Score column is always shown (⚪ — when unscored)
-    open_df["Fit Score"] = open_df["ai_score"].apply(score_badge)
-    display_cols = ["Fit Score", "country", "tender_number", "department_name", "title", "closing_date"]
+    # Build display frame — Partner Score column is always shown (⚪ — when unscored)
+    open_df["Partner Score"] = open_df["ai_score"].apply(score_badge)
+    display_cols = ["Partner Score", "country", "tender_number", "department_name", "title", "closing_date"]
 
     event = st.dataframe(
         open_df[display_cols],
@@ -2484,7 +2538,7 @@ with tab1:
                     st.subheader(f"📄 {t.get('tender_number','N/A')} — {t.get('title', '')}")
                 with score_col:
                     if pd.notna(t.get("ai_score")):
-                        st.metric("AI Fit Score", score_badge(t["ai_score"]))
+                        st.metric("Partner Opportunity", score_badge(t["ai_score"]))
 
                 _cp_col, _ = st.columns([1, 5])
                 with _cp_col:
@@ -2511,11 +2565,27 @@ with tab1:
 
                 # AI rationale
                 if pd.notna(t.get("ai_rationale")):
-                    with st.expander("🤖 AI Analysis", expanded=True):
-                        st.info(t["ai_rationale"])
+                    with st.expander("🤖 Partner Opportunity Analysis", expanded=True):
+                        _rat_raw = str(t.get("ai_rationale", ""))
+                        try:
+                            import json as _dj
+                            _rp = _dj.loads(_rat_raw) if _rat_raw.strip().startswith("{") else {}
+                        except Exception:
+                            _rp = {}
+                        if _rp:
+                            if _rp.get("partner_type"):
+                                st.write(f"**🏢 Partner Type to Activate:** {_rp['partner_type']}")
+                            if _rp.get("proposed_solutions"):
+                                st.write(f"**💡 CRS Solutions to Propose:** {' · '.join(_rp['proposed_solutions'])}")
+                            if _rp.get("rationale"):
+                                st.info(f"**Why this is a partner opportunity:** {_rp['rationale']}")
+                            if _rp.get("outreach_angle"):
+                                st.success(f"**💬 Outreach angle to partner:** {_rp['outreach_angle']}")
+                        else:
+                            st.info(_rat_raw)
                 else:
-                    if st.button("🤖 Score This Tender", key=f"score_{_tn}"):
-                        with st.spinner("Scoring…"):
+                    if st.button("🤖 Analyse Partner Opportunity", key=f"score_{_tn}"):
+                        with st.spinner("Analysing partner opportunity…"):
                             try:
                                 result = ai_score_tender(t.to_dict())
                                 supabase.table("sa_tenders").update({
@@ -2804,7 +2874,7 @@ with tab3:
 
                 st.divider()
                 st.subheader("AI Fit Assessment")
-                st.metric("Fit Score", score_badge(scored["score"]))
+                st.metric("Partner Score", score_badge(scored["score"]))
                 st.info(scored["rationale"])
 
             except json.JSONDecodeError:
