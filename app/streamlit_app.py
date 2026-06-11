@@ -778,11 +778,13 @@ openrouter_ai = init_openrouter()
 github_ai     = init_github_models()
 
 # GitHub Models — best free models available (no card, uses your GitHub token)
+# GitHub Models — verified IDs June 2026 (case-sensitive on Azure endpoint)
+# Source: github.com/marketplace/models + GitHub changelog 2025-06-26
 _GITHUB_FREE_MODELS = [
-    "meta-llama-3.3-70b-instruct",   # strong reasoning, matches Groq quality
-    "gpt-4o-mini",                    # reliable fallback
-    "mistral-large-2407",             # strong structured output
-    "Phi-4",                          # fast, good for scoring
+    "Llama-3.3-70B-Instruct",   # Meta Llama 3.3 70B — primary
+    "gpt-4o-mini",               # OpenAI GPT-4o Mini — reliable fallback
+    "Mistral-Large-2411",        # Mistral Large — strong structured output
+    "Phi-4",                     # Microsoft Phi-4 — fast, good for scoring
 ]
 
 # OpenRouter model strategy:
