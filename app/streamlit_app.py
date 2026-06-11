@@ -2151,87 +2151,104 @@ with tab1:
         hide_index=True,
     )
 
-    # Detail panel
+    # Detail panel — use tender_number as stable key, not row index
     if event.selection.rows:
         idx = event.selection.rows[0]
-        t = open_df.iloc[idx]
 
-        st.divider()
-        header_col, score_col = st.columns([4, 1])
-        with header_col:
-            st.subheader(f"📄 {t['tender_number']} — {t.get('title', '')}")
-        with score_col:
-            if pd.notna(t.get("ai_score")):
-                st.metric("AI Fit Score", score_badge(t["ai_score"]))
-
-        _cp_col, _ = st.columns([1, 5])
-        with _cp_col:
-            copy_button(format_tender_card(t.to_dict()),
-                        label="📋 Copy Tender",
-                        key=f"cp_t_{str(t.get('tender_number','x'))[:20]}")
-
-        st.write(f"**Country:** {t.get('country', 'N/A')}  |  **Department:** {t.get('department_name', 'N/A')}")
-        st.write(f"**Description:** {t.get('description', 'N/A')}")
-        st.write(f"**Compliance Requirements:** {t.get('compliance_requirements', 'N/A')}")
-        st.write(f"**Closing Date:** {t.get('closing_date', 'N/A')}")
-
-        # Contact info for enquiries
-        _cp = t.get("contact_person","")
-        _ce = t.get("contact_email","")
-        _ph = t.get("contact_phone","")
-        if any([_cp, _ce, _ph]):
-            with st.expander("📞 Enquiry Contact", expanded=True):
-                cinfo = []
-                if _cp: cinfo.append(f"**Person:** {_cp}")
-                if _ce: cinfo.append(f"**Email:** {_ce}")
-                if _ph: cinfo.append(f"**Phone:** {_ph}")
-                st.write("  |  ".join(cinfo))
-
-        # AI rationale
-        if pd.notna(t.get("ai_rationale")):
-            with st.expander("🤖 AI Analysis", expanded=True):
-                st.info(t["ai_rationale"])
+        # Guard: idx must be a valid integer within bounds
+        if not isinstance(idx, int) or idx >= len(open_df):
+            st.warning("Selection lost after refresh — please re-select a tender.")
         else:
-            if st.button("🤖 Score This Tender", key=f"score_{t['tender_number']}"):
-                with st.spinner("Scoring…"):
-                    try:
-                        result = ai_score_tender(t.to_dict())
-                        supabase.table("sa_tenders").update({
-                            "ai_score": result["score"],
-                            "ai_rationale": result["rationale"]
-                        }).eq("tender_number", t["tender_number"]).execute()
-                        st.cache_data.clear()
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Scoring failed: {e}")
+            row = open_df.iloc[idx]
+            # Guard: row must be a Series/dict-like with a tender_number
+            if not hasattr(row, "get") or not row.get("tender_number"):
+                st.warning("Could not read tender data — please re-select.")
+            else:
+                # Lock onto tender_number so reruns can re-fetch reliably
+                _tn = str(row.get("tender_number", ""))
+                # Re-fetch from dataframe by tender_number (survives rerun row-shift)
+                _matches = open_df[open_df["tender_number"] == _tn]
+                t = _matches.iloc[0] if not _matches.empty else row
 
-        # Actions
-        action_col1, action_col2 = st.columns(2)
-        with action_col1:
-            st.link_button("🌐 View on eTenders", "https://www.etenders.gov.za/Home/opportunities")
-        with action_col2:
-            if _MONDAY_AVAILABLE:
-                if st.button("📋 Push to Monday", key=f"mon_{t['tender_number']}",
-                             help="Create lead on Monday.com Leads Board"):
-                    with st.spinner("Pushing to Monday.com…"):
+                st.divider()
+                header_col, score_col = st.columns([4, 1])
+                with header_col:
+                    st.subheader(f"📄 {t.get('tender_number','N/A')} — {t.get('title', '')}")
+                with score_col:
+                    if pd.notna(t.get("ai_score")):
+                        st.metric("AI Fit Score", score_badge(t["ai_score"]))
+
+                _cp_col, _ = st.columns([1, 5])
+                with _cp_col:
+                    copy_button(format_tender_card(t.to_dict()),
+                                label="📋 Copy Tender",
+                                key=f"cp_t_{_tn[:20]}")
+
+                st.write(f"**Country:** {t.get('country', 'N/A')}  |  **Department:** {t.get('department_name', 'N/A')}")
+                st.write(f"**Description:** {t.get('description', 'N/A')}")
+                st.write(f"**Compliance Requirements:** {t.get('compliance_requirements', 'N/A')}")
+                st.write(f"**Closing Date:** {t.get('closing_date', 'N/A')}")
+
+                # Contact info for enquiries
+                _cp = t.get("contact_person","")
+                _ce = t.get("contact_email","")
+                _ph = t.get("contact_phone","")
+                if any([_cp, _ce, _ph]):
+                    with st.expander("📞 Enquiry Contact", expanded=True):
+                        cinfo = []
+                        if _cp: cinfo.append(f"**Person:** {_cp}")
+                        if _ce: cinfo.append(f"**Email:** {_ce}")
+                        if _ph: cinfo.append(f"**Phone:** {_ph}")
+                        st.write("  |  ".join(cinfo))
+
+                # AI rationale
+                if pd.notna(t.get("ai_rationale")):
+                    with st.expander("🤖 AI Analysis", expanded=True):
+                        st.info(t["ai_rationale"])
+                else:
+                    if st.button("🤖 Score This Tender", key=f"score_{_tn}"):
+                        with st.spinner("Scoring…"):
+                            try:
+                                result = ai_score_tender(t.to_dict())
+                                supabase.table("sa_tenders").update({
+                                    "ai_score": result["score"],
+                                    "ai_rationale": result["rationale"]
+                                }).eq("tender_number", _tn).execute()
+                                st.cache_data.clear()
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Scoring failed: {e}")
+
+                # Actions row — 3 columns: eTenders link | Monday push | Mark irrelevant
+                action_col1, action_col2, action_col3 = st.columns(3)
+                with action_col1:
+                    st.link_button("🌐 View on eTenders", "https://www.etenders.gov.za/Home/opportunities")
+                with action_col2:
+                    if _MONDAY_AVAILABLE:
+                        if st.button("📋 Push to Monday", key=f"mon_{_tn}",
+                                     help="Create lead on Monday.com Leads Board"):
+                            with st.spinner("Pushing to Monday.com…"):
+                                try:
+                                    r = push_tender_to_monday(t.to_dict())
+                                    t_act = r.get("ticket_action","?")
+                                    l_act = r.get("lead_action","?")
+                                    if "error" in str(t_act) or "error" in str(l_act):
+                                        st.warning(f"Partial — Ticket: {t_act} | Lead: {l_act}")
+                                    elif t_act == "exists":
+                                        st.info(f"ℹ️ Ticket already exists (updated) | Lead: {l_act}")
+                                    else:
+                                        st.success(f"✅ Pushed → Outstanding Tickets + Leads")
+                                except Exception as e:
+                                    st.error(f"Monday push failed: {e}")
+                with action_col3:
+                    if st.button("🚫 Mark as Irrelevant", key=f"del_{_tn}",
+                                 help="Hides this tender — stays in database but won't appear again"):
                         try:
-                            r = push_tender_to_monday(t.to_dict())
-                            t_act = r.get("ticket_action","?")
-                            l_act = r.get("lead_action","?")
-                            if "error" in str(t_act) or "error" in str(l_act):
-                                st.warning(f"Partial — Ticket: {t_act} | Lead: {l_act}")
-                            elif t_act == "exists":
-                                st.info(f"ℹ️ Ticket already exists (updated) | Lead: {l_act}")
-                            else:
-                                st.success(f"✅ Pushed → Outstanding Tickets (New Requests, Tender Request) + Leads (NEW Leads)")
+                            supabase.table("sa_tenders").update({"is_irrelevant": True})                                .eq("tender_number", _tn).execute()
+                            st.cache_data.clear()
+                            st.rerun()
                         except Exception as e:
-                            st.error(f"Monday push failed: {e}")
-        with action_col2:
-            if st.button("🚫 Mark as Irrelevant", key=f"del_{t['tender_number']}",
-                             help="Hides this tender — it stays in the database but won't appear again"):
-                supabase.table("sa_tenders").update({"is_irrelevant": True})                    .eq("tender_number", t["tender_number"]).execute()
-                st.cache_data.clear()
-                st.rerun()
+                            st.error(f"Could not mark as irrelevant: {e}")
 
 
 # ══════════════════════════════════════════════
