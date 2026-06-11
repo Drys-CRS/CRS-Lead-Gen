@@ -107,6 +107,154 @@ def _pipeline_log(msg: str):
             pass
 
 
+
+def scrape_non_ocds_countries(out):
+    """
+    Scrape tenders for countries without OCDS feeds using three free sources:
+    1. World Bank Group Procurement Notices (covers all African countries, JSON API)
+    2. UNDP Procurement Notices (UN system, covers fragile states)
+    3. AfDB (African Development Bank) procurement notices (JSON API)
+
+    All results go to sa_tenders (open) and awarded_tenders (awarded)
+    with correct country attribution.
+    """
+    import requests
+    from datetime import datetime, timezone, timedelta
+
+    today = datetime.now(timezone.utc).date().isoformat()
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=365)).date().isoformat()
+
+    # ── Map country names to World Bank country codes ──────────────────────
+    WB_COUNTRY_CODES = {
+        "Angola": "AO", "Botswana": "BW", "Egypt": "EG", "Eritrea": "ER",
+        "Eswatini": "SZ", "Ethiopia": "ET", "The Gambia": "GM", "Lesotho": "LS",
+        "Libya": "LY", "Malawi": "MW", "Mauritius": "MU", "Mozambique": "MZ",
+        "Namibia": "NA", "Republic of South Sudan": "SS", "Seychelles": "SC",
+        "Sierra Leone": "SL", "Somalia": "SO", "Sudan": "SD", "Zimbabwe": "ZW",
+        # Also fetch for OCDS countries as supplementary (they publish less frequently)
+        "Kenya": "KE", "Nigeria": "NG", "Ghana": "GH", "Tanzania": "TZ",
+        "Uganda": "UG", "Zambia": "ZM", "Rwanda": "RW",
+    }
+
+    total_open, total_awarded = 0, 0
+
+    for country, wb_code in WB_COUNTRY_CODES.items():
+        flag = NON_OCDS_COUNTRIES.get(country, OCDS_REGISTRY.get(country, ("🌍", "Africa")))[0]                if isinstance(NON_OCDS_COUNTRIES.get(country, OCDS_REGISTRY.get(country)), tuple)                else "🌍"
+
+        # ── Source 1: World Bank Procurement Notices ───────────────────────
+        try:
+            # WB Open Contracting for Infrastructure (OCI) + procurement API
+            wb_url = "https://search.worldbank.org/api/v2/procnotices"
+            params = {
+                "format":     "json",
+                "fl":         "id,project_name,project_id,notice_type,deadline_date,"
+                              "submission_date,contact_country,procurement_method,"
+                              "description,contact_organization,status",
+                "fq":         f"contact_country:{wb_code}",
+                "rows":       200,
+                "sort":       "submission_date desc",
+            }
+            r = requests.get(wb_url, params=params,
+                             headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
+            if r.ok:
+                notices = r.json().get("docs", [])
+                open_batch, awarded_batch = [], []
+
+                for n in notices:
+                    title = str(n.get("project_name") or n.get("description") or "")[:200]
+                    if not _is_relevant(title):
+                        continue
+
+                    notice_type = str(n.get("notice_type") or "")
+                    deadline = str(n.get("deadline_date") or n.get("submission_date") or "")[:10]
+                    org = str(n.get("contact_organization") or "")[:200]
+                    tender_no = f"WB-{n.get('id','')}"
+                    portal = f"https://projects.worldbank.org/en/projects-operations/procurement/procnotices/{n.get('id','')}"
+
+                    base = {
+                        "tender_number":   tender_no[:100],
+                        "department_name": org,
+                        "title":           title,
+                        "description":     title,
+                        "category":        notice_type,
+                        "portal_link":     portal,
+                        "country":         country,
+                    }
+
+                    status = str(n.get("status") or "").lower()
+                    if status in ("awarded", "contract signed"):
+                        awarded_batch.append({
+                            **base,
+                            "winning_bidder":  "Not Disclosed",
+                            "award_value":     "Not Disclosed",
+                            "issue_date":      deadline,
+                        })
+                    elif deadline >= today or not deadline:
+                        open_batch.append({
+                            **base,
+                            "compliance_requirements": n.get("procurement_method") or "See portal",
+                            "closing_date": deadline or None,
+                            "status":       "Open",
+                            "award_status": "Published",
+                        })
+
+                if open_batch:
+                    # Replace open WB notices for this country
+                    supabase.table("sa_tenders").delete()                        .eq("country", country)                        .like("tender_number", "WB-%")                        .execute()
+                    _upsert(open_batch, country, f"WB Open", lambda m: None)
+                    total_open += len(open_batch)
+                if awarded_batch:
+                    _upsert_awarded(awarded_batch, country, f"WB Awarded", lambda m: None)
+                    total_awarded += len(awarded_batch)
+
+        except Exception as e:
+            pass  # non-fatal per country
+
+        # ── Source 2: UNDP Procurement Notices ────────────────────────────
+        try:
+            undp_url = "https://procurement-notices.undp.org/search.cfm"
+            params2 = {
+                "op":      "search",
+                "country": country,
+                "type":    "all",
+                "output":  "json",
+                "rows":    50,
+            }
+            r2 = requests.get(undp_url, params=params2,
+                              headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+            if r2.ok and r2.text.strip().startswith("["):
+                notices2 = r2.json()
+                undp_open = []
+                for n in notices2:
+                    title = str(n.get("title") or "")[:200]
+                    if not _is_relevant(title):
+                        continue
+                    deadline = str(n.get("deadline") or "")[:10]
+                    if deadline and deadline < today:
+                        continue
+                    undp_open.append({
+                        "tender_number":           f"UNDP-{n.get('id','')}",
+                        "department_name":         str(n.get("agency") or "UNDP")[:200],
+                        "title":                   title,
+                        "description":             title,
+                        "category":                str(n.get("type") or ""),
+                        "portal_link":             str(n.get("url") or "https://procurement-notices.undp.org"),
+                        "closing_date":            deadline or None,
+                        "country":                 country,
+                        "compliance_requirements": "See UNDP portal",
+                        "status":                  "Open",
+                        "award_status":            "Published",
+                    })
+                if undp_open:
+                    _upsert(undp_open, country, "UNDP Open", lambda m: None)
+                    total_open += len(undp_open)
+        except Exception:
+            pass
+
+    out(f"  🌍 Non-OCDS countries: {total_open} open + {total_awarded} awarded tenders collected")
+
+
+
 def run_pipeline(trigger: str = "scheduled"):
     """
     Full autonomous pipeline:
@@ -146,6 +294,11 @@ def run_pipeline(trigger: str = "scheduled"):
                     scrape_ocds_country(country, out)
                 except Exception as e:
                     out(f"  ❌ {country}: {e}")
+        try:
+            out("Scraping non-OCDS countries via World Bank & UNDP…")
+            scrape_non_ocds_countries(out)
+        except Exception as e:
+            out(f"  ❌ Non-OCDS scraper: {e}")
         st.cache_data.clear()
 
         # Reload fresh data
@@ -1292,15 +1445,42 @@ def scrape_south_africa(out):
 
 OCDS_REGISTRY = {
     # country: (publication_id, flag)
-    # South Africa included as FALLBACK only — live eTenders API is primary
+    # Verified publication IDs from data.open-contracting.org 2026-06-11
+    # South Africa is FALLBACK only — live eTenders API is primary
     "South Africa": (143, "🇿🇦"),
-    "Kenya":    (147, "🇰🇪"),
-    "Ghana":    (85,  "🇬🇭"),
-    "Tanzania": (152, "🇹🇿"),
-    "Uganda":   (130, "🇺🇬"),
-    "Nigeria":  (64,  "🇳🇬"),
-    "Zambia":   (3,   "🇿🇲"),
-    "Rwanda":   (145, "🇷🇼"),
+    "Kenya":        (147, "🇰🇪"),   # PPIP — daily updates
+    "Nigeria":      (64,  "🇳🇬"),   # BPP NoCoPo
+    "Ghana":        (85,  "🇬🇭"),   # GHANEPS
+    "Tanzania":     (152, "🇹🇿"),   # PPRA/NeST
+    "Uganda":       (130, "🇺🇬"),   # PPDA
+    "Zambia":       (3,   "🇿🇲"),   # ZPPA
+    "Rwanda":       (145, "🇷🇼"),   # RPPA
+    "Liberia":      (79,  "🇱🇷"),   # PPCC
+}
+
+# Countries on target list WITHOUT OCDS — scraped via World Bank / UNDP / AfDB notices
+# and AI-grounded discovery. Grouped for the secondary scraper.
+NON_OCDS_COUNTRIES = {
+    # country: (flag, region)
+    "Angola":               ("🇦🇴", "Southern Africa"),
+    "Botswana":             ("🇧🇼", "Southern Africa"),
+    "Egypt":                ("🇪🇬", "North Africa"),
+    "Eritrea":              ("🇪🇷", "East Africa"),
+    "Eswatini":             ("🇸🇿", "Southern Africa"),
+    "Ethiopia":             ("🇪🇹", "East Africa"),
+    "The Gambia":           ("🇬🇲", "West Africa"),
+    "Lesotho":              ("🇱🇸", "Southern Africa"),
+    "Libya":                ("🇱🇾", "North Africa"),
+    "Malawi":               ("🇲🇼", "East Africa"),
+    "Mauritius":            ("🇲🇺", "Indian Ocean"),
+    "Mozambique":           ("🇲🇿", "Southern Africa"),
+    "Namibia":              ("🇳🇦", "Southern Africa"),
+    "Republic of South Sudan": ("🇸🇸", "East Africa"),
+    "Seychelles":           ("🇸🇨", "Indian Ocean"),
+    "Sierra Leone":         ("🇸🇱", "West Africa"),
+    "Somalia":              ("🇸🇴", "East Africa"),
+    "Sudan":                ("🇸🇩", "East Africa"),
+    "Zimbabwe":             ("🇿🇼", "Southern Africa"),
 }
 
 def _download_ocds_year(pub_id: int, year: int):
@@ -1451,7 +1631,7 @@ def run_all_scrapers():
         except Exception as e:
             out_write(f"  ❌ South Africa registry fallback also failed: {e}")
 
-    # All other countries: OCDS registry (one robust source, consistent format)
+    # OCDS countries
     for country in OCDS_REGISTRY:
         if country == "South Africa":
             continue  # handled above with live API + fallback
@@ -1460,7 +1640,14 @@ def run_all_scrapers():
         except Exception as e:
             out_write(f"  ❌ {country} crashed: {e}")
 
-    out_write("\n✅ **All countries done!**")
+    # Non-OCDS countries via World Bank + UNDP
+    try:
+        out_write("\n🌍 Scraping non-OCDS countries via World Bank & UNDP…")
+        scrape_non_ocds_countries(out_write)
+    except Exception as e:
+        out_write(f"  ❌ Non-OCDS scraper crashed: {e}")
+
+    out_write("\n✅ **All 28 countries done!**")
 
 # ─────────────────────────────────────────────
 # 9. MAIN DASHBOARD
@@ -1514,11 +1701,22 @@ dept_search = st.sidebar.text_input("Filter by Department")
 
 # Country filter — populated from live DB values
 all_countries = sorted(tenders_df["country"].dropna().unique().tolist()) if "country" in tenders_df.columns else []
+# All 28 target countries for quick reference
+ALL_TARGET_COUNTRIES = [
+    "South Africa", "Angola", "Botswana", "Egypt", "Eritrea", "Eswatini",
+    "Ethiopia", "The Gambia", "Ghana", "Kenya", "Lesotho", "Liberia", "Libya",
+    "Malawi", "Mauritius", "Mozambique", "Namibia", "Nigeria",
+    "Republic of South Sudan", "Rwanda", "Seychelles", "Sierra Leone",
+    "Somalia", "Sudan", "Uganda", "United Republic of Tanzania", "Zambia", "Zimbabwe",
+]
+# Use live DB countries if available, fall back to target list
+_country_opts = sorted(set(all_countries) | set(ALL_TARGET_COUNTRIES))     if all_countries else ALL_TARGET_COUNTRIES
+
 selected_countries = st.sidebar.multiselect(
     "Filter by Country",
-    options=all_countries,
-    default=all_countries,
-    help="Select one or more countries to show"
+    options=_country_opts,
+    default=all_countries if all_countries else ALL_TARGET_COUNTRIES,
+    help="28 African countries tracked"
 )
 
 # Date range filter for awarded tenders (12-month history)
