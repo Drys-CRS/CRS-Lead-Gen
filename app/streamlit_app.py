@@ -1053,25 +1053,26 @@ Return ONLY a valid JSON array, no markdown, no explanation. Each object:
     raw = _call_ai(prompt)
 
     # ── Robust JSON extraction ──────────────────────────────────────────────
-    # Strip markdown fences
     raw = _re.sub(r"^```json[\s]*|^```[\s]*|```$", "", raw.strip(), flags=_re.MULTILINE).strip()
-    # Extract first [...] array if there's surrounding text
+    # Extract first [...] array block even if surrounded by text
     m = _re.search(r"\[.*\]", raw, _re.DOTALL)
     if m:
         raw = m.group(0)
     try:
         parsed = json.loads(raw)
-        return parsed if isinstance(parsed, list) else []
     except json.JSONDecodeError:
-        # Try to salvage partial response — parse as many complete objects as possible
+        # Salvage any complete {...} objects from a truncated response
         objects = _re.findall(r'\{[^{}]+\}', raw, _re.DOTALL)
-        results = []
+        parsed = []
         for obj in objects:
             try:
-                results.append(json.loads(obj))
+                parsed.append(json.loads(obj))
             except Exception:
                 pass
-        return results
+    # Guarantee: always return a list of dicts, never strings or None
+    if not isinstance(parsed, list):
+        parsed = [parsed] if isinstance(parsed, dict) else []
+    return [p for p in parsed if isinstance(p, dict) and p.get("company")]
 
 
 _FENCE_RE = None
@@ -1425,6 +1426,102 @@ def ai_match_tenders(open_df: pd.DataFrame) -> pd.DataFrame:
 # ─────────────────────────────────────────────
 # 7. SCORE BADGE HELPER
 # ─────────────────────────────────────────────
+def copy_button(text: str, label: str = "📋 Copy", key: str = "copy") -> None:
+    """Render a small copy-to-clipboard button using an HTML component.
+    Escapes the text so any quotes or newlines are safe inside JS."""
+    import streamlit.components.v1 as _comp
+    import html as _html
+    safe = _html.escape(str(text), quote=True).replace("\n", "&#10;").replace("\r", "")
+    unique = abs(hash(key + text[:30])) % 10_000_000
+    _comp.html(f"""
+<style>
+#cbtn_{unique} {{
+    background: #1e3a5f; color: #e8f0fe; border: 1px solid #3a6fa8;
+    border-radius: 6px; padding: 4px 12px; font-size: 13px;
+    cursor: pointer; font-family: sans-serif; transition: background 0.2s;
+}}
+#cbtn_{unique}:hover {{ background: #2a5298; }}
+#cbtn_{unique}.copied {{ background: #1a5c2e; border-color: #2d9e52; color: #b7ffd0; }}
+</style>
+<button id="cbtn_{unique}"
+  onclick="navigator.clipboard.writeText(decodeURIComponent('{safe}'.replace(/&#10;/g,'\\n')));
+           this.textContent='✅ Copied!'; this.classList.add('copied');
+           setTimeout(()=>{{this.textContent='{label}';this.classList.remove('copied')}},2000)">
+  {label}
+</button>""", height=38)
+
+
+def format_tender_card(t) -> str:
+    """Format a tender row as plain text for clipboard."""
+    lines = [
+        f"TENDER: {t.get('tender_number','N/A')}",
+        f"Title: {t.get('title','N/A')}",
+        f"Department: {t.get('department_name','N/A')}",
+        f"Country: {t.get('country','N/A')}",
+        f"Closing Date: {t.get('closing_date','N/A')}",
+        f"Description: {t.get('description','N/A')}",
+    ]
+    if t.get('compliance_requirements'):
+        lines.append(f"Compliance: {t.get('compliance_requirements')}")
+    if t.get('contact_person'):
+        lines.append(f"Contact Person: {t.get('contact_person')}")
+    if t.get('contact_email'):
+        lines.append(f"Contact Email: {t.get('contact_email')}")
+    if t.get('contact_phone'):
+        lines.append(f"Contact Phone: {t.get('contact_phone')}")
+    if t.get('ai_score'):
+        lines.append(f"AI Fit Score: {t.get('ai_score')}/10")
+    if t.get('ai_rationale'):
+        lines.append(f"AI Rationale: {t.get('ai_rationale')}")
+    if t.get('portal_link'):
+        lines.append(f"Portal Link: {t.get('portal_link')}")
+    return "\n".join(lines)
+
+
+def format_partner_card(p) -> str:
+    """Format a partner analysis result as plain text for clipboard."""
+    solutions = ", ".join(p.get("proposed_solutions") or [])
+    tenders   = ", ".join(str(t) for t in (p.get("key_tenders") or [])[:3])
+    depts     = ", ".join(str(d) for d in (p.get("issuing_departments") or [])[:3])
+    lines = [
+        f"PARTNER: {p.get('company','N/A')}",
+        f"Country: {p.get('country','N/A')}",
+        f"Partner Type: {p.get('partner_classification') or p.get('partnership_type','N/A')}",
+        f"Tenders Won: {p.get('tenders_won','?')}",
+        f"Urgency: {p.get('urgency','N/A').upper()}",
+        f"Deal Size: {p.get('estimated_deal_size','N/A')}",
+        f"Proposed Solutions: {solutions}",
+        f"Key Tenders: {tenders}",
+        f"Departments Served: {depts}",
+        f"Why Aligned: {p.get('why_aligned','')}",
+        f"Outreach Angle: {p.get('outreach_angle','')}",
+    ]
+    return "\n".join(lines)
+
+
+def format_lead_card(co, enriched: dict = None) -> str:
+    """Format a lead intelligence company card as plain text for clipboard."""
+    solutions = ", ".join(co.get("proposed_solutions") or [])
+    lines = [
+        f"LEAD: {co.get('name','N/A')}",
+        f"Lead Type: {co.get('lead_type','N/A')}",
+        f"Country: {co.get('country','N/A')}",
+        f"CRS Score: {co.get('crs_score','?')}/10",
+        f"Urgency: {co.get('urgency','N/A').upper()}",
+        f"Proposed Solutions: {solutions}",
+        f"Why Now: {co.get('why','')}",
+        f"Outreach Angle: {co.get('outreach_angle','')}",
+    ]
+    if enriched:
+        if enriched.get("employees"):
+            lines.append(f"Employees: {enriched['employees']}")
+        if enriched.get("revenue"):
+            lines.append(f"Revenue: {enriched['revenue']}")
+        if enriched.get("tech_stack"):
+            lines.append(f"Tech Stack: {', '.join(enriched['tech_stack'])}")
+    return "\n".join(lines)
+
+
 def score_badge(score):
     if score is None or pd.isna(score):
         return "⚪ —"
@@ -2067,6 +2164,12 @@ with tab1:
             if pd.notna(t.get("ai_score")):
                 st.metric("AI Fit Score", score_badge(t["ai_score"]))
 
+        _cp_col, _ = st.columns([1, 5])
+        with _cp_col:
+            copy_button(format_tender_card(t.to_dict()),
+                        label="📋 Copy Tender",
+                        key=f"cp_t_{str(t.get('tender_number','x'))[:20]}")
+
         st.write(f"**Country:** {t.get('country', 'N/A')}  |  **Department:** {t.get('department_name', 'N/A')}")
         st.write(f"**Description:** {t.get('description', 'N/A')}")
         st.write(f"**Compliance Requirements:** {t.get('compliance_requirements', 'N/A')}")
@@ -2225,80 +2328,92 @@ with tab2:
         if "partner_analysis" in st.session_state and st.session_state["partner_analysis"]:
             partners = st.session_state["partner_analysis"]
 
-            # Urgency colour coding
-            URGENCY_ICON = {"high": "🔴", "medium": "🟡", "low": "🟢"}
+            # Sanitise — ensure list of dicts (guards against stale/corrupt session state)
+            if not isinstance(partners, list):
+                partners = []
+            partners = [p for p in partners if isinstance(p, dict) and p.get("company")]
 
-            # Summary cards row
-            high = [p for p in partners if p.get("urgency") == "high"]
-            med  = [p for p in partners if p.get("urgency") == "medium"]
-            low  = [p for p in partners if p.get("urgency") == "low"]
+            if not partners:
+                st.warning("Analysis returned no valid partner records. Try running again.")
+            else:
+                # Urgency colour coding
+                URGENCY_ICON = {"high": "🔴", "medium": "🟡", "low": "🟢"}
 
-            m1, m2, m3 = st.columns(3)
-            m1.metric("🔴 High Priority", len(high))
-            m2.metric("🟡 Medium Priority", len(med))
-            m3.metric("🟢 Lower Priority", len(low))
+                # Summary cards row
+                high = [p for p in partners if p.get("urgency") == "high"]
+                med  = [p for p in partners if p.get("urgency") == "medium"]
+                low  = [p for p in partners if p.get("urgency") == "low"]
 
-            st.divider()
+                m1, m2, m3 = st.columns(3)
+                m1.metric("🔴 High Priority", len(high))
+                m2.metric("🟡 Medium Priority", len(med))
+                m3.metric("🟢 Lower Priority", len(low))
 
-            # Expandable cards — one per partner
-            for p in sorted(partners, key=lambda x: {"high": 0, "medium": 1, "low": 2}.get(x.get("urgency","low"), 2)):
-                urgency_icon = URGENCY_ICON.get(p.get("urgency", "low"), "⚪")
-                ptype = p.get("partner_classification") or p.get("partnership_type", "")
-                company = p.get("company", "Unknown")
-                country = p.get("country", "")
-                wins = p.get("tenders_won", "?")
-                deal_size = p.get("estimated_deal_size", "")
+                st.divider()
 
-                with st.expander(
-                    f"{urgency_icon} **{company}** — {country}  |  {wins} wins  |  {ptype}  |  {deal_size}"
-                ):
-                    # Partner classification badge
-                    ptype_colors = {
-                        "System Integrator": "🔷",
-                        "MSP": "🟣",
-                        "VAR": "🟦",
-                        "Training Provider": "🟩",
-                        "Consulting/Advisory": "🟧",
-                    }
-                    ptype_icon = ptype_colors.get(ptype, "⚪")
-                    st.write(f"**{ptype_icon} Partner Type:** {ptype}")
+                # Expandable cards — one per partner
+                for p in sorted(partners, key=lambda x: {"high": 0, "medium": 1, "low": 2}.get(x.get("urgency","low"), 2)):
+                    urgency_icon = URGENCY_ICON.get(p.get("urgency", "low"), "⚪")
+                    ptype = p.get("partner_classification") or p.get("partnership_type", "")
+                    company = p.get("company", "Unknown")
+                    country = p.get("country", "")
+                    wins = p.get("tenders_won", "?")
+                    deal_size = p.get("estimated_deal_size", "")
 
-                    # Proposed solutions
-                    solutions = p.get("proposed_solutions", [])
-                    if solutions:
-                        st.write(f"**💡 Proposed CRS Solutions:** {' · '.join(solutions)}")
+                    with st.expander(
+                        f"{urgency_icon} **{company}** — {country}  |  {wins} wins  |  {ptype}  |  {deal_size}"
+                    ):
+                        # Partner classification badge
+                        ptype_colors = {
+                            "System Integrator": "🔷",
+                            "MSP": "🟣",
+                            "VAR": "🟦",
+                            "Training Provider": "🟩",
+                            "Consulting/Advisory": "🟧",
+                        }
+                        ptype_icon = ptype_colors.get(ptype, "⚪")
+                        st.write(f"**{ptype_icon} Partner Type:** {ptype}")
 
-                    # Key tenders won
-                    key_tenders = p.get("key_tenders", [])
-                    if key_tenders:
-                        st.write(f"**📋 Key Tenders Won:** {', '.join(str(t) for t in key_tenders[:3])}")
+                        # Proposed solutions
+                        solutions = p.get("proposed_solutions", [])
+                        if solutions:
+                            st.write(f"**💡 Proposed CRS Solutions:** {' · '.join(solutions)}")
 
-                    # Departments served
-                    depts = p.get("issuing_departments", [])
-                    if depts:
-                        st.write(f"**🏛️ Departments Served:** {', '.join(str(d) for d in depts[:3])}")
+                        # Key tenders won
+                        key_tenders = p.get("key_tenders", [])
+                        if key_tenders:
+                            st.write(f"**📋 Key Tenders Won:** {', '.join(str(t) for t in key_tenders[:3])}")
 
-                    st.write(f"**Why aligned:** {p.get('why_aligned', '')}")
-                    st.info(f"💬 Outreach angle: {p.get('outreach_angle', '')}")
+                        # Departments served
+                        depts = p.get("issuing_departments", [])
+                        if depts:
+                            st.write(f"**🏛️ Departments Served:** {', '.join(str(d) for d in depts[:3])}")
 
-                    # Per-company Monday push button
-                    if _MONDAY_AVAILABLE:
-                        btn_key = f"push_co_{company[:30].replace(' ','_')}"
-                        if st.button(f"📋 Push to Monday Companies", key=btn_key,
-                                     help="Create or update this company on the 2.1 - Companies board"):
-                            with st.spinner(f"Pushing {company}…"):
-                                try:
-                                    result = push_partner_to_companies(p)
-                                    action = result.get("action","?")
-                                    item_id = result.get("item_id","")
-                                    if action == "created":
-                                        st.success(f"✅ **{company}** created on Companies board (ID: {item_id})")
-                                    elif action == "updated":
-                                        st.success(f"✅ **{company}** already exists — AI analysis added as update (ID: {item_id})")
-                                    else:
-                                        st.info(f"ℹ️ {company}: {action}")
-                                except Exception as e:
-                                    st.error(f"Push failed: {e}")
+                        st.write(f"**Why aligned:** {p.get('why_aligned', '')}")
+                        st.info(f"💬 Outreach angle: {p.get('outreach_angle', '')}")
+
+                        copy_button(format_partner_card(p),
+                                    label="📋 Copy Partner Card",
+                                    key=f"cp_p_{company[:20].replace(' ','_')}")
+
+                        # Per-company Monday push button
+                        if _MONDAY_AVAILABLE:
+                            btn_key = f"push_co_{company[:30].replace(' ','_')}"
+                            if st.button(f"📋 Push to Monday Companies", key=btn_key,
+                                         help="Create or update this company on the 2.1 - Companies board"):
+                                with st.spinner(f"Pushing {company}…"):
+                                    try:
+                                        result = push_partner_to_companies(p)
+                                        action = result.get("action","?")
+                                        item_id = result.get("item_id","")
+                                        if action == "created":
+                                            st.success(f"✅ **{company}** created on Companies board (ID: {item_id})")
+                                        elif action == "updated":
+                                            st.success(f"✅ **{company}** already exists — AI analysis added as update (ID: {item_id})")
+                                        else:
+                                            st.info(f"ℹ️ {company}: {action}")
+                                    except Exception as e:
+                                        st.error(f"Push failed: {e}")
 
             st.divider()
 
@@ -3116,7 +3231,10 @@ Return ONLY a valid JSON object:
                         c2.write(f"**💡 Proposed:** {' · '.join(solutions)}")
                     st.write(f"**Why now:** {co.get('why','')}")
                     st.info(f"💬 Outreach angle: {co.get('outreach_angle','')}")
+
                     enr = res.get("enriched",{}).get(co.get("name",""), {})
+                    copy_button(format_lead_card(co, enr), label="📋 Copy Lead Card",
+                                key=f"cp_lead_{co.get('name','')[:25]}")
                     if enr:
                         ec1, ec2 = st.columns(2)
                         ec1.write(f"**Employees:** {enr.get('employees','?')}")
@@ -3143,6 +3261,16 @@ Return ONLY a valid JSON object:
                     st.write(f"**Why reach out:** {c.get('why_first','')}")
                     if c.get("linkedin"):
                         st.markdown(f"[🔗 LinkedIn]({c['linkedin']})")
+                    _contact_txt = (
+                        f"CONTACT: {c.get('name','N/A')}\n"
+                        f"Title: {c.get('title','N/A')}\n"
+                        f"Company: {c.get('company','N/A')}\n"
+                        f"CRS Score: {c.get('crs_score','?')}/10\n"
+                        f"Why Reach Out: {c.get('why_first','')}\n"
+                        f"LinkedIn: {c.get('linkedin','N/A')}"
+                    )
+                    copy_button(_contact_txt, label="📋 Copy Contact",
+                                key=f"cp_contact_{c.get('name','')[:25]}")
 
         if all_people:
             people_df = pd.DataFrame(all_people)
