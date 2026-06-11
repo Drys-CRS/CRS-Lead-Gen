@@ -1561,9 +1561,10 @@ _GH_FILES = {
 }
 
 def _gh_headers() -> dict:
-    token = st.secrets.get("GITHUB_TOKEN", "")
+    token = (st.secrets.get("GITHUB_TOKEN") or
+             st.secrets.get("GH_PAT") or "").strip()
     if not token:
-        raise ValueError("GITHUB_TOKEN not set in Streamlit secrets")
+        raise ValueError("No GitHub token found. Add GITHUB_TOKEN to Streamlit secrets.")
     return {
         "Authorization": f"token {token}",
         "Accept": "application/vnd.github.v3+json",
