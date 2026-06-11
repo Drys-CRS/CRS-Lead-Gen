@@ -6,6 +6,22 @@ import re
 import google.generativeai as genai
 from supabase import create_client
 
+# Monday.com integration (optional — only active if MONDAY_API_KEY is set)
+try:
+    import sys, os
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from monday_client import (
+        discover_columns, find_item_by_name,
+        create_lead, create_subitem, create_company,
+        push_tender_lead, push_attack_signal_lead,
+        push_apollo_contact, push_partner_company,
+        update_lead_columns,
+    )
+    _MONDAY_AVAILABLE = bool(st.secrets.get("MONDAY_API_KEY") if hasattr(st, 'secrets') else False)
+except ImportError:
+    _MONDAY_AVAILABLE = False
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # AUTONOMOUS PIPELINE — Provider health checks, scheduled runner, keep-alive
 # ─────────────────────────────────────────────────────────────────────────────
@@ -174,6 +190,17 @@ def run_pipeline(trigger: str = "scheduled"):
                     supabase.table("tender_score_history").insert(score_rows).execute()
                 except Exception as e:
                     out(f"  History insert error: {e}")
+                if _MONDAY_AVAILABLE:
+                    high_score = [r for r in score_rows if (r.get("ai_score") or 0) >= 8]
+                    mon_count = 0
+                    for row in high_score:
+                        try:
+                            push_tender_lead(row)
+                            mon_count += 1
+                        except Exception:
+                            pass
+                    if mon_count:
+                        out(f"  📋 {mon_count} high-score tenders pushed to Monday.com")
 
             # ── 3. Partner analysis ───────────────────────────────────────
             out("Running partner analysis…")
@@ -1345,6 +1372,10 @@ st.title("🛡️ CRS Competitive Intelligence Dashboard")
 st.sidebar.header("Controls")
 st.sidebar.caption(_provider_status())
 _usage_sidebar()
+if _MONDAY_AVAILABLE:
+    st.sidebar.success("🟢 Monday.com connected")
+else:
+    st.sidebar.caption("⚪ Monday.com — add MONDAY_API_KEY to secrets")
 if st.sidebar.button("🔄 Refresh All Countries"):
     run_all_scrapers()
     st.cache_data.clear()
@@ -1431,6 +1462,26 @@ with tab1:
         )
         if not _can_score:
             st.caption(f"⏳ Available in {_score_wait} min")
+
+        if _MONDAY_AVAILABLE:
+            if st.button("📋 Push High-Score (≥7) to Monday", key="mon_bulk_tenders",
+                         help="Create Monday.com leads for all open tenders scored 7+"):
+                high = open_df[open_df["ai_score"].fillna(0) >= 7]
+                if high.empty:
+                    st.info("No tenders scored 7+ yet. Run AI scoring first.")
+                else:
+                    pushed, skipped = 0, 0
+                    prog = st.progress(0, text="Pushing to Monday.com…")
+                    for i, (_, row) in enumerate(high.iterrows()):
+                        prog.progress((i+1)/len(high), text=f"Pushing {i+1}/{len(high)}…")
+                        try:
+                            push_tender_lead(row.to_dict())
+                            pushed += 1
+                        except Exception:
+                            skipped += 1
+                    prog.empty()
+                    st.success(f"✅ {pushed} leads pushed to Monday.com ({skipped} skipped/errors)")
+
         if _score_btn and _can_score:
             _record_op("score_all")
             ai_match_tenders(open_df)
@@ -1494,6 +1545,16 @@ with tab1:
         action_col1, action_col2 = st.columns(2)
         with action_col1:
             st.link_button("🌐 View on eTenders", "https://www.etenders.gov.za/Home/opportunities")
+        with action_col2:
+            if _MONDAY_AVAILABLE:
+                if st.button("📋 Push to Monday", key=f"mon_{t['tender_number']}",
+                             help="Create lead on Monday.com Leads Board"):
+                    with st.spinner("Pushing to Monday.com…"):
+                        try:
+                            mid = push_tender_lead(t.to_dict())
+                            st.success(f"✅ Lead created in Monday.com (ID: {mid})")
+                        except Exception as e:
+                            st.error(f"Monday push failed: {e}")
         with action_col2:
             if st.button("🗑️ Mark as Irrelevant", key=f"del_{t['tender_number']}"):
                 supabase.table("sa_tenders").delete().eq("tender_number", t["tender_number"]).execute()
@@ -1593,6 +1654,21 @@ with tab2:
                 ):
                     st.write(f"**Why aligned:** {p.get('why_aligned', '')}")
                     st.info(f"💬 Outreach angle: {p.get('outreach_angle', '')}")
+
+            # Push partner recommendations to Monday Companies board
+            if _MONDAY_AVAILABLE and "partner_analysis" in st.session_state:
+                partners = st.session_state["partner_analysis"]
+                if st.button("📋 Push Partners to Monday Companies Board",
+                             key="mon_partners",
+                             help="Add recommended companies as Resellers in Monday.com"):
+                    pushed = 0
+                    for p in partners:
+                        try:
+                            push_partner_company(p)
+                            pushed += 1
+                        except Exception:
+                            pass
+                    st.success(f"✅ {pushed} companies pushed to Monday.com Companies board")
 
             st.divider()
 
@@ -2533,13 +2609,67 @@ Return ONLY a valid JSON object:
                 else:
                     st.info("Run a lead search first to populate contacts.")
 
-        # ── Export CSV ───────────────────────────────────────────────────
-        if all_people:
-            csv = pd.DataFrame(all_people).to_csv(index=False)
-            st.download_button(
-                "⬇️ Export All Contacts as CSV",
-                data=csv, file_name="crs_leads.csv", mime="text/csv"
-            )
+        # ── Push to Monday ────────────────────────────────────────────────
+        if _MONDAY_AVAILABLE and "lead_results" in st.session_state:
+            res    = st.session_state["lead_results"]
+            ai_out = res.get("ai", {})
+            all_people = res.get("apollo_contacts",[]) + res.get("top_people",[])
+            st.subheader("📋 Push to Monday.com")
+            push_col1, push_col2, push_col3 = st.columns(3)
+
+            with push_col1:
+                if st.button("🚨 Push Attack Signals (≥7) to Monday"):
+                    signals = res.get("signals", [])
+                    high_sigs = [s for s in signals if (s.get("crs_score") or 0) >= 7
+                                 and s.get("victim_org")]
+                    pushed = 0
+                    for s in high_sigs:
+                        try:
+                            push_attack_signal_lead(s)
+                            pushed += 1
+                        except Exception:
+                            pass
+                    st.success(f"✅ {pushed} attack signal leads pushed")
+
+            with push_col2:
+                if st.button("👤 Push Apollo Contacts to Monday"):
+                    contacts = all_people[:10]
+                    pushed = 0
+                    for p in contacts:
+                        try:
+                            push_apollo_contact(p)
+                            pushed += 1
+                        except Exception:
+                            pass
+                    st.success(f"✅ {pushed} contacts pushed")
+
+            with push_col3:
+                if st.button("🏢 Push Target Companies (≥7) to Monday"):
+                    top_cos = ai_out.get("scored_companies", [])
+                    pushed = 0
+                    for co in [c for c in top_cos if (c.get("crs_score") or 0) >= 7]:
+                        try:
+                            create_lead(
+                                name=co.get("name",""), company=co.get("name",""),
+                                lead_origin="AI Lead Discovery",
+                                notes=co.get("why",""),
+                                outreach_angle=co.get("outreach_angle",""),
+                                crs_score=co.get("crs_score"),
+                            )
+                            pushed += 1
+                        except Exception:
+                            pass
+                    st.success(f"✅ {pushed} companies pushed")
+
+        # ── Export CSV ────────────────────────────────────────────────────
+        if "lead_results" in st.session_state:
+            _lp = st.session_state["lead_results"].get("apollo_contacts",[]) +                   st.session_state["lead_results"].get("top_people",[])
+            if _lp:
+                csv = pd.DataFrame(_lp).to_csv(index=False)
+                st.download_button(
+                    "⬇️ Export All Contacts as CSV",
+                    data=csv, file_name="crs_leads.csv", mime="text/csv"
+                )
 
 # ══════════════════════════════════════════════
 # TAB 6 — PIPELINE & HEALTH
@@ -2676,6 +2806,24 @@ with tab6:
             st.warning(f"Could not load: {e}")
 
     st.divider()
+
+    # ── Monday.com column discovery ───────────────────────────────────────────
+    if _MONDAY_AVAILABLE:
+        st.subheader("🔍 Monday.com Column ID Discovery")
+        st.caption("Use this to find the real column IDs for your boards before they're configured.")
+        disc_board_id = st.text_input("Enter a Monday Board ID to inspect:", placeholder="1234567890")
+        if st.button("🔍 Discover Column IDs") and disc_board_id:
+            try:
+                cols = discover_columns(disc_board_id)
+                st.write("**Column title → Column ID mapping:**")
+                st.dataframe(
+                    pd.DataFrame(list(cols.items()), columns=["Title","Column ID"]),
+                    use_container_width=True, hide_index=True
+                )
+                st.caption("Copy these IDs into monday_client.py to match your actual board structure.")
+            except Exception as e:
+                st.error(f"Discovery failed: {e}")
+        st.divider()
 
     # ── Manual pipeline trigger with progress ─────────────────────────────────
     st.subheader("🚀 Manual Pipeline Run")
