@@ -11,8 +11,8 @@ try:
     import sys, os
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from monday_client import (
-        push_tender_to_tickets,
-        get_board_id, get_tenders_group_id,
+        push_tender_to_monday,
+        get_ticket_board_id, get_leads_board_id,
     )
     _MONDAY_AVAILABLE = bool(st.secrets.get("MONDAY_API_KEY") if hasattr(st, 'secrets') else False)
 except ImportError:
@@ -345,8 +345,8 @@ def run_pipeline(trigger: str = "scheduled"):
                     mon_count = 0
                     for row in high_score:
                         try:
-                            _, act = push_tender_to_tickets(row)
-                            if act == "created":
+                            r = push_tender_to_monday(row)
+                            if r.get("ticket_action") == "created" or r.get("lead_action") == "created":
                                 mon_count += 1
                         except Exception:
                             pass
@@ -1776,8 +1776,8 @@ with tab1:
                     for i, (_, row) in enumerate(high.iterrows()):
                         prog.progress((i+1)/len(high), text=f"Pushing {i+1}/{len(high)}…")
                         try:
-                            _, action = push_tender_to_tickets(row.to_dict())
-                            if action == "created":
+                            r = push_tender_to_monday(row.to_dict())
+                            if r.get("ticket_action") == "created" or r.get("lead_action") == "created":
                                 pushed += 1
                             else:
                                 skipped += 1
@@ -1855,8 +1855,15 @@ with tab1:
                              help="Create lead on Monday.com Leads Board"):
                     with st.spinner("Pushing to Monday.com…"):
                         try:
-                            mid, action = push_tender_to_tickets(t.to_dict())
-                            st.success(f"✅ Lead created in Monday.com (ID: {mid})")
+                            r = push_tender_to_monday(t.to_dict())
+                            t_act = r.get("ticket_action","?")
+                            l_act = r.get("lead_action","?")
+                            if "error" in str(t_act) or "error" in str(l_act):
+                                st.warning(f"Partial — Ticket: {t_act} | Lead: {l_act}")
+                            elif t_act == "exists":
+                                st.info(f"ℹ️ Ticket already exists (updated) | Lead: {l_act}")
+                            else:
+                                st.success(f"✅ Pushed → Outstanding Tickets (New Requests, Tender Request) + Leads (NEW Leads)")
                         except Exception as e:
                             st.error(f"Monday push failed: {e}")
         with action_col2:
