@@ -797,7 +797,7 @@ def _provider_status() -> str:
 
 def _clean(raw: str) -> str:
     """Strip markdown fences from an AI response."""
-    return re.sub(r"^```json\s*|^```\s*|```$", "", raw.strip(), flags=re.MULTILINE).strip()
+    return re.sub(r"^```json[\s]*|^```[\s]*|```$", "", raw.strip(), flags=re.MULTILINE).strip()
 
 def _is_rate_limit(err: str) -> bool:
     return any(x in err.lower() for x in ["429", "quota", "rate limit", "too many", "throttl"])
@@ -987,7 +987,7 @@ def _call_ai_grounded(prompt: str) -> str:
                 tools=[{"google_search": {}}]
             ).generate_content(prompt)
             raw = response.text.strip()
-        return re.sub(r"^```json\s*|^```\s*|```$", "", raw, flags=re.MULTILINE).strip()
+        return re.sub(r"^```json[\s]*|^```[\s]*|```$", "", raw, flags=re.MULTILINE).strip()
     except Exception:
         pass
     # Ungrounded fallback
@@ -1036,42 +1036,67 @@ def ai_analyse_partners(awarded_df) -> list:
         lines.append(f"{r['company']}|{r['country']}|{r['wins']}|{r['titles']}|{r['depts']}|{r['ref_nos']}")
     table_text = "\n".join(lines)
 
-    prompt = f"""You are a channel-partner analyst for Cyber Retaliator Solutions (CRS), a cyber security distributor and IBM/RedHat/SUSE/CompTIA training partner based in South Africa.
+    # Build prompt using % formatting to avoid f-string brace escaping issues
+    schema_example = (
+        '{"company":"Acme Tech","country":"South Africa","tenders_won":5,'
+        '"partner_classification":"System Integrator",'
+        '"proposed_solutions":["VECTRA","vRx"],'
+        '"key_tenders":["RFQ/2024/001","ICT-2023-045"],'
+        '"issuing_departments":["SAPS","Dept of Health"],'
+        '"why_aligned":"Wins large ICT integration tenders for government clients.",'
+        '"outreach_angle":"Lead with VECTRA NDR — they won the SAPS network monitoring tender.",'
+        '"urgency":"high","estimated_deal_size":"large"}'
+    )
 
-CRS VENDOR PORTFOLIO: VECTRA (NDR/XDR), vRx (vuln/patch mgmt), Strobes (CTEM/PTaaS), Aikido (AppSec), Flare (dark web intel), BeachheadSecure (encryption/MFA), SMBsecure (SMB/POPIA), Telivy (MSSP audit), BlueFlag (SDLC), Standss/SendGuard (email GRC), CRE/GoldPhish (cyber awareness), VAPT services, IBM/RedHat/SUSE/CompTIA/Agile training.
-
-PARTNER TYPES: System Integrator | MSP | VAR | Training Provider | Consulting/Advisory | End-user
-
-AGGREGATED TENDER WIN DATA (pipe-delimited):
-{table_text}
-
-Identify the TOP 12 companies CRS should approach as channel partners or resellers. Focus on ICT/security companies — exclude government departments, construction, catering, cleaning, vehicles, stationery.
-
-Return ONLY a valid JSON array, no markdown, no explanation. Each object:
-{{"company":"name","country":"country","tenders_won":N,"partner_classification":"type","proposed_solutions":["sol1","sol2"],"key_tenders":["ref1","ref2"],"issuing_departments":["dept1"],"why_aligned":"1-2 sentences","outreach_angle":"1 sentence","urgency":"high|medium|low","estimated_deal_size":"small|medium|large"}}"""
+    prompt = (
+        "You are a channel-partner analyst for Cyber Retaliator Solutions (CRS), "
+        "a cyber security distributor and IBM/RedHat/SUSE/CompTIA training partner in South Africa.\n\n"
+        "CRS VENDOR PORTFOLIO: VECTRA (NDR/XDR), vRx (vuln/patch), Strobes (CTEM/PTaaS), "
+        "Aikido (AppSec), Flare (dark web intel), BeachheadSecure (encryption/MFA), "
+        "SMBsecure (SMB/POPIA), Telivy (MSSP audit), BlueFlag (SDLC), Standss/SendGuard (email GRC), "
+        "CRE/GoldPhish (cyber awareness), VAPT services, IBM/RedHat/SUSE/CompTIA/Agile training.\n\n"
+        "PARTNER TYPES: System Integrator | MSP | VAR | Training Provider | Consulting/Advisory | End-user\n\n"
+        "AGGREGATED TENDER WIN DATA (pipe-delimited):\n"
+        + table_text +
+        "\n\nIdentify the TOP 12 companies CRS should approach as channel partners or resellers. "
+        "Focus on ICT/security companies — exclude government departments, construction, catering, "
+        "cleaning, vehicles, stationery.\n\n"
+        "Return ONLY a valid JSON array — no markdown fences, no explanation, no text before or after. "
+        "Array must start with [ and end with ]. Each element must follow this exact schema:\n"
+        "[" + schema_example + ", ...]"
+    )
 
     raw = _call_ai(prompt)
 
     # ── Robust JSON extraction ──────────────────────────────────────────────
-    raw = _re.sub(r"^```json[\s]*|^```[\s]*|```$", "", raw.strip(), flags=_re.MULTILINE).strip()
-    # Extract first [...] array block even if surrounded by text
-    m = _re.search(r"\[.*\]", raw, _re.DOTALL)
-    if m:
-        raw = m.group(0)
+    import re as _re2
+    # Strip markdown fences
+    raw = _re2.sub(r"```json[\s]*|```[\s]*", "", raw.strip()).strip()
+    # Try direct parse first
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError:
-        # Salvage any complete {...} objects from a truncated response
-        objects = _re.findall(r'\{[^{}]+\}', raw, _re.DOTALL)
-        parsed = []
-        for obj in objects:
+        # Find first [...] block
+        m = _re2.search(r"\[[\s\S]*\]", raw)
+        if m:
             try:
-                parsed.append(json.loads(obj))
-            except Exception:
-                pass
-    # Guarantee: always return a list of dicts, never strings or None
+                parsed = json.loads(m.group(0))
+            except json.JSONDecodeError:
+                parsed = []
+        else:
+            # Last resort — salvage individual objects
+            parsed = []
+            for obj in _re2.findall(r"\{[^{}]+\}", raw):
+                try:
+                    parsed.append(json.loads(obj))
+                except Exception:
+                    pass
+
+    # Normalise to list of dicts with a company key
+    if isinstance(parsed, dict):
+        parsed = [parsed]
     if not isinstance(parsed, list):
-        parsed = [parsed] if isinstance(parsed, dict) else []
+        parsed = []
     return [p for p in parsed if isinstance(p, dict) and p.get("company")]
 
 
@@ -1083,7 +1108,7 @@ def _safe_json(raw: str, expect_list: bool = True):
     import re as _re
     global _FENCE_RE
     if _FENCE_RE is None:
-        _FENCE_RE = _re.compile(r"^```json\s*|^```\s*|```$", _re.MULTILINE)
+        _FENCE_RE = _re.compile(r"^```json[\s]*|^```[\s]*|```$", _re.MULTILINE)
     raw = _FENCE_RE.sub("", raw.strip()).strip()
     # Try to extract array or object
     pattern = r"\[.*\]" if expect_list else r"\{.*\}"
