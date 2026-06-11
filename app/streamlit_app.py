@@ -68,12 +68,13 @@ def init_connection():
 supabase = init_connection()
 
 # ─────────────────────────────────────────────
-# 4. AI CLIENTS  (Groq → Cerebras → Gemini cascade)
+# 4. AI CLIENTS  (Groq → Cerebras → OpenRouter → Gemini cascade)
 #
 # Priority for scoring/parsing:
 #   1. Groq        — 30 RPM free, fastest inference (~1s responses)
-#   2. Cerebras    — 1M tokens/day free, fast, good fallback
-#   3. Gemini      — 5 RPM free, kept for grounded web search (Discovery tab)
+#   2. Cerebras    — token-based free tier, fast
+#   3. OpenRouter  — free :free models, no hard daily cap, OpenAI-compatible
+#   4. Gemini      — 20 req/day free, kept for grounded web search (Discovery tab)
 #
 # Each key is optional — the cascade skips any provider whose key is missing.
 # ─────────────────────────────────────────────
@@ -106,15 +107,45 @@ def init_cerebras():
     except Exception:
         return None
 
-ai         = init_gemini()
-groq_ai    = init_groq()
-cerebras_ai = init_cerebras()
+@st.cache_resource
+def init_openrouter():
+    try:
+        from openai import OpenAI
+        key = st.secrets.get("OPENROUTER_API_KEY")
+        if not key:
+            return None
+        return OpenAI(
+            api_key=key,
+            base_url="https://openrouter.ai/api/v1",
+            default_headers={
+                "HTTP-Referer": "https://github.com/Drys-CRS/CRS-Lead-Gen",
+                "X-Title": "CRS Competitive Intelligence",
+            }
+        )
+    except Exception:
+        return None
+
+ai           = init_gemini()
+groq_ai      = init_groq()
+cerebras_ai  = init_cerebras()
+openrouter_ai = init_openrouter()
+
+# Free models on OpenRouter — tried in order, first success wins.
+# All have :free suffix meaning $0/token. Falls through to next on failure.
+_OPENROUTER_FREE_MODELS = [
+    "meta-llama/llama-3.3-70b-instruct:free",   # strong general reasoning
+    "deepseek/deepseek-r1:free",                  # excellent structured output
+    "mistralai/mistral-7b-instruct:free",         # fast, reliable fallback
+    "google/gemma-3-12b-it:free",                 # Google open model, good quality
+    "qwen/qwen3-14b:free",                        # Alibaba, strong reasoning
+]
 
 # ── Provider status shown in sidebar ──
 def _provider_status() -> str:
     parts = []
-    parts.append("🟢 Groq"     if groq_ai     else "⚪ Groq (no key)")
-    parts.append("🟢 Cerebras" if cerebras_ai else "⚪ Cerebras (no key)")
+    parts.append("🟢 Groq"        if groq_ai        else "⚪ Groq (no key)")
+    parts.append("🟢 Cerebras"    if cerebras_ai     else "⚪ Cerebras (no key)")
+    parts.append("🟢 OpenRouter"  if openrouter_ai   else "⚪ OpenRouter (no key)")
     parts.append("🟢 Gemini")
     return " · ".join(parts)
 
@@ -155,6 +186,33 @@ def _call_cerebras(prompt: str) -> str:
             raise          # real error — propagate
     raise ValueError("Both Cerebras models returned empty content or are unavailable.")
 
+def _call_openrouter(prompt: str) -> str:
+    """Call OpenRouter — cascades through free :free models until one succeeds."""
+    last_err = None
+    for model in _OPENROUTER_FREE_MODELS:
+        try:
+            resp = openrouter_ai.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+                max_tokens=1500,
+                timeout=30,
+            )
+            text = (resp.choices[0].message.content or "").strip()
+            if text:
+                return _clean(text)
+        except Exception as e:
+            last_err = e
+            err_str = str(e)
+            if _is_rate_limit(err_str):
+                _time.sleep(3)   # brief pause between free model attempts
+                continue
+            if any(x in err_str.lower() for x in ["404", "unavailable", "does not exist", "not found"]):
+                continue         # model gone — try next
+            raise                # unexpected error — propagate
+    raise RuntimeError(f"All OpenRouter free models failed. Last: {last_err}")
+
+
 def _call_gemini(prompt: str, retries: int = 3) -> str:
     """Call Gemini with backoff. Raises after all retries."""
     delay = 20
@@ -184,6 +242,8 @@ def _call_ai(prompt: str) -> str:
         providers.append(("Cerebras", _call_cerebras))
     elif cerebras_ai:
         st.toast("⚠️ Cerebras daily limit reached — skipping")
+    if openrouter_ai:
+        providers.append(("OpenRouter", _call_openrouter))
     if _provider_budget_ok("Gemini"):
         providers.append(("Gemini", _call_gemini))
     else:
@@ -340,9 +400,10 @@ import datetime as _dt
 
 # Free-tier daily limits (requests/day)
 _AI_DAILY_LIMITS = {
-    "Groq":     1000,   # 1 000 req/day on free tier
-    "Cerebras": 500,    # conservative — actual is token-based (~1M tokens/day)
-    "Gemini":   20,     # 20 req/day on 2.5 Flash free tier
+    "Groq":       1000,   # 1 000 req/day on free tier
+    "Cerebras":   500,    # conservative — actual is token-based (~1M tokens/day)
+    "OpenRouter": 9999,   # no hard daily cap on free models — effectively unlimited
+    "Gemini":     20,     # 20 req/day on 2.5 Flash free tier
 }
 # Minimum minutes between full AI operations (score-all, partner analysis, lead discovery)
 _AI_OP_COOLDOWN_MINUTES = {

@@ -7,3 +7,4 @@ requests
 beautifulsoup4
 groq
 cerebras-cloud-sdk
+openai
