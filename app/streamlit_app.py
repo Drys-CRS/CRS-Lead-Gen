@@ -1522,6 +1522,163 @@ def format_lead_card(co, enriched: dict = None) -> str:
     return "\n".join(lines)
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# GITHUB SYNC MODULE
+# ═══════════════════════════════════════════════════════════════════════════
+
+_GH_REPO   = "Drys-CRS/CRS-Lead-Gen"
+_GH_BRANCH = "main"
+
+# All files managed by the sync system: repo_path → local filename
+_GH_FILES = {
+    "app/streamlit_app.py": "streamlit_app.py",
+    "app/monday_client.py": "monday_client.py",
+}
+
+def _gh_headers() -> dict:
+    token = st.secrets.get("GITHUB_TOKEN", "")
+    if not token:
+        raise ValueError("GITHUB_TOKEN not set in Streamlit secrets")
+    return {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "Content-Type": "application/json",
+    }
+
+def _gh_base() -> str:
+    return f"https://api.github.com/repos/{_GH_REPO}/contents"
+
+def github_get_file_info(repo_path: str) -> dict:
+    """Fetch metadata + content of a single file from GitHub.
+    Returns dict with sha, size, last_modified, content_b64, decoded lines."""
+    import requests as _req, base64 as _b64
+    r = _req.get(
+        f"{_gh_base()}/{repo_path}",
+        headers=_gh_headers(),
+        params={"ref": _GH_BRANCH},
+        timeout=15,
+    )
+    if r.status_code != 200:
+        return {"error": f"HTTP {r.status_code}: {r.json().get('message','?')}"}
+    d = r.json()
+    raw = _b64.b64decode(d.get("content","").replace("\n",""))
+    return {
+        "sha":           d.get("sha",""),
+        "size":          d.get("size", 0),
+        "html_url":      d.get("html_url",""),
+        "last_modified": d.get("last_modified",""),
+        "content":       raw.decode("utf-8", errors="replace"),
+        "lines":         len(raw.decode("utf-8", errors="replace").splitlines()),
+    }
+
+def github_diff_file(repo_path: str, local_path: str) -> dict:
+    """Compare local file to GitHub version.
+    Returns {changed: bool, added: int, removed: int, summary: str}"""
+    import difflib, os as _os
+    remote = github_get_file_info(repo_path)
+    if "error" in remote:
+        return {"changed": True, "added": 0, "removed": 0,
+                "summary": f"Cannot compare — {remote['error']}"}
+    try:
+        with open(local_path) as f:
+            local_lines = f.readlines()
+    except FileNotFoundError:
+        return {"changed": False, "added": 0, "removed": 0,
+                "summary": "Local file not found"}
+
+    remote_lines = remote["content"].splitlines(keepends=True)
+    diff = list(difflib.unified_diff(remote_lines, local_lines,
+                                     fromfile=f"github/{repo_path}",
+                                     tofile=f"local/{repo_path}", n=0))
+    added   = sum(1 for l in diff if l.startswith("+") and not l.startswith("+++"))
+    removed = sum(1 for l in diff if l.startswith("-") and not l.startswith("---"))
+    changed = added > 0 or removed > 0
+    summary = f"+{added} lines / -{removed} lines" if changed else "Up to date"
+    return {"changed": changed, "added": added, "removed": removed,
+            "summary": summary, "diff": "".join(diff[:120])}  # cap diff preview
+
+def github_push_file(repo_path: str, local_path: str,
+                     commit_message: str, sha: str = None) -> dict:
+    """Push a single local file to GitHub. sha required for updates."""
+    import base64 as _b64, requests as _req
+    try:
+        with open(local_path, "rb") as f:
+            encoded = _b64.b64encode(f.read()).decode()
+    except FileNotFoundError:
+        return {"ok": False, "message": f"Local file not found: {local_path}"}
+
+    payload = {"message": commit_message, "content": encoded, "branch": _GH_BRANCH}
+    if sha:
+        payload["sha"] = sha
+
+    r = _req.put(f"{_gh_base()}/{repo_path}",
+                 headers=_gh_headers(), json=payload, timeout=30)
+    if r.status_code in (200, 201):
+        commit_sha = r.json().get("commit",{}).get("sha","")[:7]
+        action = "updated" if sha else "created"
+        return {"ok": True, "message": f"{repo_path} {action} — commit {commit_sha}",
+                "commit_sha": commit_sha}
+    return {"ok": False,
+            "message": f"{repo_path}: HTTP {r.status_code} — {r.json().get('message','?')}"}
+
+def github_push_all(commit_message: str = None, files: list = None) -> dict:
+    """Push one or all managed files to GitHub.
+    files: list of repo_paths to push (None = all)"""
+    import datetime, os as _os
+    if not commit_message:
+        ts = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+        commit_message = f"chore: CRS Dashboard auto-sync [{ts}]"
+
+    app_dir  = _os.path.dirname(_os.path.abspath(__file__))
+    to_push  = files or list(_GH_FILES.keys())
+    results  = []
+    any_fail = False
+
+    for repo_path in to_push:
+        local_name = _GH_FILES.get(repo_path)
+        if not local_name:
+            results.append({"file": repo_path, "ok": False,
+                            "message": "Not in managed file list"})
+            continue
+        local_path = _os.path.join(app_dir, local_name)
+        # Get current SHA
+        info = github_get_file_info(repo_path)
+        sha  = info.get("sha") if "error" not in info else None
+        res  = github_push_file(repo_path, local_path, commit_message, sha)
+        res["file"] = repo_path
+        results.append(res)
+        if not res["ok"]:
+            any_fail = True
+
+    return {"ok": not any_fail, "results": results,
+            "commit_message": commit_message}
+
+def github_get_recent_commits(n: int = 5) -> list:
+    """Fetch the last n commits on the main branch."""
+    import requests as _req
+    try:
+        r = _req.get(
+            f"https://api.github.com/repos/{_GH_REPO}/commits",
+            headers=_gh_headers(),
+            params={"sha": _GH_BRANCH, "per_page": n},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return []
+        return [
+            {
+                "sha":     c["sha"][:7],
+                "message": c["commit"]["message"].split("\n")[0][:80],
+                "author":  c["commit"]["author"]["name"],
+                "date":    c["commit"]["author"]["date"][:16].replace("T"," "),
+                "url":     c["html_url"],
+            }
+            for c in r.json()
+        ]
+    except Exception:
+        return []
+
+
 def score_badge(score):
     if score is None or pd.isna(score):
         return "⚪ —"
@@ -3509,6 +3666,29 @@ Return ONLY a valid JSON object:
 # ══════════════════════════════════════════════
 with tab6:
     st.subheader("⚙️ Pipeline & Health")
+
+    # ── GitHub Self-Deploy ────────────────────────────────────────────────────
+    with st.expander("🚀 Push to GitHub", expanded=False):
+        st.caption(
+            "Pushes the running `streamlit_app.py` and `monday_client.py` directly "
+            "to `Drys-CRS/CRS-Lead-Gen` on GitHub. "
+            "Streamlit Cloud auto-deploys on commit."
+        )
+        gh_msg = st.text_input(
+            "Commit message (optional)",
+            placeholder="e.g. feat: add partner classification",
+            key="gh_commit_msg"
+        )
+        if st.button("🚀 Push to GitHub Now", key="btn_gh_push",
+                     help="Commits and pushes both app files to GitHub main branch"):
+            with st.spinner("Pushing to GitHub…"):
+                result = github_push_self(gh_msg.strip() or None)
+            if result["ok"]:
+                st.success(result["message"])
+                st.balloons()
+            else:
+                st.error(result["message"])
+    st.divider()
 
     # ── Scheduler status ──────────────────────────────────────────────────────
     sched_status = st.session_state.get(_SCHEDULER_KEY)
