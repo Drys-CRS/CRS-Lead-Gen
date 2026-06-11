@@ -130,14 +130,17 @@ groq_ai      = init_groq()
 cerebras_ai  = init_cerebras()
 openrouter_ai = init_openrouter()
 
-# Free models on OpenRouter — tried in order, first success wins.
-# All have :free suffix meaning $0/token. Falls through to next on failure.
+# OpenRouter model strategy:
+# 1. openrouter/free  — meta-router that auto-selects from all currently available
+#                       free models; never needs updating as models rotate in/out
+# 2. deepseek/deepseek-r1:free — explicit fallback, excellent at structured JSON
+# 3. deepseek/deepseek-v3:free — fast, reliable second fallback
+# 4. meta-llama/llama-4-maverick:free — strong reasoning third fallback
 _OPENROUTER_FREE_MODELS = [
-    "meta-llama/llama-3.3-70b-instruct:free",   # strong general reasoning
-    "deepseek/deepseek-r1:free",                  # excellent structured output
-    "mistralai/mistral-7b-instruct:free",         # fast, reliable fallback
-    "google/gemma-3-12b-it:free",                 # Google open model, good quality
-    "qwen/qwen3-14b:free",                        # Alibaba, strong reasoning
+    "openrouter/free",                   # auto-selects best available free model
+    "deepseek/deepseek-r1:free",         # explicit: great structured JSON output
+    "deepseek/deepseek-v3:free",         # explicit: fast general reasoning
+    "meta-llama/llama-4-maverick:free",  # explicit: strong reasoning fallback
 ]
 
 # ── Provider status shown in sidebar ──
