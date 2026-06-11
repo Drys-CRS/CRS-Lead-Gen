@@ -684,8 +684,18 @@ import time as _time
 
 @st.cache_resource
 def init_gemini():
-    genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-    return genai.GenerativeModel("gemini-2.5-flash")
+    try:
+        key = st.secrets.get("GEMINI_API_KEY", "")
+        if not key:
+            return None
+        if _GENAI_NEW:
+            return genai.Client(api_key=key)
+        else:
+            genai.configure(api_key=key)
+            return genai.GenerativeModel("gemini-2.5-flash")
+    except Exception as e:
+        st.error(f"Gemini init error: {e}")
+        return None
 
 @st.cache_resource
 def init_groq():
@@ -1172,7 +1182,6 @@ def fetch_tenders():
         st.error(f"Error fetching open tenders: {e}")
         return pd.DataFrame()
 
-@st.cache_data(ttl=300)
 @st.cache_data(ttl=300)
 def fetch_awarded_tenders():
     """Fetch awarded tenders from the dedicated awarded_tenders table."""
