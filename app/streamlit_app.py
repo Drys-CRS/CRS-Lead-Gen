@@ -2207,6 +2207,231 @@ def _classify_authority(contact: dict) -> dict:
     return {"authority": fallback, "opener": ""}
 
 
+def _apollo_people_match(name: str = "", first: str = "", last: str = "",
+                         company: str = "", domain: str = "") -> dict:
+    """Apollo People Enrichment (POST people/match) — reveal email/phone for ONE
+    *known* person. Unlike People Search, this is available on Basic plans
+    (1 credit per match). Returns {} on no key / 403 / no match."""
+    import requests
+    try:
+        key = st.secrets.get("APOLLO_API_KEY", "")
+    except Exception:
+        key = ""
+    if not key:
+        return {}
+    if not first and not last and name:
+        parts = name.strip().split()
+        first = parts[0] if parts else ""
+        last = " ".join(parts[1:]) if len(parts) > 1 else ""
+    if not (first or company or domain):
+        return {}
+    headers = {"Content-Type": "application/json", "Cache-Control": "no-cache",
+               "x-api-key": key}
+    payload = {"reveal_personal_emails": False}
+    if first:   payload["first_name"] = first
+    if last:    payload["last_name"] = last
+    if company: payload["organization_name"] = company
+    if domain:  payload["domain"] = domain
+    try:
+        r = requests.post("https://api.apollo.io/api/v1/people/match",
+                          json=payload, headers=headers, timeout=20)
+        if not r.ok:
+            st.session_state["_apollo_match_diag"] = f"people/match HTTP {r.status_code}: {r.text[:80]}"
+            return {}
+        p = r.json().get("person") or {}
+        phones = p.get("phone_numbers") or []
+        phone = ""
+        if phones and isinstance(phones, list):
+            ph0 = phones[0] or {}
+            phone = ph0.get("sanitized_number") or ph0.get("raw_number") or ""
+        org = p.get("organization") or {}
+        return {
+            "email":    p.get("email", "") or "",
+            "phone":    phone,
+            "title":    p.get("title", "") or "",
+            "linkedin": p.get("linkedin_url", "") or "",
+            "domain":   org.get("primary_domain", "") or "",
+        }
+    except Exception:
+        return {}
+
+
+def _verify_process_contacts(raw: list, use_lusha: bool, classify: bool, threshold: int,
+                             default_country: str = "", apollo_match: bool = False,
+                             base_provider: str = None, vlog=None):
+    """Shared cascade processor used by both Lead-Verification modes (Discover and
+    Enrich-seed-list). For each contact: optional Apollo people/match enrich →
+    Lusha gap-fill → validate/normalise → score → AI authority classification →
+    verified/quarantine split. Returns (results, provider_counts)."""
+    def _log(m):
+        if vlog:
+            vlog(m)
+    results, counts = [], {"Apollo": 0, "Lusha": 0}
+    seen = set()
+    for c in raw:
+        chain = []
+        if base_provider:
+            chain.append(base_provider)
+            counts[base_provider] = counts.get(base_provider, 0) + 1
+
+        # Apollo people/match (seed-list mode — enrich a known person)
+        if apollo_match and (not c.get("email") or not c.get("phone")):
+            am = _apollo_people_match(c.get("name", ""), c.get("first", ""),
+                                      c.get("last", ""), c.get("company", ""),
+                                      c.get("domain", ""))
+            if am and (am.get("email") or am.get("phone")):
+                if "Apollo" not in chain:
+                    chain.append("Apollo")
+                counts["Apollo"] += 1
+                c["email"]    = c.get("email") or am.get("email", "")
+                c["phone"]    = c.get("phone") or am.get("phone", "")
+                c["title"]    = c.get("title") or am.get("title", "")
+                c["linkedin"] = c.get("linkedin") or am.get("linkedin", "")
+                c["domain"]   = c.get("domain") or am.get("domain", "")
+                _log(f"[Apollo] {c.get('name')} → enriched (people/match).")
+
+        # Dedup within run
+        k = (c.get("email") or c.get("linkedin") or c.get("name") or "").lower()
+        if k in seen:
+            _log(f"[Dedup] {c.get('name')} skipped (duplicate in run).")
+            continue
+        seen.add(k)
+
+        # Lusha gap-fill for phone / email
+        if use_lusha and (not c.get("phone") or not _valid_email(c.get("email"))):
+            lu = _lusha_enrich_person(c.get("first", ""), c.get("last", ""),
+                                      c.get("company", ""), c.get("domain", ""),
+                                      c.get("email", ""), c.get("linkedin", ""))
+            if lu and (lu.get("phone") or lu.get("email")):
+                if "Lusha" not in chain:
+                    chain.append("Lusha")
+                counts["Lusha"] += 1
+                c["phone"]    = c.get("phone") or lu.get("phone", "")
+                c["email"]    = c.get("email") or lu.get("email", "")
+                c["title"]    = c.get("title") or lu.get("title", "")
+                c["linkedin"] = c.get("linkedin") or lu.get("linkedin", "")
+                _log(f"[Lusha] {c.get('name')} → phone/email enriched.")
+
+        # Validate + normalise + score
+        c["country"] = c.get("country") or default_country
+        c["phone"] = _normalize_phone(c.get("phone", ""), c.get("country", ""))
+        c["email_valid"] = _valid_email(c.get("email"))
+        c["accuracy_score"] = _verification_score(c)
+        c["provider_chain"] = " → ".join(chain) if chain else "—"
+
+        # AI authority classification + opener
+        if classify:
+            cls = _classify_authority(c)
+            c["authority"] = cls.get("authority", "")
+            c["opener"]    = cls.get("opener", "")
+        else:
+            c["authority"] = ""
+            c["opener"]    = ""
+
+        c["status"] = "Verified" if c["accuracy_score"] >= int(threshold) else "Quarantine"
+        results.append(c)
+    return results, counts
+
+
+def _parse_linkedin_result(title: str, snippet: str, url: str,
+                           searched_title: str = "", default_country: str = "") -> dict:
+    """Turn a Google result for a linkedin.com/in/ profile into a contact dict.
+    LinkedIn titles look like '<Name> - <headline> | … | LinkedIn'; snippets often
+    carry 'Experience: <Company> · … · Location: <Place>'."""
+    t = (title or "")
+    for tail in (" | LinkedIn", " - LinkedIn", " | Professional Profile"):
+        t = t.replace(tail, "")
+    t = t.strip()
+    name, headline = t, ""
+    for sep in (" - ", " – ", " — "):
+        if sep in t:
+            name, headline = t.split(sep, 1)
+            break
+    name = name.strip()
+    # Drop obvious non-person results (data brokers, generic pages)
+    if not name or len(name) > 60 or name.lower().startswith(("data ", "linkedin")):
+        return {}
+    parts = name.split()
+    first = parts[0] if parts else ""
+    last = " ".join(parts[1:]) if len(parts) > 1 else ""
+
+    snip = snippet or ""
+    company = ""
+    m = _re.search(r"Experience:\s*([^·|]+)", snip)
+    if m:
+        company = m.group(1).strip()
+    location = ""
+    m2 = _re.search(r"Location:\s*([^·|]+)", snip)
+    if m2:
+        location = m2.group(1).strip()
+
+    # Prefer the searched title; otherwise the first headline segment if it looks like a role
+    job = searched_title or ""
+    if not job and headline:
+        seg = headline.split("|")[0].strip()
+        if seg and not _re.search(r",|South Africa|Nigeria|Kenya|Ghana|Egypt|Cape Town|Johannesburg", seg):
+            job = seg
+
+    return {
+        "name": name, "first": first, "last": last,
+        "title": job, "company": company, "domain": "",
+        "email": "", "phone": "",
+        "linkedin": (url or "").split("?")[0],
+        "country": default_country, "location": location,
+        "headline": headline.replace(" | ", " ").strip()[:140],
+    }
+
+
+def _google_dork_linkedin(term: str, country: str = "", max_results: int = 20) -> list:
+    """Run a Google dork (site:linkedin.com/in/ "term" "country") via the Google
+    Custom Search JSON API and return parsed LinkedIn contacts. Needs
+    GOOGLE_API_KEY + GOOGLE_CSE_ID in st.secrets (free tier = 100 queries/day).
+    Writes a diagnostic to st.session_state['_google_dork_diag']."""
+    import requests
+    try:
+        key = st.secrets.get("GOOGLE_API_KEY", "")
+        cse = st.secrets.get("GOOGLE_CSE_ID", "")
+    except Exception:
+        key, cse = "", ""
+    if not (key and cse):
+        st.session_state["_google_dork_diag"] = "no GOOGLE_API_KEY / GOOGLE_CSE_ID"
+        return []
+    q = f'site:linkedin.com/in/ "{term}"'
+    if country:
+        q += f' "{country}"'
+    out, start = [], 1
+    pages = max(1, min((int(max_results) + 9) // 10, 10))
+    try:
+        for _ in range(pages):
+            r = requests.get("https://www.googleapis.com/customsearch/v1",
+                             params={"key": key, "cx": cse, "q": q,
+                                     "num": 10, "start": start}, timeout=20)
+            if not r.ok:
+                st.session_state["_google_dork_diag"] = (
+                    f"Custom Search HTTP {r.status_code}: {r.text[:90]}")
+                break
+            items = r.json().get("items", []) or []
+            if not items:
+                break
+            for it in items:
+                link = it.get("link", "")
+                if "linkedin.com/in/" not in link:
+                    continue
+                p = _parse_linkedin_result(it.get("title", ""), it.get("snippet", ""),
+                                           link, searched_title=term, default_country=country)
+                if p:
+                    out.append(p)
+            start += 10
+            if len(out) >= int(max_results):
+                break
+        st.session_state["_google_dork_diag"] = (
+            st.session_state.get("_google_dork_diag", "") or
+            f"{len(out)} LinkedIn profile(s) parsed")
+    except Exception as e:
+        st.session_state["_google_dork_diag"] = f"dork error: {e}"
+    return out[: int(max_results)]
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # GITHUB SYNC MODULE
 # ═══════════════════════════════════════════════════════════════════════════
@@ -4893,9 +5118,10 @@ Return ONLY a valid JSON object:
 # ══════════════════════════════════════════════
 with tab_verify:
     st.subheader("✅ Lead Verification")
-    st.caption("Find and verify decision-maker contacts through a waterfall cascade "
-               "(**Apollo → Lusha**), validate + score them, AI-classify buying authority, "
-               "and push verified leads to Monday. Quarantines low-confidence contacts for review.")
+    st.caption("Discover decision-makers via **Google dorking → LinkedIn**, then run the "
+               "enrichment cascade (**Apollo + Lusha** by LinkedIn URL), validate + score, "
+               "AI-classify buying authority, and push verified leads to Monday. "
+               "Low-confidence contacts are quarantined for review.")
 
     _has_apollo = bool(st.secrets.get("APOLLO_API_KEY", "")) if hasattr(st, "secrets") else False
     _has_lusha  = bool(st.secrets.get("LUSHA_API_KEY", "")) if hasattr(st, "secrets") else False
@@ -4923,36 +5149,131 @@ with tab_verify:
         elif _lu.get("_error"):
             st.caption(f"Lusha credit check unavailable ({_lu['_error']}).")
 
-    # ── Step 1: input trigger / filters ────────────────────────────────────
-    st.markdown("#### 1 · Target filters")
-    vf1, vf2 = st.columns(2)
-    with vf1:
-        v_titles = multiselect_all(
-            "Job titles / ICP",
-            ["CISO", "CIO", "CTO", "IT Director", "Head of Cybersecurity", "IT Manager",
-             "Head of IT", "Security Manager", "Procurement Manager", "L&D Manager",
-             "Head of Infrastructure", "Network Manager", "CEO", "CFO", "Managing Director"],
-            key="verify_titles",
-            default=["CISO", "IT Director", "Head of Cybersecurity"],
-        )
-        v_company = st.text_input("Company (optional — narrows to one org)", key="verify_company")
-    with vf2:
-        v_countries = multiselect_all(
-            "Target countries",
-            ["South Africa", "Nigeria", "Kenya", "Ghana", "Egypt", "Morocco",
-             "Tanzania", "Uganda", "Zambia", "Rwanda", "Ethiopia", "Senegal"],
-            key="verify_countries",
-            default=["South Africa"],
-        )
-        vc1, vc2 = st.columns(2)
-        v_limit = vc1.number_input("Max contacts", 1, 25, 10, key="verify_limit")
-        v_threshold = vc2.number_input("Min score (verified)", 0, 100, 60, step=5, key="verify_threshold")
-    v_use_lusha = st.checkbox("Use Lusha for phone/email gap-fill (Layer 3)", value=_has_lusha,
+    # ── Mode selector ──────────────────────────────────────────────────────
+    st.markdown("#### 1 · Choose mode")
+    v_mode = st.radio(
+        "How do you want to source contacts?",
+        ["🔎 Google Dork → LinkedIn (discover, works on current plans)",
+         "📋 Enrich a seed list (paste contacts)",
+         "🔍 Discover (Apollo People Search) — needs Apollo plan with Search API"],
+        key="verify_mode",
+    )
+    dork_mode     = v_mode.startswith("🔎")
+    discover_mode = v_mode.startswith("🔍")
+
+    # Shared options
+    oc1, oc2 = st.columns(2)
+    v_threshold = oc1.number_input("Min score (verified)", 0, 100, 60, step=5, key="verify_threshold")
+    default_country = oc2.selectbox(
+        "Default country (for phone codes / blanks)",
+        ["South Africa", "Nigeria", "Kenya", "Ghana", "Egypt", "Morocco",
+         "Tanzania", "Uganda", "Zambia", "Rwanda", "Ethiopia", "Senegal"],
+        key="verify_default_country",
+    )
+    v_use_lusha = st.checkbox("Use Lusha for phone/email enrichment", value=_has_lusha,
                               disabled=not _has_lusha, key="verify_use_lusha")
     v_classify  = st.checkbox("AI-classify authority + draft outreach opener", value=True, key="verify_classify")
 
-    run_verify = st.button("▶️ Run Cascade", type="primary", key="verify_run",
-                           disabled=not _has_apollo)
+    raw_contacts, run_verify = [], False
+
+    if dork_mode:
+        _has_google = (bool(st.secrets.get("GOOGLE_API_KEY", "")) and
+                       bool(st.secrets.get("GOOGLE_CSE_ID", ""))) if hasattr(st, "secrets") else False
+        if not _has_google:
+            st.info("This mode runs a Google dork via the **Custom Search JSON API**. "
+                    "Add **GOOGLE_API_KEY** and **GOOGLE_CSE_ID** to Streamlit secrets "
+                    "(free tier = 100 queries/day). Create a Programmable Search Engine at "
+                    "programmablesearchengine.google.com set to search the entire web, then "
+                    "grab an API key from the Google Cloud console.")
+        st.markdown("Builds: `site:linkedin.com/in/ \"<term>\" \"<country>\"` per term, "
+                    "collects LinkedIn profiles, then enriches via Lusha (by LinkedIn URL) "
+                    "+ Apollo, scores and classifies.")
+        gd1, gd2 = st.columns(2)
+        with gd1:
+            v_terms = multiselect_all(
+                "Search terms (titles / technologies / keywords)",
+                ["CISO", "CIO", "CTO", "IT Director", "Head of Cybersecurity", "IT Manager",
+                 "Head of IT", "Security Manager", "Procurement Manager",
+                 "VECTRA", "vRx", "Aikido", "SIEM", "SOC", "penetration testing",
+                 "vulnerability management", "Red Hat", "IBM"],
+                key="dork_terms",
+                default=["CISO", "Head of Cybersecurity"],
+            )
+            v_extra = st.text_input("Add a custom term (optional, e.g. a company name)", key="dork_extra")
+        with gd2:
+            v_dork_countries = multiselect_all(
+                "Countries",
+                ["South Africa", "Nigeria", "Kenya", "Ghana", "Egypt", "Morocco",
+                 "Tanzania", "Uganda", "Zambia", "Rwanda", "Ethiopia", "Senegal"],
+                key="dork_countries",
+                default=["South Africa"],
+            )
+            v_per_term = st.number_input("Max profiles per term×country", 10, 100, 20, step=10,
+                                         key="dork_per_term")
+        _terms_all = list(v_terms) + ([v_extra.strip()] if v_extra.strip() else [])
+        _n_queries = max(1, len(_terms_all)) * max(1, len(v_dork_countries))
+        st.caption(f"Will run ~{_n_queries} dork quer{'y' if _n_queries==1 else 'ies'} "
+                   f"(counts against your 100/day Custom Search quota).")
+        run_verify = st.button("▶️ Run Dork + Cascade", type="primary",
+                               key="verify_run_dork", disabled=not _has_google or not _terms_all)
+
+    elif discover_mode:
+        st.info("⚠️ **Discover** uses Apollo's People Search API. Your current Apollo key "
+                "returned **403 — not accessible with this api_key**, meaning your plan doesn't "
+                "include net-new People Search. This mode will keep returning 0 until that plan is "
+                "upgraded. Use **Google Dork** or **Enrich a seed list**, which work on your current plans.")
+        df1, df2 = st.columns(2)
+        with df1:
+            v_titles = multiselect_all(
+                "Job titles / ICP",
+                ["CISO", "CIO", "CTO", "IT Director", "Head of Cybersecurity", "IT Manager",
+                 "Head of IT", "Security Manager", "Procurement Manager", "L&D Manager",
+                 "Head of Infrastructure", "Network Manager", "CEO", "CFO", "Managing Director"],
+                key="verify_titles",
+                default=["CISO", "IT Director", "Head of Cybersecurity"],
+            )
+            v_company = st.text_input("Company (optional)", key="verify_company")
+        with df2:
+            v_countries = multiselect_all(
+                "Target countries",
+                ["South Africa", "Nigeria", "Kenya", "Ghana", "Egypt", "Morocco",
+                 "Tanzania", "Uganda", "Zambia", "Rwanda", "Ethiopia", "Senegal"],
+                key="verify_countries",
+                default=["South Africa"],
+            )
+            v_limit = st.number_input("Max contacts", 1, 25, 10, key="verify_limit")
+        run_verify = st.button("▶️ Run Discover Cascade", type="primary",
+                               key="verify_run_discover", disabled=not _has_apollo)
+    else:
+        st.markdown("Paste contacts — **one per line** as `Name, Company` "
+                    "(optionally `Name, Company, Title, Country`). The cascade enriches each "
+                    "via Apollo people/match + Lusha, then scores and classifies them.")
+        seed_text = st.text_area(
+            "Seed contacts",
+            height=160,
+            placeholder="Thabo Nkosi, Absa Group, CTO, South Africa\nAmara Okonkwo, Zenith Bank, CISO, Nigeria",
+            key="verify_seed",
+        )
+        v_limit = st.number_input("Max rows to process", 1, 50, 25, key="verify_seed_limit")
+        for line in (seed_text or "").splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if not parts or not parts[0]:
+                continue
+            nm = parts[0]
+            first = nm.split()[0] if nm.split() else ""
+            last = " ".join(nm.split()[1:]) if len(nm.split()) > 1 else ""
+            raw_contacts.append({
+                "name": nm, "first": first, "last": last,
+                "company": parts[1] if len(parts) > 1 else "",
+                "title":   parts[2] if len(parts) > 2 else "",
+                "country": parts[3] if len(parts) > 3 else "",
+                "domain": "", "email": "", "phone": "", "linkedin": "",
+            })
+        if raw_contacts:
+            st.caption(f"Parsed {len(raw_contacts)} contact(s).")
+        run_verify = st.button("▶️ Run Enrichment Cascade", type="primary",
+                               key="verify_run_seed",
+                               disabled=not (_has_apollo or _has_lusha) or not raw_contacts)
 
     if run_verify:
         log_box = st.empty()
@@ -4960,83 +5281,73 @@ with tab_verify:
         def _vlog(m):
             _log.append(m)
             log_box.code("\n".join(_log[-16:]))
-
         try:
-            # ── Step 2: cascade enrichment ────────────────────────────────
-            _vlog("[Apollo] Searching contacts by title / country…")
-            people = _apollo_people_search(v_titles, v_countries, v_company.strip(),
-                                           per_page=int(v_limit))
-            _adiag = st.session_state.get("_apollo_people_diag", "")
-            if _adiag:
-                _vlog(f"[Apollo] {_adiag}")
-            _vlog(f"[Apollo] Found {len(people)} contact(s).")
-
-            results, provider_counts = [], {"Apollo": 0, "Lusha": 0}
-            seen = set()
-            for c in people[: int(v_limit)]:
-                chain = ["Apollo"]
-                provider_counts["Apollo"] += 1
-
-                # Step 3: dedup within this run (email → phone → linkedin → name)
-                k = (c.get("email") or c.get("linkedin") or c.get("name") or "").lower()
-                if k in seen:
-                    _vlog(f"[Dedup] {c.get('name')} skipped (duplicate in run).")
-                    continue
-                seen.add(k)
-
-                # Layer 3: Lusha gap-fill for phone / email
-                if v_use_lusha and (not c.get("phone") or not _valid_email(c.get("email"))):
-                    lu = _lusha_enrich_person(c.get("first",""), c.get("last",""),
-                                              c.get("company",""), c.get("domain",""),
-                                              c.get("email",""), c.get("linkedin",""))
-                    if lu:
-                        chain.append("Lusha")
-                        provider_counts["Lusha"] += 1
-                        c["phone"]    = c.get("phone") or lu.get("phone","")
-                        c["email"]    = c.get("email") or lu.get("email","")
-                        c["title"]    = c.get("title") or lu.get("title","")
-                        c["linkedin"] = c.get("linkedin") or lu.get("linkedin","")
-                        _vlog(f"[Lusha] {c.get('name')} → phone/email enriched.")
-
-                # Step 4: validate + normalise + score
-                c["phone"] = _normalize_phone(c.get("phone",""), c.get("country",""))
-                c["email_valid"] = _valid_email(c.get("email"))
-                c["accuracy_score"] = _verification_score(c)
-                c["provider_chain"] = " → ".join(chain)
-
-                # Step 5: AI authority classification + opener
-                if v_classify:
-                    cls = _classify_authority(c)
-                    c["authority"] = cls.get("authority","")
-                    c["opener"]    = cls.get("opener","")
-                else:
-                    c["authority"] = ""
-                    c["opener"]    = ""
-
-                # Step 6: verified vs quarantine
-                c["status"] = "Verified" if c["accuracy_score"] >= int(v_threshold) else "Quarantine"
-                results.append(c)
+            if dork_mode:
+                seen_urls = set()
+                for term in _terms_all:
+                    for ctry in (v_dork_countries or [""]):
+                        _vlog(f'[Dork] site:linkedin.com/in/ "{term}" "{ctry}"…')
+                        hits = _google_dork_linkedin(term, ctry, max_results=int(v_per_term))
+                        _gdiag = st.session_state.get("_google_dork_diag", "")
+                        if _gdiag:
+                            _vlog(f"[Dork] {_gdiag}")
+                        for h in hits:
+                            u = (h.get("linkedin") or "").lower()
+                            if u and u in seen_urls:
+                                continue
+                            if u:
+                                seen_urls.add(u)
+                            raw_contacts.append(h)
+                _vlog(f"[Dork] {len(raw_contacts)} unique LinkedIn profile(s) collected.")
+                results, provider_counts = _verify_process_contacts(
+                    raw_contacts, v_use_lusha, v_classify, int(v_threshold),
+                    default_country=default_country, apollo_match=_has_apollo,
+                    base_provider="LinkedIn", vlog=_vlog)
+                _mdiag = st.session_state.get("_apollo_match_diag", "")
+                if _mdiag:
+                    _vlog(f"[Apollo] {_mdiag}")
+            elif discover_mode:
+                _vlog("[Apollo] Searching contacts by title / country…")
+                raw_contacts = _apollo_people_search(v_titles, v_countries, v_company.strip(),
+                                                     per_page=int(v_limit))
+                _adiag = st.session_state.get("_apollo_people_diag", "")
+                if _adiag:
+                    _vlog(f"[Apollo] {_adiag}")
+                _vlog(f"[Apollo] Found {len(raw_contacts)} contact(s).")
+                results, provider_counts = _verify_process_contacts(
+                    raw_contacts[: int(v_limit)], v_use_lusha, v_classify, int(v_threshold),
+                    default_country=default_country, apollo_match=False,
+                    base_provider="Apollo", vlog=_vlog)
+            else:
+                _vlog(f"[Seed] Enriching {len(raw_contacts)} contact(s)…")
+                results, provider_counts = _verify_process_contacts(
+                    raw_contacts[: int(v_limit)], v_use_lusha, v_classify, int(v_threshold),
+                    default_country=default_country, apollo_match=_has_apollo,
+                    base_provider=None, vlog=_vlog)
+                _mdiag = st.session_state.get("_apollo_match_diag", "")
+                if _mdiag:
+                    _vlog(f"[Apollo] {_mdiag}")
 
             _vlog(f"[Score] {sum(1 for r in results if r['status']=='Verified')} verified · "
                   f"{sum(1 for r in results if r['status']=='Quarantine')} quarantined.")
 
-            # Step 8: log the run to Supabase
+            # Log run to Supabase
             try:
                 rows = [{
-                    "target_company": v_company.strip() or None,
-                    "country": (r.get("country") or (v_countries[0] if v_countries else "")),
-                    "title": r.get("title",""),
-                    "contact_name": r.get("name",""),
-                    "contact_title": r.get("title",""),
-                    "company": r.get("company",""),
-                    "email": r.get("email",""),
-                    "phone": r.get("phone",""),
-                    "linkedin": r.get("linkedin",""),
-                    "provider_chain": r.get("provider_chain",""),
-                    "accuracy_score": int(r.get("accuracy_score",0)),
-                    "authority": r.get("authority",""),
-                    "status": r.get("status",""),
-                    "cost_estimate": round(0.03 * len(r.get("provider_chain","").split("→")), 3),
+                    "target_company": (v_company.strip() if discover_mode else None) or None,
+                    "country": r.get("country") or default_country,
+                    "title": r.get("title", ""),
+                    "contact_name": r.get("name", ""),
+                    "contact_title": r.get("title", ""),
+                    "company": r.get("company", ""),
+                    "email": r.get("email", ""),
+                    "phone": r.get("phone", ""),
+                    "linkedin": r.get("linkedin", ""),
+                    "provider_chain": r.get("provider_chain", ""),
+                    "accuracy_score": int(r.get("accuracy_score", 0)),
+                    "authority": r.get("authority", ""),
+                    "status": r.get("status", ""),
+                    "cost_estimate": round(0.03 * max(1, len(r.get("provider_chain", "").split("→"))), 3),
                 } for r in results]
                 if rows:
                     supabase.table("lead_verification_log").insert(rows).execute()
@@ -5066,6 +5377,7 @@ with tab_verify:
             "Name": r.get("name",""), "Title": r.get("title",""),
             "Company": r.get("company",""), "Authority": r.get("authority",""),
             "Email": r.get("email",""), "Phone": r.get("phone",""),
+            "LinkedIn": r.get("linkedin",""),
             "Score": r.get("accuracy_score",0), "Source": r.get("provider_chain",""),
             "Status": r.get("status",""),
         } for r in results])
