@@ -302,14 +302,18 @@ def scrape_non_ocds_countries(out):
 
 
 
-def run_pipeline(trigger: str = "scheduled"):
+def run_pipeline(trigger: str = "scheduled", years_back: int = 3, skip_scrape: bool = False,
+                 live_out=None):
     """
     Full autonomous pipeline:
-    1. Scrape all countries
+    1. Scrape all countries (skipped when skip_scrape=True — e.g. when a refresh
+       has just run, so we go straight to AI on the fresh data)
     2. Score all new open tenders → append to tender_score_history
     3. Run partner analysis → append to partner_recommendation_history
     4. Collect attack signals + score → append to attack_signal_history
     5. Mark pipeline_run as complete
+
+    `live_out`, if provided, is called with each log line for live UI feedback.
     """
     import time as _pt
     t_start = _pt.time()
@@ -319,6 +323,11 @@ def run_pipeline(trigger: str = "scheduled"):
 
     def out(msg):
         log_lines.append(msg)
+        if live_out:
+            try:
+                live_out(msg)
+            except Exception:
+                pass
 
     # Create pipeline run record
     try:
@@ -333,20 +342,24 @@ def run_pipeline(trigger: str = "scheduled"):
 
     try:
         # ── 1. Scrape ──────────────────────────────────────────────────────
-        out("Starting scrape…")
-        scrape_south_africa(out)
-        for country in OCDS_REGISTRY:
-            if country != "South Africa":
-                try:
-                    scrape_ocds_country(country, out)
-                except Exception as e:
-                    out(f"  ❌ {country}: {e}")
-        try:
-            out("Scraping non-OCDS countries via World Bank & UNDP…")
-            scrape_non_ocds_countries(out)
-        except Exception as e:
-            out(f"  ❌ Non-OCDS scraper: {e}")
-        st.cache_data.clear()
+        if not skip_scrape:
+            out("Starting scrape…")
+            scrape_south_africa(out)
+            for country in OCDS_REGISTRY:
+                if country != "South Africa":
+                    try:
+                        scrape_ocds_country(country, out, years_back)
+                    except Exception as e:
+                        out(f"  ❌ {country}: {e}")
+            try:
+                out("Scraping non-OCDS countries via World Bank & UNDP…")
+                scrape_non_ocds_countries(out)
+            except Exception as e:
+                out(f"  ❌ Non-OCDS scraper: {e}")
+            st.cache_data.clear()
+        else:
+            out("Skipping scrape — running AI analysis on freshly-refreshed data.")
+            st.cache_data.clear()
 
         # Reload fresh data
         tenders_df = fetch_tenders()
@@ -415,7 +428,8 @@ def run_pipeline(trigger: str = "scheduled"):
                             "why":              str(p.get("why_aligned",""))[:500],
                             "outreach_angle":   str(p.get("outreach_angle",""))[:500],
                             "urgency":          str(p.get("urgency",""))[:20],
-                            "partnership_type": str(p.get("partnership_type",""))[:100],
+                            "partnership_type": str(p.get("partner_classification")
+                                                    or p.get("partnership_type", ""))[:100],
                         })
                     if partner_rows:
                         supabase.table("partner_recommendation_history").insert(partner_rows).execute()
@@ -851,17 +865,17 @@ def _clean(raw: str) -> str:
 def _is_rate_limit(err: str) -> bool:
     return any(x in err.lower() for x in ["429", "quota", "rate limit", "too many", "throttl"])
 
-def _call_groq(prompt: str) -> str:
+def _call_groq(prompt: str, max_tokens: int = 2000) -> str:
     """Call Groq (llama-3.3-70b-versatile). Raises on any error."""
     resp = groq_ai.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[{"role": "user", "content": prompt}],
         temperature=0.2,
-        max_tokens=1500,
+        max_tokens=max_tokens,
     )
     return _clean(resp.choices[0].message.content)
 
-def _call_cerebras(prompt: str) -> str:
+def _call_cerebras(prompt: str, max_tokens: int = 2000) -> str:
     """Call Cerebras. Current public models per inference-docs.cerebras.ai June 2026:
       gpt-oss-120b  (production, reasoning model)
       zai-glm-4.7   (preview, high quality)
@@ -873,7 +887,7 @@ def _call_cerebras(prompt: str) -> str:
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.2,
-                max_tokens=1500,
+                max_tokens=max_tokens,
             )
             msg  = resp.choices[0].message
             text = (getattr(msg, "content", None) or
@@ -888,7 +902,7 @@ def _call_cerebras(prompt: str) -> str:
             raise
     raise ValueError("All Cerebras models unavailable — check inference-docs.cerebras.ai")
 
-def _call_github(prompt: str) -> str:
+def _call_github(prompt: str, max_tokens: int = 2000) -> str:
     """Call GitHub Models — free with any GitHub account, OpenAI-compatible."""
     last_err = None
     for model in _GITHUB_FREE_MODELS:
@@ -897,7 +911,7 @@ def _call_github(prompt: str) -> str:
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.2,
-                max_tokens=1500,
+                max_tokens=max_tokens,
             )
             text = (resp.choices[0].message.content or "").strip()
             if text:
@@ -913,7 +927,7 @@ def _call_github(prompt: str) -> str:
     raise RuntimeError(f"All GitHub Models failed. Last: {last_err}")
 
 
-def _call_openrouter(prompt: str) -> str:
+def _call_openrouter(prompt: str, max_tokens: int = 2000) -> str:
     """Call OpenRouter — cascades through free :free models until one succeeds."""
     last_err = None
     for model in _OPENROUTER_FREE_MODELS:
@@ -922,7 +936,7 @@ def _call_openrouter(prompt: str) -> str:
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.2,
-                max_tokens=1500,
+                max_tokens=max_tokens,
                 timeout=30,
             )
             text = (resp.choices[0].message.content or "").strip()
@@ -940,7 +954,7 @@ def _call_openrouter(prompt: str) -> str:
     raise RuntimeError(f"All OpenRouter free models failed. Last: {last_err}")
 
 
-def _call_gemini(prompt: str, retries: int = 3) -> str:
+def _call_gemini(prompt: str, max_tokens: int = 2000, retries: int = 3) -> str:
     """Call Gemini with backoff. Handles both new google.genai and legacy SDK."""
     if ai is None:
         raise RuntimeError("Gemini not initialised — check GEMINI_API_KEY in secrets.")
@@ -968,7 +982,7 @@ def _call_gemini(prompt: str, retries: int = 3) -> str:
                 raise
     raise RuntimeError("Gemini quota exceeded after retries.")
 
-def _call_ai(prompt: str) -> str:
+def _call_ai(prompt: str, max_tokens: int = 2000) -> str:
     """Smart cascade: Groq → Cerebras → Gemini.
     Skips any provider that has exhausted its daily budget.
     Raises only if ALL providers fail."""
@@ -1003,8 +1017,9 @@ def _call_ai(prompt: str) -> str:
     last_err = None
     for name, fn in providers:
         try:
-            result = fn(prompt)
+            result = fn(prompt, max_tokens)
             _increment_usage(name)   # track successful call
+            st.session_state["_last_ai_provider"] = name
             return result
         except Exception as e:
             last_err = e
@@ -1126,7 +1141,7 @@ def ai_analyse_partners(awarded_df) -> list:
         "[" + schema_example + ", ...]"
     )
 
-    raw = _call_ai(prompt)
+    raw = _call_ai(prompt, max_tokens=6000)
 
     # ── Robust JSON extraction ──────────────────────────────────────────────
     import re as _re2
@@ -1191,7 +1206,7 @@ def _safe_json(raw: str, expect_list: bool = True):
         return results[0] if results else {}
 
 
-def _call_nvidia(prompt: str) -> str:
+def _call_nvidia(prompt: str, max_tokens: int = 2000) -> str:
     """Call NVIDIA NIM — 100+ open-weight models, 40 RPM free tier.
     Primary: meta/llama-3.3-70b-instruct
     Fallback: mistralai/mistral-large-2411, nvidia/llama-3.3-nemotron-super-49b-v1
@@ -1206,7 +1221,7 @@ def _call_nvidia(prompt: str) -> str:
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.2,
-                max_tokens=1500,
+                max_tokens=max_tokens,
             )
             text = (resp.choices[0].message.content or "").strip()
             if text:
@@ -1219,7 +1234,7 @@ def _call_nvidia(prompt: str) -> str:
     raise RuntimeError("All NVIDIA NIM models failed")
 
 
-def _call_deepseek(prompt: str) -> str:
+def _call_deepseek(prompt: str, max_tokens: int = 2000) -> str:
     """Call DeepSeek API — 5M free tokens on signup, very low cost after.
     deepseek-v4-flash: fast, cheap ($0.28/M input)
     deepseek-v4-pro: frontier quality (~GPT-5 class)
@@ -1231,7 +1246,7 @@ def _call_deepseek(prompt: str) -> str:
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.2,
-                max_tokens=1500,
+                max_tokens=max_tokens,
             )
             text = (resp.choices[0].message.content or "").strip()
             if text:
@@ -1393,11 +1408,19 @@ def fetch_tenders():
 
 @st.cache_data(ttl=300)
 def fetch_awarded_tenders():
-    """Fetch awarded tenders from the dedicated awarded_tenders table.
-    Uses select("*") — returns all 5000+ records regardless of open-tender country filter."""
+    """Fetch ALL awarded tenders from the dedicated awarded_tenders table.
+    Paginates past Supabase's 1000-row API cap so large tables (5000+ rows)
+    are returned in full instead of silently truncated."""
     try:
-        response = supabase.table("awarded_tenders").select("*").execute()
-        df = pd.DataFrame(response.data)
+        rows, step, start = [], 1000, 0
+        while True:
+            batch = (supabase.table("awarded_tenders").select("*")
+                     .range(start, start + step - 1).execute().data) or []
+            rows.extend(batch)
+            if len(batch) < step:
+                break
+            start += step
+        df = pd.DataFrame(rows)
         if df.empty:
             raise ValueError("awarded_tenders table is empty or missing")
         return df
@@ -1417,6 +1440,29 @@ def fetch_awarded_countries() -> list:
         return sorted({row["country"] for row in r.data if row.get("country")})
     except Exception:
         return []
+
+
+def multiselect_all(label, options, *, key, default=None, help=None, sidebar=False):
+    """A st.multiselect with a one-click 'Select all / Clear all' toggle above it.
+    The toggle flips between every option selected and none. Selection is held in
+    st.session_state[key] so it survives reruns and is returned to the caller."""
+    options = list(options)
+    container = st.sidebar if sidebar else st
+
+    # Seed the selection once (do NOT also pass default= to the widget, or
+    # Streamlit warns about a default colliding with session-state).
+    if key not in st.session_state:
+        st.session_state[key] = list(default) if default is not None else []
+
+    current = st.session_state.get(key) or []
+    all_on = len(options) > 0 and set(current) >= set(options)
+    if container.button("☑️ Clear all" if all_on else "✅ Select all",
+                        key=f"{key}__toggle_all",
+                        help="Toggle every option on or off"):
+        st.session_state[key] = [] if all_on else options
+        st.rerun()
+
+    return container.multiselect(label, options, key=key, help=help)
 
 # ─────────────────────────────────────────────
 # 6. AI HELPERS
@@ -1600,6 +1646,30 @@ def ai_match_tenders(open_df: pd.DataFrame) -> pd.DataFrame:
             unscored["ai_score"] = unscored["ai_score_new"].combine_first(unscored["ai_score"])
             unscored["ai_rationale"] = unscored["ai_rationale_new"].combine_first(unscored["ai_rationale"])
             unscored.drop(columns=["ai_score_new", "ai_rationale_new"], inplace=True)
+
+    # Persist scored rows to history so the tab-6 Historical Data panel populates
+    try:
+        def _cd(v):
+            s = str(v)[:10]
+            return s if s and s not in ("NaT", "None", "nan") else None
+        hist_rows = []
+        for _, r in unscored.iterrows():
+            if pd.isna(r.get("ai_score")):
+                continue
+            hist_rows.append({
+                "tender_number": str(r.get("tender_number", ""))[:100],
+                "department":    str(r.get("department_name", ""))[:200],
+                "title":         str(r.get("title", ""))[:200],
+                "country":       str(r.get("country", "")),
+                "closing_date":  _cd(r.get("closing_date")),
+                "ai_score":      int(r["ai_score"]) if pd.notna(r.get("ai_score")) else None,
+                "ai_rationale":  str(r.get("ai_rationale", ""))[:2000],
+                "status":        "Open",
+            })
+        if hist_rows:
+            supabase.table("tender_score_history").insert(hist_rows).execute()
+    except Exception:
+        pass
 
     combined = pd.concat([already_scored, unscored], ignore_index=True)
     return combined.sort_values("ai_score", ascending=False, na_position="last")
@@ -2187,127 +2257,134 @@ def _download_ocds_year(pub_id: int, year: int):
         return None
 
 
-def scrape_ocds_country(country: str, out):
-    """Pull all available awarded tenders for one country from the OCDS registry.
-    - Downloads current year back to 2015 and merges them.
-    - Open records replace existing ones (stale tenders close daily).
-    - Awarded records are UPSERTED only — history is never wiped.
+def scrape_ocds_country(country: str, out, years_back: int = 3):
+    """Pull open + awarded tenders for one country from the OCDS registry.
+
+    Processes ONE year file at a time (memory-safe) instead of loading the whole
+    history into RAM — this is what lets the run actually finish on Streamlit
+    Cloud. `years_back` limits how far back to fetch: open tenders are always
+    current, and because awarded rows are UPSERTED (never deleted), each refresh
+    keeps adding to the awarded history, so a small per-run window still
+    accumulates full history over time. Emits per-country diagnostics so an
+    empty country is visible instead of failing silently. Returns
+    {"open": n, "awarded": n}.
     """
     import json as _json
-    from datetime import datetime, timezone, timedelta
+    from datetime import datetime, timezone
+
+    if country not in OCDS_REGISTRY:
+        out(f"  ⚠️ {country}: not in OCDS registry — skipped")
+        return {"open": 0, "awarded": 0}
 
     pub_id, flag = OCDS_REGISTRY[country]
-    out(f"{flag} Scraping {country} (OCDS — 12 months)…")
-
     now = datetime.now(timezone.utc)
     today = now.date().isoformat()
-    cutoff = "2015-01-01"  # collect all available history
     current_year = now.year
+    start_year = current_year - max(years_back - 1, 0)
 
-    # Download all available years from current back to 2015
-    all_lines = []
-    for yr in range(current_year, 2014, -1):
-        yr_lines = _download_ocds_year(pub_id, yr)
-        if yr_lines:
-            all_lines.extend(yr_lines)
-            out(f"  ℹ️ {country} {yr}: {len(yr_lines):,} records")
-        # Stop going further back once two consecutive years return nothing
-        elif yr < current_year - 1:
-            break
-
-    if not all_lines:
-        out(f"  ❌ {country}: no data available from registry")
-        return
+    out(f"{flag} {country}: OCDS pub {pub_id}, downloading {start_year}–{current_year}…")
 
     open_records, awarded_records = [], []
-    seen_awarded = set()  # deduplicate across year files
+    seen_awarded = set()
+    total_lines = relevant_hits = years_with_data = 0
 
-    for line in all_lines:
-        try:
-            rel = _json.loads(line)
-        except Exception:
+    # Process newest year first, one file at a time (lines freed each iteration)
+    for yr in range(current_year, start_year - 1, -1):
+        yr_lines = _download_ocds_year(pub_id, yr)
+        if not yr_lines:
             continue
+        years_with_data += 1
+        total_lines += len(yr_lines)
 
-        tender  = rel.get("tender") or {}
-        title   = tender.get("title") or ""
-        desc    = tender.get("description") or title
-        category = tender.get("mainProcurementCategory") or ""
-
-        if not _is_relevant(f"{title} {desc} {category}"):
-            continue
-
-        buyer      = (rel.get("buyer") or {}).get("name") or                      (tender.get("procuringEntity") or {}).get("name", "")
-        ocid       = rel.get("ocid", "")
-        tender_id  = tender.get("id") or ocid
-        period     = tender.get("tenderPeriod") or {}
-        end_date   = (period.get("endDate") or "")[:10]
-        start_date = (period.get("startDate") or rel.get("date", ""))[:10]
-        awards     = rel.get("awards") or []
-
-        # Extract contact info from OCDS parties array
-        _contact_person, _contact_email, _contact_phone = "", "", ""
-        for party in (rel.get("parties") or []):
-            if party.get("roles") and any(r in ["buyer","procuringEntity"]
-                                           for r in party.get("roles",[])):
-                cp = party.get("contactPoint") or {}
-                _contact_person = str(cp.get("name") or "")[:200]
-                _contact_email  = str(cp.get("email") or "")[:200]
-                _contact_phone  = str(cp.get("telephone") or "")[:50]
-                break
-
-        base = {
-            "tender_number":   str(tender_id)[:100],
-            "department_name": str(buyer)[:200],
-            "title":           str(title or desc)[:200],
-            "description":     str(desc),
-            "category":        str(category),
-            "portal_link":     f"https://data.open-contracting.org/en/publication/{pub_id}",
-            "country":         country,
-            "contact_person":  _contact_person,
-            "contact_email":   _contact_email,
-            "contact_phone":   _contact_phone,
-        }
-
-        # Open: not yet closed, not cancelled
-        status = (tender.get("status") or "").lower()
-        if end_date and end_date >= today and status not in ("cancelled", "unsuccessful", "withdrawn"):
-            open_records.append({
-                **base,
-                "compliance_requirements": tender.get("submissionMethodDetails") or "See portal",
-                "issue_date":   start_date or None,
-                "closing_date": end_date,
-                "status":       "Open",
-                "award_status": "Published",
-            })
-
-        # Awarded: within 12-month window, deduplicated
-        for aw in awards:
-            award_date = (aw.get("date") or rel.get("date") or "")[:10]
-            # Skip if award date is known and outside the 12-month window
-            if award_date and award_date < cutoff:
+        for line in yr_lines:
+            try:
+                rel = _json.loads(line)
+            except Exception:
                 continue
-            suppliers = aw.get("suppliers") or []
-            winner    = suppliers[0].get("name", "Unknown") if suppliers else "Not Disclosed"
-            val       = aw.get("value") or {}
-            amount    = f"{val.get('currency','')} {val.get('amount','')}".strip() if val else "Not Disclosed"
-            dedup_key = f"{tender_id}|{winner}"
-            if dedup_key in seen_awarded:
-                continue
-            seen_awarded.add(dedup_key)
-            awarded_records.append({
-                **base,
-                "status":         "Awarded",
-                "winning_bidder": str(winner)[:200],
-                "award_value":    amount or "Not Disclosed",
-                "issue_date":     award_date or None,
-            })
 
-    # Open records: replace (stale tenders close)
+            tender   = rel.get("tender") or {}
+            title    = tender.get("title") or ""
+            desc     = tender.get("description") or title
+            category = tender.get("mainProcurementCategory") or ""
+
+            if not _is_relevant(f"{title} {desc} {category}"):
+                continue
+            relevant_hits += 1
+
+            buyer      = (rel.get("buyer") or {}).get("name") or                          (tender.get("procuringEntity") or {}).get("name", "")
+            ocid       = rel.get("ocid", "")
+            tender_id  = tender.get("id") or ocid
+            period     = tender.get("tenderPeriod") or {}
+            end_date   = (period.get("endDate") or "")[:10]
+            start_date = (period.get("startDate") or rel.get("date", ""))[:10]
+            awards     = rel.get("awards") or []
+
+            _contact_person, _contact_email, _contact_phone = "", "", ""
+            for party in (rel.get("parties") or []):
+                if party.get("roles") and any(r in ["buyer", "procuringEntity"]
+                                               for r in party.get("roles", [])):
+                    cp = party.get("contactPoint") or {}
+                    _contact_person = str(cp.get("name") or "")[:200]
+                    _contact_email  = str(cp.get("email") or "")[:200]
+                    _contact_phone  = str(cp.get("telephone") or "")[:50]
+                    break
+
+            base = {
+                "tender_number":   str(tender_id)[:100],
+                "department_name": str(buyer)[:200],
+                "title":           str(title or desc)[:200],
+                "description":     str(desc),
+                "category":        str(category),
+                "portal_link":     f"https://data.open-contracting.org/en/publication/{pub_id}",
+                "country":         country,
+                "contact_person":  _contact_person,
+                "contact_email":   _contact_email,
+                "contact_phone":   _contact_phone,
+            }
+
+            # Open: not yet closed, not cancelled
+            status = (tender.get("status") or "").lower()
+            if end_date and end_date >= today and status not in ("cancelled", "unsuccessful", "withdrawn"):
+                open_records.append({
+                    **base,
+                    "compliance_requirements": tender.get("submissionMethodDetails") or "See portal",
+                    "issue_date":   start_date or None,
+                    "closing_date": end_date,
+                    "status":       "Open",
+                    "award_status": "Published",
+                })
+
+            # Awarded: deduplicated across the window
+            for aw in awards:
+                award_date = (aw.get("date") or rel.get("date") or "")[:10]
+                suppliers  = aw.get("suppliers") or []
+                winner     = suppliers[0].get("name", "Unknown") if suppliers else "Not Disclosed"
+                val        = aw.get("value") or {}
+                amount     = f"{val.get('currency','')} {val.get('amount','')}".strip() if val else "Not Disclosed"
+                dedup_key  = f"{tender_id}|{winner}"
+                if dedup_key in seen_awarded:
+                    continue
+                seen_awarded.add(dedup_key)
+                awarded_records.append({
+                    **base,
+                    "status":         "Awarded",
+                    "winning_bidder": str(winner)[:200],
+                    "award_value":    amount or "Not Disclosed",
+                    "issue_date":     award_date or None,
+                })
+
+    if years_with_data == 0:
+        out(f"  ❌ {country}: registry returned no downloadable files for {start_year}–{current_year} (pub {pub_id})")
+        return {"open": 0, "awarded": 0}
+
+    # Open records: replace (stale tenders close). Awarded: upsert (history kept).
     supabase.table("sa_tenders").delete().eq("status", "Open").eq("country", country).execute()
-    _upsert(open_records, country, "Open", out)
+    n_open    = _upsert(open_records, country, "Open", out)
+    n_awarded = _upsert_awarded(awarded_records, country, "Awarded", out)
 
-    # Write to dedicated awarded_tenders table — never wiped
-    _upsert_awarded(awarded_records, country, f"Awarded (all history, {len(awarded_records)} records)", out)
+    out(f"  📊 {country}: scanned {total_lines:,} records · {relevant_hits:,} relevant · "
+        f"upserted {n_open} open + {n_awarded} awarded")
+    return {"open": n_open, "awarded": n_awarded}
 
 
 def _count_rows(table: str, **filters) -> int:
@@ -2344,10 +2421,16 @@ def _country_counts(table: str, **filters):
     return counter
 
 
-def run_all_scrapers():
+def run_all_scrapers(years_back: int = 3, log_run: bool = True):
     """Full country refresh: scrape every live source, filter each record through
     the CRS relevance keyword set, upsert (dedupe) into Supabase, then render a
-    before/after comparison and log the run to pipeline_runs."""
+    before/after comparison and log the run to pipeline_runs.
+
+    `years_back` controls how many years of OCDS history each country pulls per
+    run (open tenders are always current; awarded history accumulates across
+    runs since awarded rows are upserted, never deleted). `log_run=False`
+    suppresses the pipeline_runs record (used when the AI pipeline that follows
+    will log the combined run instead)."""
     import time as _t
 
     st.subheader("🔄 Refreshing tender data across Africa…")
@@ -2379,7 +2462,7 @@ def run_all_scrapers():
     if not sa_ok:
         out_write("  🔁 Falling back to OCDS registry for South Africa…")
         try:
-            scrape_ocds_country("South Africa", out_write)
+            scrape_ocds_country("South Africa", out_write, years_back)
         except Exception as e:
             errors.append(f"South Africa: {e}")
             out_write(f"  ❌ South Africa registry fallback also failed: {e}")
@@ -2389,7 +2472,7 @@ def run_all_scrapers():
         if country == "South Africa":
             continue  # handled above with live API + fallback
         try:
-            scrape_ocds_country(country, out_write)
+            scrape_ocds_country(country, out_write, years_back)
         except Exception as e:
             errors.append(f"{country}: {e}")
             out_write(f"  ❌ {country} crashed: {e}")
@@ -2450,16 +2533,17 @@ def run_all_scrapers():
     st.info("Tables updated — open any tab to load the refreshed data.")
 
     # ── 7. Log this refresh to pipeline_runs so it appears in run history ────
-    try:
-        supabase.table("pipeline_runs").insert({
-            "trigger": "refresh_countries",
-            "status":  "failed" if errors and (new_open + new_awarded) <= 0 else "success",
-            "tenders_scraped": max(new_open, 0) + new_awarded,
-            "duration_secs":   duration,
-            "error_log": ("\n".join(errors))[:5000] if errors else None,
-        }).execute()
-    except Exception:
-        pass
+    if log_run:
+        try:
+            supabase.table("pipeline_runs").insert({
+                "trigger": "refresh_countries",
+                "status":  "failed" if errors and (new_open + new_awarded) <= 0 else "success",
+                "tenders_scraped": max(new_open, 0) + new_awarded,
+                "duration_secs":   duration,
+                "error_log": ("\n".join(errors))[:5000] if errors else None,
+            }).execute()
+        except Exception:
+            pass
 
 # ─────────────────────────────────────────────
 # 9. MAIN DASHBOARD
@@ -2478,18 +2562,40 @@ if _MONDAY_AVAILABLE:
     st.sidebar.success("🟢 Monday.com connected")
 else:
     st.sidebar.caption("⚪ Monday.com — add MONDAY_API_KEY to secrets")
-if st.sidebar.button("🔄 Refresh All Countries"):
-    # run_all_scrapers() clears the data cache and renders its own comparison
-    # summary in the main area — do NOT st.rerun() here or the summary is wiped.
-    run_all_scrapers()
+_refresh_years = st.sidebar.slider(
+    "Years of OCDS history per refresh",
+    min_value=1, max_value=11, value=3,
+    help="How far back each country pulls per refresh. Higher = more awarded "
+         "history but slower. Awarded rows accumulate across runs, so you can "
+         "build deep history with repeated low-year refreshes too.",
+)
+
+if st.sidebar.button("🚀 Run Everything (Scrape → AI)", type="primary",
+                     help="One click: scrape every country, then AI-score tenders, "
+                          "analyse partners, and collect attack signals — writing all "
+                          "history tables. The AI phase can take several minutes."):
+    # 1) Scrape + comparison summary. log_run=False so only the AI pipeline below
+    #    logs the combined run to history.
+    run_all_scrapers(_refresh_years, log_run=False)
+    # 2) AI analysis on the freshly-scraped data, with a live log.
+    st.divider()
+    st.subheader("🤖 AI Analysis")
+    _ai_log = st.empty()
+    _ai_lines = []
+    def _ai_out(m):
+        _ai_lines.append(m)
+        _ai_log.markdown("\n\n".join(_ai_lines[-25:]))
+    with st.spinner("Scoring tenders → analysing partners → collecting attack signals…"):
+        run_pipeline("manual_full", years_back=_refresh_years,
+                     skip_scrape=True, live_out=_ai_out)
+    st.success("✅ Full cycle complete — scraping + AI analysis done. Open any tab to view results.")
     st.stop()
 
-if st.sidebar.button("🚀 Run Full Pipeline Now"):
-    with st.spinner("Running full pipeline…"):
-        run_pipeline("manual")
-    st.cache_data.clear()
-    st.success("Pipeline complete!")
-    st.rerun()
+if st.sidebar.button("🔄 Scrape Only (skip AI)",
+                     help="Just refresh tender data from every country — no AI scoring. "
+                          "Use when you only want fresh listings fast."):
+    run_all_scrapers(_refresh_years)
+    st.stop()
 
 if st.sidebar.button("🩺 Check Provider Health"):
     with st.spinner("Pinging providers…"):
@@ -2525,11 +2631,13 @@ ALL_TARGET_COUNTRIES = [
 # Use live DB countries if available, fall back to target list
 _country_opts = sorted(set(all_countries) | set(ALL_TARGET_COUNTRIES))     if all_countries else ALL_TARGET_COUNTRIES
 
-selected_countries = st.sidebar.multiselect(
+selected_countries = multiselect_all(
     "Filter by Country",
-    options=_country_opts,
+    _country_opts,
+    key="open_country_filter",
     default=all_countries if all_countries else ALL_TARGET_COUNTRIES,
-    help="28 African countries tracked"
+    help="28 African countries tracked",
+    sidebar=True,
 )
 
 # Date range filter for awarded tenders (12-month history)
@@ -2758,12 +2866,12 @@ with tab2:
 
     t2_col1, t2_col2, t2_col3 = st.columns([2, 2, 2])
     with t2_col1:
-        t2_countries = st.multiselect(
+        t2_countries = multiselect_all(
             "Filter by Country",
-            options=awarded_all_countries or ALL_TARGET_COUNTRIES,
-            default=[],   # empty = show all
+            awarded_all_countries or ALL_TARGET_COUNTRIES,
             key="t2_country_filter",
-            help=f"{len(awarded_all_countries)} countries in awarded history"
+            default=[],   # empty = show all
+            help=f"{len(awarded_all_countries)} countries in awarded history",
         )
     with t2_col2:
         t2_date_from = st.date_input("Awarded From", value=date(2015, 1, 1),
@@ -2821,14 +2929,49 @@ with tab2:
             )
 
         if run_analysis:
-            with st.spinner("Gemini is analysing winning companies…"):
+            n_bidders = 0
+            try:
+                if not awarded_df.empty and "winning_bidder" in awarded_df.columns:
+                    n_bidders = awarded_df["winning_bidder"].dropna().nunique()
+            except Exception:
+                pass
+            with st.spinner(f"Analysing {n_bidders:,} unique winning companies…"):
                 try:
                     partners = ai_analyse_partners(awarded_df)
                     st.session_state["partner_analysis"] = partners
+                    provider = st.session_state.get("_last_ai_provider", "AI")
+                    if partners:
+                        st.caption(f"✅ {provider} returned {len(partners)} partner candidates.")
+                        # Persist to history so the tab-6 Historical Data panel populates
+                        try:
+                            rows = [{
+                                "company":          str(p.get("company", ""))[:200],
+                                "country":          str(p.get("country", ""))[:100],
+                                "crs_score":        p.get("crs_score") or p.get("urgency_score"),
+                                "why":              str(p.get("why_aligned", ""))[:500],
+                                "outreach_angle":   str(p.get("outreach_angle", ""))[:500],
+                                "urgency":          str(p.get("urgency", ""))[:20],
+                                "partnership_type": str(p.get("partner_classification")
+                                                        or p.get("partnership_type", ""))[:100],
+                            } for p in partners if isinstance(p, dict) and p.get("company")]
+                            if rows:
+                                supabase.table("partner_recommendation_history").insert(rows).execute()
+                        except Exception:
+                            pass
+                    else:
+                        st.warning(
+                            f"{provider} responded but no partner companies were extracted — "
+                            "usually a truncated response or no clear ICT/security winners in the "
+                            "current filter. Try again, or widen the awarded date range / countries."
+                        )
                 except json.JSONDecodeError:
-                    st.error("Gemini returned an unexpected format. Try again.")
+                    st.error("AI returned a non-JSON format. Try again.")
                 except Exception as e:
-                    st.error(f"Analysis failed: {e}")
+                    st.error(
+                        f"Analysis failed: {e}  —  if this says 'All AI providers failed', add at "
+                        "least one AI key (GROQ_API_KEY / GEMINI_API_KEY / OPENROUTER_API_KEY …) "
+                        "to Streamlit secrets."
+                    )
 
         if "partner_analysis" in st.session_state and st.session_state["partner_analysis"]:
             partners = st.session_state["partner_analysis"]
@@ -3021,10 +3164,11 @@ with tab4:
 
     disc_col1, disc_col2 = st.columns([2, 3])
     with disc_col1:
-        disc_countries = st.multiselect(
+        disc_countries = multiselect_all(
             "Countries to search",
             ["South Africa", "Kenya", "Nigeria", "Ghana", "Tanzania", "Uganda",
              "Zambia", "Rwanda", "Botswana", "Namibia", "Zimbabwe"],
+            key="disc_countries",
             default=["South Africa", "Kenya", "Nigeria"],
         )
     with disc_col2:
@@ -3126,27 +3270,30 @@ with tab5:
     # ── Search configuration ─────────────────────────────────────────────────
     cfg_col1, cfg_col2 = st.columns(2)
     with cfg_col1:
-        lead_countries = st.multiselect(
+        lead_countries = multiselect_all(
             "Target countries",
             ["South Africa", "Kenya", "Nigeria", "Ghana", "Tanzania", "Uganda", "Zambia", "Rwanda"],
-            default=["South Africa", "Kenya", "Nigeria"]
+            key="lead_countries",
+            default=["South Africa", "Kenya", "Nigeria"],
         )
-        job_titles = st.multiselect(
+        job_titles = multiselect_all(
             "Decision-maker titles to find",
             ["CISO", "Chief Information Security Officer", "CTO", "Chief Technology Officer",
              "IT Manager", "IT Director", "Head of IT", "Head of Cybersecurity",
              "Security Manager", "Security Architect", "Procurement Manager",
              "ICT Manager", "Digital Transformation Manager", "Head of Infrastructure"],
-            default=["CISO", "CTO", "IT Director", "Head of Cybersecurity", "IT Manager"]
+            key="job_titles",
+            default=["CISO", "CTO", "IT Director", "Head of Cybersecurity", "IT Manager"],
         )
     with cfg_col2:
-        solution_focus = st.multiselect(
+        solution_focus = multiselect_all(
             "Solution focus (for sentiment matching)",
             ["cybersecurity", "endpoint protection", "vulnerability management",
              "SIEM", "SOC", "penetration testing", "security training",
              "IBM training", "Red Hat", "cloud security", "ransomware",
              "data protection", "POPIA compliance", "network security"],
-            default=["cybersecurity", "endpoint protection", "SOC", "ransomware", "POPIA compliance"]
+            key="solution_focus",
+            default=["cybersecurity", "endpoint protection", "SOC", "ransomware", "POPIA compliance"],
         )
         include_jse = st.checkbox("Include JSE-listed ICT companies", value=True)
         enrich_orgs = st.checkbox(
@@ -3682,6 +3829,25 @@ Return ONLY a valid JSON object:
                 except Exception:
                     pass  # table may not exist yet
 
+            # Persist attack signals to history (so the tab-6 panel populates)
+            try:
+                sig_rows = [{
+                    "source":          str(s.get("source", ""))[:100],
+                    "title":           str(s.get("title", ""))[:300],
+                    "victim_org":      str(s.get("victim_org", ""))[:200],
+                    "attack_type":     str(s.get("attack_type", ""))[:50],
+                    "crs_score":       s.get("crs_score"),
+                    "contact_title":   str(s.get("contact_title", ""))[:100],
+                    "outreach_angle":  str(s.get("outreach_angle", ""))[:500],
+                    "url":             str(s.get("url", ""))[:500],
+                    "published":       str(s.get("published", ""))[:20],
+                    "country_context": "Africa",
+                } for s in merged_signals if s.get("title") or s.get("victim_org")]
+                if sig_rows:
+                    supabase.table("attack_signal_history").insert(sig_rows).execute()
+            except Exception:
+                pass
+
     # ────────────────────────────────────────────────────────────────────────
     # DISPLAY RESULTS
     # ────────────────────────────────────────────────────────────────────────
@@ -4118,7 +4284,7 @@ Groq → Cerebras → OpenRouter → GitHub → **NVIDIA** → **DeepSeek** → 
                 with st.expander(f"❌ Last failed run — {failed[0].get('run_at','')}"):
                     st.code(failed[0].get("error_log","no log"))
         else:
-            st.info("No pipeline runs yet. Click 'Run Full Pipeline Now' in the sidebar to start.")
+            st.info("No pipeline runs yet. Click '🚀 Run Everything (Scrape → AI)' in the sidebar to start.")
     except Exception as e:
         st.warning(f"Could not load run history: {e}")
 
@@ -4218,6 +4384,6 @@ Groq → Cerebras → OpenRouter → GitHub → **NVIDIA** → **DeepSeek** → 
             log_lines_tab.append(msg)
             log_container.markdown("\n\n".join(log_lines_tab[-20:]))
         with st.spinner("Pipeline running…"):
-            run_pipeline("manual")
+            run_pipeline("manual", years_back=_refresh_years, live_out=_tab_out)
         st.cache_data.clear()
         st.success("Done! Refresh the other tabs to see updated data.")
