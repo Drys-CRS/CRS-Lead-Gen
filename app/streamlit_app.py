@@ -2432,6 +2432,105 @@ def _google_dork_linkedin(term: str, country: str = "", max_results: int = 20) -
     return out[: int(max_results)]
 
 
+def _serper_dork_linkedin(term: str, country: str = "", max_results: int = 20) -> list:
+    """Same LinkedIn dork as _google_dork_linkedin, but via Serper.dev
+    (POST https://google.serper.dev/search, X-API-KEY header). Serper is open to
+    new signups with a free trial, unlike Google's closed Custom Search API.
+    Needs SERPER_API_KEY in st.secrets. Returns parsed LinkedIn contacts."""
+    import requests
+    try:
+        key = st.secrets.get("SERPER_API_KEY", "")
+    except Exception:
+        key = ""
+    if not key:
+        st.session_state["_google_dork_diag"] = "no SERPER_API_KEY"
+        return []
+    q = f'site:linkedin.com/in/ "{term}"'
+    if country:
+        q += f' "{country}"'
+    out, page = [], 1
+    pages = max(1, min((int(max_results) + 9) // 10, 10))
+    try:
+        for _ in range(pages):
+            r = requests.post("https://google.serper.dev/search",
+                              headers={"X-API-KEY": key, "Content-Type": "application/json"},
+                              json={"q": q, "num": 10, "page": page}, timeout=20)
+            if not r.ok:
+                st.session_state["_google_dork_diag"] = f"Serper HTTP {r.status_code}: {r.text[:90]}"
+                break
+            items = r.json().get("organic", []) or []
+            if not items:
+                break
+            for it in items:
+                link = it.get("link", "")
+                if "linkedin.com/in/" not in link:
+                    continue
+                p = _parse_linkedin_result(it.get("title", ""), it.get("snippet", ""),
+                                           link, searched_title=term, default_country=country)
+                if p:
+                    out.append(p)
+            page += 1
+            if len(out) >= int(max_results):
+                break
+        if not st.session_state.get("_google_dork_diag", "").startswith("Serper HTTP"):
+            st.session_state["_google_dork_diag"] = f"{len(out)} LinkedIn profile(s) parsed (Serper)"
+    except Exception as e:
+        st.session_state["_google_dork_diag"] = f"Serper error: {e}"
+    return out[: int(max_results)]
+
+
+def _serpapi_dork_linkedin(term: str, country: str = "", max_results: int = 20) -> list:
+    """Same LinkedIn dork via SerpApi (GET https://serpapi.com/search.json,
+    engine=google). SerpApi's free tier is 100 searches/month and RESETS monthly
+    (no credit card) — a recurring free allowance, unlike Serper's one-off trial.
+    Needs SERPAPI_API_KEY in st.secrets."""
+    import requests
+    try:
+        key = st.secrets.get("SERPAPI_API_KEY", "")
+    except Exception:
+        key = ""
+    if not key:
+        st.session_state["_google_dork_diag"] = "no SERPAPI_API_KEY"
+        return []
+    q = f'site:linkedin.com/in/ "{term}"'
+    if country:
+        q += f' "{country}"'
+    out, start = [], 0
+    pages = max(1, min((int(max_results) + 9) // 10, 10))
+    try:
+        for _ in range(pages):
+            r = requests.get("https://serpapi.com/search.json",
+                             params={"engine": "google", "q": q, "api_key": key,
+                                     "num": 10, "start": start}, timeout=25)
+            if not r.ok:
+                st.session_state["_google_dork_diag"] = f"SerpApi HTTP {r.status_code}: {r.text[:90]}"
+                break
+            jr = r.json()
+            if jr.get("error"):
+                st.session_state["_google_dork_diag"] = f"SerpApi: {str(jr.get('error'))[:90]}"
+                break
+            items = jr.get("organic_results", []) or []
+            if not items:
+                break
+            for it in items:
+                link = it.get("link", "")
+                if "linkedin.com/in/" not in link:
+                    continue
+                p = _parse_linkedin_result(it.get("title", ""), it.get("snippet", ""),
+                                           link, searched_title=term, default_country=country)
+                if p:
+                    out.append(p)
+            start += 10
+            if len(out) >= int(max_results):
+                break
+        _d = st.session_state.get("_google_dork_diag", "")
+        if not (_d.startswith("SerpApi HTTP") or _d.startswith("SerpApi:")):
+            st.session_state["_google_dork_diag"] = f"{len(out)} LinkedIn profile(s) parsed (SerpApi)"
+    except Exception as e:
+        st.session_state["_google_dork_diag"] = f"SerpApi error: {e}"
+    return out[: int(max_results)]
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # GITHUB SYNC MODULE
 # ═══════════════════════════════════════════════════════════════════════════
@@ -5179,12 +5278,38 @@ with tab_verify:
     if dork_mode:
         _has_google = (bool(st.secrets.get("GOOGLE_API_KEY", "")) and
                        bool(st.secrets.get("GOOGLE_CSE_ID", ""))) if hasattr(st, "secrets") else False
-        if not _has_google:
-            st.info("This mode runs a Google dork via the **Custom Search JSON API**. "
-                    "Add **GOOGLE_API_KEY** and **GOOGLE_CSE_ID** to Streamlit secrets "
-                    "(free tier = 100 queries/day). Create a Programmable Search Engine at "
-                    "programmablesearchengine.google.com set to search the entire web, then "
-                    "grab an API key from the Google Cloud console.")
+        _has_serper = bool(st.secrets.get("SERPER_API_KEY", "")) if hasattr(st, "secrets") else False
+        _has_serpapi = bool(st.secrets.get("SERPAPI_API_KEY", "")) if hasattr(st, "secrets") else False
+
+        _provider_opts = []
+        if _has_serpapi:
+            _provider_opts.append("SerpApi")
+        if _has_serper:
+            _provider_opts.append("Serper.dev")
+        if _has_google:
+            _provider_opts.append("Google CSE")
+        if not _provider_opts:
+            _provider_opts = ["SerpApi", "Serper.dev", "Google CSE"]
+        dork_provider = st.radio("Search provider", _provider_opts, horizontal=True,
+                                 key="dork_provider")
+        _use_serpapi = dork_provider == "SerpApi"
+        _use_serper  = dork_provider == "Serper.dev"
+        _provider_ready = (_has_serpapi if _use_serpapi else
+                           _has_serper if _use_serper else _has_google)
+
+        if _use_serpapi and not _has_serpapi:
+            st.info("Runs the dork via **SerpApi** — free tier is **100 Google searches/month "
+                    "that resets monthly** (no credit card). Sign up at **serpapi.com**, copy your "
+                    "key, and add **SERPAPI_API_KEY** to Streamlit secrets.")
+        elif _use_serper and not _has_serper:
+            st.info("Runs the dork via **Serper.dev** (open to new signups). Note: free tier is a "
+                    "one-off trial (~2,500 queries), not a recurring monthly allowance. "
+                    "Add **SERPER_API_KEY** to Streamlit secrets.")
+        elif (not _use_serpapi and not _use_serper) and not _has_google:
+            st.warning("Google's **Custom Search JSON API is closed to new customers (2025)** — new "
+                       "Google Cloud accounts get a 403 even with the API enabled and billing on. "
+                       "Only an **older pre-2025 project** can use it. For a recurring free allowance, "
+                       "use **SerpApi** instead (100/month, resets monthly).")
         st.markdown("Builds: `site:linkedin.com/in/ \"<term>\" \"<country>\"` per term, "
                     "collects LinkedIn profiles, then enriches via Lusha (by LinkedIn URL) "
                     "+ Apollo, scores and classifies.")
@@ -5212,10 +5337,17 @@ with tab_verify:
                                          key="dork_per_term")
         _terms_all = list(v_terms) + ([v_extra.strip()] if v_extra.strip() else [])
         _n_queries = max(1, len(_terms_all)) * max(1, len(v_dork_countries))
+        if _use_serpapi:
+            _quota_note = "SerpApi 100/month quota"
+        elif _use_serper:
+            _quota_note = "Serper.dev trial credits"
+        else:
+            _quota_note = "100/day Custom Search quota"
         st.caption(f"Will run ~{_n_queries} dork quer{'y' if _n_queries==1 else 'ies'} "
-                   f"(counts against your 100/day Custom Search quota).")
+                   f"via {dork_provider} (counts against your {_quota_note}).")
         run_verify = st.button("▶️ Run Dork + Cascade", type="primary",
-                               key="verify_run_dork", disabled=not _has_google or not _terms_all)
+                               key="verify_run_dork",
+                               disabled=not _provider_ready or not _terms_all)
 
     elif discover_mode:
         st.info("⚠️ **Discover** uses Apollo's People Search API. Your current Apollo key "
@@ -5287,7 +5419,11 @@ with tab_verify:
                 for term in _terms_all:
                     for ctry in (v_dork_countries or [""]):
                         _vlog(f'[Dork] site:linkedin.com/in/ "{term}" "{ctry}"…')
-                        hits = _google_dork_linkedin(term, ctry, max_results=int(v_per_term))
+                        hits = (_serpapi_dork_linkedin(term, ctry, max_results=int(v_per_term))
+                                if _use_serpapi else
+                                _serper_dork_linkedin(term, ctry, max_results=int(v_per_term))
+                                if _use_serper else
+                                _google_dork_linkedin(term, ctry, max_results=int(v_per_term)))
                         _gdiag = st.session_state.get("_google_dork_diag", "")
                         if _gdiag:
                             _vlog(f"[Dork] {_gdiag}")
