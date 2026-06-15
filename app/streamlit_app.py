@@ -1434,10 +1434,20 @@ def fetch_awarded_tenders():
 
 @st.cache_data(ttl=600)
 def fetch_awarded_countries() -> list:
-    """Get distinct countries from awarded_tenders — separate from open tender countries."""
+    """Get distinct countries from awarded_tenders — separate from open tender countries.
+    Paginates past Supabase's 1000-row API cap so every country is represented, not
+    just those that happen to fall in the first page (which silently hid South Africa
+    and Nigeria from the awarded country filter)."""
     try:
-        r = supabase.table("awarded_tenders").select("country").execute()
-        return sorted({row["country"] for row in r.data if row.get("country")})
+        seen, step, start = set(), 1000, 0
+        while True:
+            batch = (supabase.table("awarded_tenders").select("country")
+                     .range(start, start + step - 1).execute().data) or []
+            seen.update(row["country"] for row in batch if row.get("country"))
+            if len(batch) < step:
+                break
+            start += step
+        return sorted(seen)
     except Exception:
         return []
 
@@ -2242,6 +2252,24 @@ NON_OCDS_COUNTRIES = {
     "Zimbabwe":             ("🇿🇼", "Southern Africa"),
 }
 
+def _clean_ocds_date(s):
+    """Return a YYYY-MM-DD string only if it's a plausible date (year 2000–next
+    year); otherwise None. Guards against malformed OCDS dates like '2922-08-26'
+    that would corrupt sorting/filtering and make closed tenders look open."""
+    from datetime import datetime
+    s = (s or "")[:10]
+    if len(s) != 10:
+        return None
+    try:
+        y = int(s[:4])
+        if y < 2000 or y > datetime.now().year + 1:
+            return None
+        datetime.strptime(s, "%Y-%m-%d")  # validate it's a real calendar date
+        return s
+    except Exception:
+        return None
+
+
 def _download_ocds_year(pub_id: int, year: int):
     """Download and decompress one year's JSONL from the OCDS registry.
     Returns list of text lines, or None if unavailable."""
@@ -2315,8 +2343,8 @@ def scrape_ocds_country(country: str, out, years_back: int = 3):
             ocid       = rel.get("ocid", "")
             tender_id  = tender.get("id") or ocid
             period     = tender.get("tenderPeriod") or {}
-            end_date   = (period.get("endDate") or "")[:10]
-            start_date = (period.get("startDate") or rel.get("date", ""))[:10]
+            end_date   = _clean_ocds_date(period.get("endDate")) or ""
+            start_date = _clean_ocds_date(period.get("startDate") or rel.get("date", "")) or ""
             awards     = rel.get("awards") or []
 
             _contact_person, _contact_email, _contact_phone = "", "", ""
@@ -2356,7 +2384,7 @@ def scrape_ocds_country(country: str, out, years_back: int = 3):
 
             # Awarded: deduplicated across the window
             for aw in awards:
-                award_date = (aw.get("date") or rel.get("date") or "")[:10]
+                award_date = _clean_ocds_date(aw.get("date") or rel.get("date")) or ""
                 suppliers  = aw.get("suppliers") or []
                 winner     = suppliers[0].get("name", "Unknown") if suppliers else "Not Disclosed"
                 val        = aw.get("value") or {}
@@ -4006,7 +4034,7 @@ Return ONLY a valid JSON object:
             high_signals = [s for s in res["signals"] if (s.get("crs_score") or 0) >= 7]
             if high_signals:
                 st.write(f"**🔴 {len(high_signals)} high-priority attack signals — expand for outreach angles:**")
-                for s in high_signals:
+                for _si, s in enumerate(high_signals):
                     badge = "🟢" if (s.get("crs_score") or 0) >= 9 else "🟡"
                     label = (
                         f"{badge} **{s.get('victim_org') or 'Unknown org'}** — "
@@ -4021,7 +4049,7 @@ Return ONLY a valid JSON object:
                             st.markdown(f"[🔗 Source]({s['url']})")
 
                         # Quick Apollo contact search button for this specific org
-                        btn_key = f"find_{s.get('victim_org','')[:20]}_{s.get('crs_score')}"
+                        btn_key = f"find_{_si}_{str(s.get('victim_org',''))[:20]}_{s.get('crs_score')}"
                         if s.get("victim_org") and st.button(
                             f"🔍 Find {s.get('contact_title','contact')} at {s.get('victim_org','')} in Apollo",
                             key=btn_key
