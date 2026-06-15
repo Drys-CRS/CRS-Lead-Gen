@@ -2888,7 +2888,7 @@ with tab3:
         if st.button("💾 Save to Database", key="btn_save_parsed"):
             try:
                 record = st.session_state["parsed_tender"]
-                supabase.table("sa_tenders").upsert(record, on_conflict="tender_number").execute()
+                supabase.table("sa_tenders").upsert(record, on_conflict="tender_number,department_name").execute()
                 st.success(f"Tender {record.get('tender_number', '')} saved to Supabase.")
                 del st.session_state["parsed_tender"]
                 st.cache_data.clear()
@@ -3793,6 +3793,7 @@ Return ONLY a valid JSON object:
 
         with push_col1:
             if st.button("📤 Push Top Companies to Apollo Accounts", key="btn_apollo_companies"):
+                top_cos = ai_out.get("scored_companies", [])
                 push_cos = top_cos[:10] if top_cos else res.get("apollo_orgs",[])[:10]
                 if push_cos:
                     with st.spinner("Creating accounts in Apollo…"):
