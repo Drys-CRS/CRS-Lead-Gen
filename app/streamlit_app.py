@@ -695,6 +695,24 @@ Standss (SendGuard/SendConfirm) — Email GRC
   Features: confirm recipients/attachments before send, DLP rules, unsend, audit logs
   Target: orgs with high email reliance, SMBs, compliance-driven
 
+Todyl — Consolidated Cybersecurity Platform (channel-only, single agent)
+  Target: MSPs, IT & security teams, mid-market consolidating their security stack
+  Modules: SASE (secure connectivity/network), SIEM (centralised detection & compliance),
+  MXDR (24x7 managed detection & response), Endpoint Security (EDR/NGAV),
+  GRC (governance, risk & compliance)
+  Keywords: SASE, SIEM, MXDR, MDR, EDR, endpoint, GRC, compliance, CMMC, cyber insurance,
+  MSP, stack consolidation, single-agent platform
+
+Panorays — Third-Party Cyber Risk & Attack Surface Management (TPCRM)
+  Target: enterprises, banks, insurers, healthcare, tech with large vendor/supply chains; CISOs
+  Features: Risk DNA cyber posture ratings, external attack surface assessment,
+  AI-powered security questionnaires, continuous vendor monitoring, remediation workflows,
+  supply chain (3rd-to-Nth party) visibility
+  Compliance: DORA, M&A due diligence, regulatory monitoring; ISO/IEC 42001 AI governance;
+  Forrester Wave Leader 2026
+  Keywords: third-party risk, TPRM, TPCRM, vendor risk, supply chain security,
+  attack surface management, DORA, vendor assessment, due diligence
+
 ── TARGET MARKETS ──
 Government (all levels, all African countries), financial services, banking,
 healthcare, education, telcos, mining, enterprises with dev teams.
@@ -1158,6 +1176,7 @@ def ai_analyse_partners(awarded_df) -> list:
         "CRS VENDOR PORTFOLIO: VECTRA (NDR/XDR), vRx (vuln/patch), Strobes (CTEM/PTaaS), "
         "Aikido (AppSec), Flare (dark web intel), BeachheadSecure (encryption/MFA), "
         "SMBsecure (SMB/POPIA), Telivy (MSSP audit), BlueFlag (SDLC), Standss/SendGuard (email GRC), "
+        "Todyl (SASE/SIEM/MXDR/EDR/GRC platform), Panorays (third-party/supply-chain cyber risk, attack surface), "
         "CRE/GoldPhish (cyber awareness), VAPT services, IBM/RedHat/SUSE/CompTIA/Agile training.\n\n"
         "PARTNER TYPES: System Integrator | MSP | VAR | Training Provider | Consulting/Advisory | End-user\n\n"
         "AGGREGATED TENDER WIN DATA (pipe-delimited):\n"
@@ -1569,6 +1588,8 @@ def ai_score_tender(tender: dict) -> dict:
         "Aikido (AppSec/DevSecOps), Flare (dark web/threat intel), "
         "BeachheadSecure (encryption/MFA/POPIA), SMBsecure (SMB all-in-one), "
         "Telivy (MSSP audit), BlueFlag (SDLC security), Standss/SendGuard (email GRC), "
+        "Todyl (SASE/SIEM/MXDR/EDR/GRC consolidated platform), "
+        "Panorays (third-party/supply-chain cyber risk & attack surface mgmt, DORA), "
         "CRE/GoldPhish/Prventi (cyber awareness/SAT), VAPT (pentest services), "
         "IBM/RedHat/SUSE/CompTIA/Agile SAFe training.\n\n"
         f"TENDER:\n"
@@ -2117,6 +2138,15 @@ TARGET_KEYWORDS = [
     "application security", "sast", "dast", "sca", "devsecops",
     "code security", "secure development", "software supply chain",
     "container security", "cloud security posture", "cspm", "secrets detection",
+    # ── Third-Party / Supply-Chain Cyber Risk (Panorays) ──
+    "third party risk", "third-party risk", "tprm", "tpcrm", "vendor risk",
+    "vendor risk management", "supply chain risk", "supply chain security",
+    "vendor assessment", "vendor due diligence", "dora", "dora compliance",
+    "cyber risk rating", "security ratings", "supplier risk", "nth party",
+    # ── Consolidated Security Platform / SASE / MXDR / GRC (Todyl) ──
+    "sase", "secure access service edge", "mxdr", "managed xdr",
+    "grc", "governance risk and compliance", "governance risk compliance",
+    "security platform", "managed security service", "mssp", "cmmc",
     # ── Data Protection & Endpoint (BeachheadSecure / SMBsecure) ──
     "endpoint security", "endpoint protection", "edr", "encryption",
     "data protection", "data security", "data loss prevention", "dlp",
@@ -3693,7 +3723,8 @@ with tab5:
             ["cybersecurity", "endpoint protection", "vulnerability management",
              "SIEM", "SOC", "penetration testing", "security training",
              "IBM training", "Red Hat", "cloud security", "ransomware",
-             "data protection", "POPIA compliance", "network security"],
+             "data protection", "POPIA compliance", "network security",
+             "MXDR", "SASE", "third-party risk", "supply chain security", "attack surface"],
             key="solution_focus",
             default=["cybersecurity", "endpoint protection", "SOC", "ransomware", "POPIA compliance"],
         )
