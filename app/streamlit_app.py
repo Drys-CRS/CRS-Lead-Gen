@@ -1937,18 +1937,40 @@ import re as _re
 
 def _apollo_people_search(titles: list, countries: list, company: str = "",
                           per_page: int = 10) -> list:
-    """Apollo mixed_people/search — find contacts by title/country (+ optional
-    company). Returns lightweight contact dicts. Email is often masked until
-    enrichment; phone is rarely present here (Lusha fills it)."""
+    """Find prospect contacts via Apollo. Primary: mixed_people/search (whole DB).
+    Fallback: organizations/search → organization_top_people (the path the Lead
+    Intelligence tab uses, which works on more Apollo plans). Writes a short
+    diagnostic to st.session_state['_apollo_people_diag'] so the tab can show
+    WHY a search came back empty (plan/403 vs genuinely 0)."""
     import requests
     try:
         key = st.secrets.get("APOLLO_API_KEY", "")
     except Exception:
         key = ""
     if not key:
+        st.session_state["_apollo_people_diag"] = "no APOLLO_API_KEY"
         return []
     headers = {"Content-Type": "application/json", "Cache-Control": "no-cache",
                "x-api-key": key}
+
+    def _map(p, org=None):
+        org = org or p.get("organization") or {}
+        return {
+            "name":     f"{p.get('first_name','')} {p.get('last_name','')}".strip(),
+            "first":    p.get("first_name", ""),
+            "last":     p.get("last_name", ""),
+            "title":    p.get("title", ""),
+            "company":  org.get("name", "") or p.get("organization_name", ""),
+            "domain":   org.get("primary_domain", "") or org.get("domain", "") or "",
+            "email":    p.get("email", "") or "",
+            "email_status": p.get("email_status", "") or "",
+            "phone":    "",
+            "linkedin": p.get("linkedin_url", "") or "",
+            "country":  (p.get("country") or org.get("country") or
+                         (countries[0] if countries else "")),
+        }
+
+    # ── Primary: People Search across Apollo's DB ──────────────────────────
     payload = {"page": 1, "per_page": max(1, min(per_page, 25))}
     if titles:
         payload["person_titles"] = titles[:8]
@@ -1959,27 +1981,58 @@ def _apollo_people_search(titles: list, countries: list, company: str = "",
     try:
         r = requests.post("https://api.apollo.io/api/v1/mixed_people/search",
                           json=payload, headers=headers, timeout=25)
-        if not r.ok:
+        if r.ok:
+            people = r.json().get("people", []) or []
+            out = [_map(p) for p in people if p.get("first_name")]
+            if out:
+                st.session_state["_apollo_people_diag"] = f"people-search: {len(out)} found"
+                return out[:per_page]
+            st.session_state["_apollo_people_diag"] = (
+                "people-search returned 0 (plan may not include People Search) — "
+                "trying organisation → top-people fallback")
+        else:
+            st.session_state["_apollo_people_diag"] = (
+                f"people-search HTTP {r.status_code}: {r.text[:90]} — trying fallback")
+    except Exception as e:
+        st.session_state["_apollo_people_diag"] = f"people-search error: {e} — trying fallback"
+
+    # ── Fallback: org search → top people per org (proven endpoints) ───────
+    out = []
+    try:
+        org_payload = {"per_page": 5, "page": 1}
+        if countries:
+            org_payload["organization_locations"] = countries
+        if company:
+            org_payload["q_organization_name"] = company
+        else:
+            org_payload["q_organization_keyword_tags"] = [
+                "information technology", "cyber security", "computer & network security",
+                "banking", "telecommunications"]
+        ro = requests.post("https://api.apollo.io/api/v1/organizations/search",
+                           json=org_payload, headers=headers, timeout=25)
+        if not ro.ok:
+            st.session_state["_apollo_people_diag"] += f" | orgs HTTP {ro.status_code}: {ro.text[:80]}"
             return []
-        out = []
-        for p in r.json().get("people", []) or []:
-            org = p.get("organization") or {}
-            out.append({
-                "name":     f"{p.get('first_name','')} {p.get('last_name','')}".strip(),
-                "first":    p.get("first_name", ""),
-                "last":     p.get("last_name", ""),
-                "title":    p.get("title", ""),
-                "company":  org.get("name", "") or p.get("organization_name", ""),
-                "domain":   org.get("primary_domain", "") or "",
-                "email":    p.get("email", "") or "",
-                "email_status": p.get("email_status", "") or "",
-                "phone":    "",
-                "linkedin": p.get("linkedin_url", "") or "",
-                "country":  (p.get("country") or org.get("country") or ""),
-            })
-        return [c for c in out if c["name"]]
-    except Exception:
-        return []
+        orgs = ro.json().get("organizations", []) or []
+        for o in orgs[:5]:
+            oid = o.get("id")
+            if not oid:
+                continue
+            rp = requests.post(
+                "https://api.apollo.io/api/v1/mixed_people/organization_top_people",
+                json={"organization_id": oid, "person_titles": titles[:5],
+                      "per_page": per_page},
+                headers=headers, timeout=25)
+            if rp.ok:
+                for p in rp.json().get("people", []) or []:
+                    if p.get("first_name"):
+                        out.append(_map(p, org=o))
+            if len(out) >= per_page:
+                break
+        st.session_state["_apollo_people_diag"] += f" | fallback: {len(out)} via {len(orgs)} org(s)"
+    except Exception as e:
+        st.session_state["_apollo_people_diag"] += f" | fallback error: {e}"
+    return out[:per_page]
 
 
 def _lusha_enrich_person(first: str = "", last: str = "", company: str = "",
@@ -2014,20 +2067,28 @@ def _lusha_enrich_person(first: str = "", last: str = "", company: str = "",
         if not r.ok:
             return {}
         data = r.json().get("data", r.json()) or {}
-        # Phones / emails can appear as arrays of objects or strings
-        def _first_val(obj, *keys):
-            for k in keys:
-                v = obj.get(k)
-                if isinstance(v, list) and v:
-                    item = v[0]
-                    if isinstance(item, dict):
-                        return item.get("number") or item.get("email") or item.get("value") or ""
-                    return str(item)
-                if isinstance(v, str) and v:
-                    return v
-            return ""
-        phone = _first_val(data, "phoneNumbers", "phones", "phoneNumber", "phone")
-        em    = _first_val(data, "emailAddresses", "emails", "email")
+        # Phones / emails can appear as arrays of objects or strings, and the
+        # number can live under several keys depending on Lusha's record.
+        def _first_phone(obj):
+            v = obj.get("phoneNumbers") or obj.get("phones") or obj.get("phoneNumber") or obj.get("phone")
+            if isinstance(v, list) and v:
+                item = v[0]
+                if isinstance(item, dict):
+                    return (item.get("internationalNumber") or item.get("number")
+                            or item.get("localizedNumber") or item.get("e164")
+                            or item.get("value") or "")
+                return str(item)
+            return v if isinstance(v, str) else ""
+        def _first_email(obj):
+            v = obj.get("emailAddresses") or obj.get("emails") or obj.get("email")
+            if isinstance(v, list) and v:
+                item = v[0]
+                if isinstance(item, dict):
+                    return item.get("email") or item.get("address") or item.get("value") or ""
+                return str(item)
+            return v if isinstance(v, str) else ""
+        phone = _first_phone(data)
+        em    = _first_email(data)
         return {
             "phone":    phone or "",
             "email":    em or "",
@@ -2036,6 +2097,36 @@ def _lusha_enrich_person(first: str = "", last: str = "", company: str = "",
         }
     except Exception:
         return {}
+
+
+@st.cache_data(ttl=300)
+def _lusha_account_usage() -> dict:
+    """Lusha Account API (GET /v3/account/usage) — credit balance + plan.
+    Cached 5 min to respect the 5-requests/minute limit. Returns {} with no key,
+    or {'_error': ...} on failure."""
+    import requests
+    try:
+        key = st.secrets.get("LUSHA_API_KEY", "")
+    except Exception:
+        key = ""
+    if not key:
+        return {}
+    try:
+        r = requests.get("https://api.lusha.com/v3/account/usage",
+                         headers={"api_key": key, "Accept": "application/json"}, timeout=15)
+        if not r.ok:
+            return {"_error": f"HTTP {r.status_code}"}
+        j = r.json() or {}
+        credits = j.get("credits") or {}
+        plan = j.get("plan") or {}
+        return {
+            "total":     credits.get("total"),
+            "used":      credits.get("used"),
+            "remaining": credits.get("remaining"),
+            "plan":      plan.get("category", ""),
+        }
+    except Exception as e:
+        return {"_error": str(e)[:80]}
 
 
 _EMAIL_RE = _re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -4817,6 +4908,21 @@ with tab_verify:
         st.info("Add **APOLLO_API_KEY** to Streamlit secrets to run the cascade. "
                 "Add **LUSHA_API_KEY** as well to enable phone enrichment (Layer 3).")
 
+    # Lusha credit meter (Account API — cached 5 min)
+    if _has_lusha:
+        _lu = _lusha_account_usage()
+        if _lu and not _lu.get("_error"):
+            lc1, lc2, lc3 = st.columns(3)
+            _rem = _lu.get("remaining")
+            lc1.metric("Lusha credits remaining", f"{_rem:,}" if isinstance(_rem, (int, float)) else "—")
+            _used = _lu.get("used")
+            lc2.metric("Lusha credits used", f"{_used:,}" if isinstance(_used, (int, float)) else "—")
+            lc3.metric("Lusha plan", str(_lu.get("plan") or "—").title())
+            if isinstance(_rem, (int, float)) and _rem <= 0:
+                st.warning("Lusha credits are exhausted — phone enrichment will return no data until they reset.")
+        elif _lu.get("_error"):
+            st.caption(f"Lusha credit check unavailable ({_lu['_error']}).")
+
     # ── Step 1: input trigger / filters ────────────────────────────────────
     st.markdown("#### 1 · Target filters")
     vf1, vf2 = st.columns(2)
@@ -4860,6 +4966,9 @@ with tab_verify:
             _vlog("[Apollo] Searching contacts by title / country…")
             people = _apollo_people_search(v_titles, v_countries, v_company.strip(),
                                            per_page=int(v_limit))
+            _adiag = st.session_state.get("_apollo_people_diag", "")
+            if _adiag:
+                _vlog(f"[Apollo] {_adiag}")
             _vlog(f"[Apollo] Found {len(people)} contact(s).")
 
             results, provider_counts = [], {"Apollo": 0, "Lusha": 0}
