@@ -344,6 +344,7 @@ def run_pipeline(trigger: str = "scheduled", years_back: int = 3, skip_scrape: b
         # ── 1. Scrape ──────────────────────────────────────────────────────
         if not skip_scrape:
             out("Starting scrape…")
+            _ann_snapshot = _snapshot_open_annotations()  # preserve scores/flags
             scrape_south_africa(out)
             for country in OCDS_REGISTRY:
                 if country != "South Africa":
@@ -356,6 +357,7 @@ def run_pipeline(trigger: str = "scheduled", years_back: int = 3, skip_scrape: b
                 scrape_non_ocds_countries(out)
             except Exception as e:
                 out(f"  ❌ Non-OCDS scraper: {e}")
+            _restore_open_annotations(_ann_snapshot, out)  # re-apply scores/flags
             st.cache_data.clear()
         else:
             out("Skipping scrape — running AI analysis on freshly-refreshed data.")
@@ -1114,7 +1116,7 @@ def ai_analyse_partners(awarded_df) -> list:
         if not company or len(company) < 3:
             continue
         country  = str(grp["country"].mode().iloc[0]) if "country" in grp else "Unknown"
-        titles   = grp["title"].dropna().str[:60].tolist()[:3] if "title" in grp else []
+        titles   = grp["title"].dropna().str[:80].tolist()[:5] if "title" in grp else []
         depts    = grp["department_name"].dropna().str[:50].unique().tolist()[:2] if "department_name" in grp else []
         t_nums   = grp["tender_number"].dropna().str[:30].tolist()[:2] if "tender_number" in grp else []
         agg_rows.append({
@@ -1142,9 +1144,11 @@ def ai_analyse_partners(awarded_df) -> list:
         '"partner_classification":"System Integrator",'
         '"proposed_solutions":["VECTRA","vRx"],'
         '"key_tenders":["RFQ/2024/001","ICT-2023-045"],'
+        '"tenders_won_summary":"Mostly large-scale network and security infrastructure '
+        'contracts for national government and policing - supply, installation, monitoring and support.",'
         '"issuing_departments":["SAPS","Dept of Health"],'
         '"why_aligned":"Wins large ICT integration tenders for government clients.",'
-        '"outreach_angle":"Lead with VECTRA NDR — they won the SAPS network monitoring tender.",'
+        '"outreach_angle":"Lead with VECTRA NDR - they won the SAPS network monitoring tender.",'
         '"urgency":"high","estimated_deal_size":"large"}'
     )
 
@@ -1161,6 +1165,10 @@ def ai_analyse_partners(awarded_df) -> list:
         "\n\nIdentify the TOP 12 companies CRS should approach as channel partners or resellers. "
         "Focus on ICT/security companies — exclude government departments, construction, catering, "
         "cleaning, vehicles, stationery.\n\n"
+        "For each company, set 'tenders_won_summary' to a concise 1–2 sentence plain-English "
+        "description of the TYPES of tenders/work that company has won — inferred from its sample "
+        "tenders and the departments it serves — so a salesperson instantly understands what the "
+        "company actually does.\n\n"
         "Return ONLY a valid JSON array — no markdown fences, no explanation, no text before or after. "
         "Array must start with [ and end with ]. Each element must follow this exact schema:\n"
         "[" + schema_example + ", ...]"
@@ -1811,10 +1819,11 @@ def format_partner_card(p) -> str:
         f"Country: {p.get('country','N/A')}",
         f"Partner Type: {p.get('partner_classification') or p.get('partnership_type','N/A')}",
         f"Tenders Won: {p.get('tenders_won','?')}",
+        f"What They Won: {p.get('tenders_won_summary','')}",
         f"Urgency: {p.get('urgency','N/A').upper()}",
         f"Deal Size: {p.get('estimated_deal_size','N/A')}",
         f"Proposed Solutions: {solutions}",
-        f"Key Tenders: {tenders}",
+        f"Reference Tenders: {tenders}",
         f"Departments Served: {depts}",
         f"Why Aligned: {p.get('why_aligned','')}",
         f"Outreach Angle: {p.get('outreach_angle','')}",
@@ -2464,6 +2473,56 @@ def scrape_ocds_country(country: str, out, years_back: int = 3):
     return {"open": n_open, "awarded": n_awarded}
 
 
+def _snapshot_open_annotations() -> dict:
+    """Capture AI scores / rationales / irrelevant-flags for current open tenders,
+    keyed by tender_number, so they survive the delete-and-reinsert that scraping
+    performs. Without this, every refresh wipes the scores off open tenders."""
+    snap = {}
+    try:
+        step, start = 1000, 0
+        while True:
+            rows = (supabase.table("sa_tenders")
+                    .select("tender_number, ai_score, ai_rationale, is_irrelevant")
+                    .eq("status", "Open")
+                    .range(start, start + step - 1).execute().data) or []
+            for r in rows:
+                tn = r.get("tender_number")
+                if tn and (r.get("ai_score") is not None or r.get("is_irrelevant")):
+                    snap[tn] = {
+                        "ai_score":      r.get("ai_score"),
+                        "ai_rationale":  r.get("ai_rationale"),
+                        "is_irrelevant": r.get("is_irrelevant"),
+                    }
+            if len(rows) < step:
+                break
+            start += step
+    except Exception:
+        pass
+    return snap
+
+
+def _restore_open_annotations(snap: dict, out=None) -> int:
+    """Re-apply snapshotted scores / flags to open tenders that still exist after a
+    scrape, matched by tender_number. Returns the number of rows restored."""
+    if not snap:
+        return 0
+    restored = 0
+    for tn, vals in snap.items():
+        payload = {k: v for k, v in vals.items() if v is not None}
+        if not payload:
+            continue
+        try:
+            res = (supabase.table("sa_tenders").update(payload)
+                   .eq("tender_number", tn).eq("status", "Open").execute())
+            if res.data:
+                restored += len(res.data)
+        except Exception:
+            pass
+    if out and restored:
+        out(f"  ♻️ Restored AI scores/flags on {restored} tender(s) that survived the refresh.")
+    return restored
+
+
 def _count_rows(table: str, **filters) -> int:
     """Exact row count for a table, with optional .eq() filters. Returns 0 on error."""
     try:
@@ -2529,6 +2588,12 @@ def run_all_scrapers(years_back: int = 3, log_run: bool = True):
         f"**{before_awarded:,}** awarded already in Supabase."
     )
 
+    # Preserve existing AI scores / irrelevant-flags across the scrape (the open
+    # delete-and-reinsert below would otherwise wipe them).
+    _ann_snapshot = _snapshot_open_annotations()
+    if _ann_snapshot:
+        out_write(f"💾 Saved AI scores/flags for {len(_ann_snapshot)} tender(s) to re-apply after scraping.")
+
     # ── 2. South Africa: live eTenders API (primary), OCDS registry (fallback) ─
     sa_ok = False
     try:
@@ -2562,7 +2627,9 @@ def run_all_scrapers(years_back: int = 3, log_run: bool = True):
         errors.append(f"Non-OCDS sources: {e}")
         out_write(f"  ❌ Non-OCDS scraper crashed: {e}")
 
-    # ── 5. Snapshot AFTER + clear cache so the dashboard reads fresh data ─────
+    # ── 5. Restore preserved scores/flags, then snapshot AFTER + clear cache ──
+    _restore_open_annotations(_ann_snapshot, out_write)
+
     after_open    = _count_rows("sa_tenders", status="Open")
     after_awarded = _count_rows("awarded_tenders")
     duration      = int(round(_t.time() - t0))
@@ -3120,10 +3187,15 @@ with tab2:
                         if solutions:
                             st.write(f"**💡 Proposed CRS Solutions:** {' · '.join(solutions)}")
 
+                        # High-level description of what this company has won
+                        _tw_summary = p.get("tenders_won_summary", "")
+                        if _tw_summary:
+                            st.write(f"**🏆 Tenders Won:** {_tw_summary}")
+
                         # Key tenders won
                         key_tenders = p.get("key_tenders", [])
                         if key_tenders:
-                            st.write(f"**📋 Key Tenders Won:** {', '.join(str(t) for t in key_tenders[:3])}")
+                            st.write(f"**📋 Reference tenders:** {', '.join(str(t) for t in key_tenders[:3])}")
 
                         # Departments served
                         depts = p.get("issuing_departments", [])
