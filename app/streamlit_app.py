@@ -2817,7 +2817,8 @@ if selected_countries and "country" in df_filtered.columns:
     df_filtered = df_filtered[df_filtered["country"].isin(selected_countries)]
 
 # ─────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab_home, tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "🏠 Overview",
     "📢 Open Opportunities",
     "🏆 Competitive Intelligence",
     "🤖 AI Tender Parser",
@@ -2825,6 +2826,87 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "🎯 Lead Intelligence",
     "⚙️ Pipeline & Health"
 ])
+
+# ══════════════════════════════════════════════
+# TAB HOME — OVERVIEW (Tenders-SA style landing)
+# ══════════════════════════════════════════════
+with tab_home:
+    st.subheader("CRS Tender Intelligence — Overview")
+    st.caption("Africa-wide government & private-sector tender intelligence for "
+               "Cyber Retaliator Solutions — active tenders, historical awards, and "
+               "AI-powered partner & lead intelligence in one place.")
+
+    # ── Hero stats ──────────────────────────────────────────────────────────
+    _open_n      = len(tenders_df)
+    _awarded_n   = _count_rows("awarded_tenders")
+    _countries_n = tenders_df["country"].nunique() if "country" in tenders_df.columns else 0
+    if "ai_score" in tenders_df.columns:
+        _scores  = pd.to_numeric(tenders_df["ai_score"], errors="coerce")
+        _scored_n = int(_scores.notna().sum())
+        _high_n   = int((_scores >= 8).sum())
+    else:
+        _scored_n = _high_n = 0
+
+    h1, h2, h3, h4, h5 = st.columns(5)
+    h1.metric("📂 Open Tenders",       f"{_open_n:,}")
+    h2.metric("🏆 Awarded (history)",  f"{_awarded_n:,}")
+    h3.metric("🌍 Countries",          f"{_countries_n}")
+    h4.metric("🔴 High Priority (≥8)", f"{_high_n}")
+    h5.metric("🤖 Scored",             f"{_scored_n}/{_open_n}")
+
+    st.divider()
+
+    # ── Just Added Opportunities (recent open tenders as cards) ─────────────
+    st.markdown("### 🆕 Just Added Opportunities")
+    _recent = tenders_df.copy()
+    if "issue_date" in _recent.columns:
+        _recent["_d"] = pd.to_datetime(_recent["issue_date"], errors="coerce")
+        _recent = _recent.sort_values("_d", ascending=False, na_position="last")
+    _recent = _recent.head(6)
+    if _recent.empty:
+        st.info("No open tenders yet — run a refresh to populate.")
+    else:
+        _rc = st.columns(3)
+        for _i, (_, _t) in enumerate(_recent.iterrows()):
+            with _rc[_i % 3]:
+                with st.container(border=True):
+                    _sc = _t.get("ai_score")
+                    _badge = score_badge(_sc) if pd.notna(_sc) else "⚪ Unscored"
+                    st.markdown(f"**{str(_t.get('title', '(untitled)'))[:90]}**")
+                    st.caption(f"📍 {_t.get('country', '')} · {str(_t.get('department_name', ''))[:40]}")
+                    st.caption(f"🗓️ Closes: {_t.get('closing_date', 'N/A')}  ·  {_badge}")
+
+    st.divider()
+
+    # ── Browse by Country / Category / Department ───────────────────────────
+    st.markdown("### 🧭 Browse Open Tenders")
+    _bc1, _bc2, _bc3 = st.columns(3)
+    with _bc1:
+        st.markdown("**🌍 By Country**")
+        if "country" in tenders_df.columns:
+            _by = tenders_df["country"].fillna("Unknown").value_counts().head(12)
+            st.dataframe(_by.rename_axis("Country").reset_index(name="Open"),
+                         hide_index=True, use_container_width=True)
+    with _bc2:
+        st.markdown("**🗂️ By Category**")
+        if "category" in tenders_df.columns and tenders_df["category"].notna().any():
+            _by = tenders_df["category"].fillna("Uncategorised").value_counts().head(12)
+            st.dataframe(_by.rename_axis("Category").reset_index(name="Open"),
+                         hide_index=True, use_container_width=True)
+        else:
+            st.caption("No category data on current tenders.")
+    with _bc3:
+        st.markdown("**🏛️ By Department / Buyer**")
+        if "department_name" in tenders_df.columns:
+            _by = tenders_df["department_name"].fillna("Unknown").value_counts().head(12)
+            st.dataframe(_by.rename_axis("Department").reset_index(name="Open"),
+                         hide_index=True, use_container_width=True)
+
+    st.divider()
+    st.caption("👉 **Open Opportunities** to filter & act on tenders · "
+               "**Competitive Intelligence** for awarded analysis & partner candidates · "
+               "**AI Discovery** for private-sector RFPs · **Lead Intelligence** for buying signals.")
+
 
 # ══════════════════════════════════════════════
 # TAB 1 — OPEN OPPORTUNITIES
@@ -3367,9 +3449,53 @@ with tab4:
         st.subheader("Review Candidates")
         st.caption("⚠️ AI-discovered results can include stale or incorrect listings — verify the source link before bidding.")
 
-        disc_df = pd.DataFrame(st.session_state["discovered"])
-        st.dataframe(disc_df, use_container_width=True, hide_index=True)
+        discovered = st.session_state["discovered"]
+        disc_df = pd.DataFrame(discovered)
 
+        # Selectable table — pick a row to see its full card + copy, same UX as
+        # Open Opportunities.
+        _disc_cols = [c for c in ["title", "organisation", "country", "sector",
+                                  "closing_date", "source_url"] if c in disc_df.columns]
+        disc_event = st.dataframe(
+            disc_df[_disc_cols] if _disc_cols else disc_df,
+            use_container_width=True,
+            hide_index=True,
+            selection_mode="single-row",
+            on_select="rerun",
+            key="disc_table",
+        )
+
+        # Detail card for the selected discovered tender
+        if disc_event.selection.rows:
+            _di = disc_event.selection.rows[0]
+            if isinstance(_di, int) and _di < len(discovered):
+                d = discovered[_di]
+                _card = {
+                    "tender_number":           "AI-DISCOVERED",
+                    "title":                   d.get("title", ""),
+                    "department_name":         d.get("organisation", ""),
+                    "country":                 d.get("country", ""),
+                    "closing_date":            d.get("closing_date") or "Verify on portal",
+                    "description":             d.get("description", ""),
+                    "compliance_requirements": "Verify on source portal",
+                    "portal_link":             d.get("source_url") or "",
+                }
+                st.divider()
+                st.subheader(f"📄 {d.get('title', '(untitled)')}")
+                _cpc, _ = st.columns([1, 5])
+                with _cpc:
+                    copy_button(format_tender_card(_card),
+                                label="📋 Copy Tender",
+                                key=f"cp_disc_{_di}")
+                st.write(f"**Organisation:** {d.get('organisation', 'N/A')}  |  "
+                         f"**Country:** {d.get('country', 'N/A')}")
+                st.write(f"**Sector:** {d.get('sector', 'N/A')}")
+                st.write(f"**Closing Date:** {d.get('closing_date') or 'Verify on portal'}")
+                st.write(f"**Description:** {d.get('description', 'N/A')}")
+                if d.get("source_url"):
+                    st.markdown(f"[🔗 Source notice]({d['source_url']})")
+
+        st.divider()
         save_col1, save_col2 = st.columns(2)
         with save_col1:
             if st.button("💾 Save All to Database", key="btn_save_all_discovered"):
