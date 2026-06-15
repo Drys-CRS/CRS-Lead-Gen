@@ -5467,7 +5467,7 @@ with tab_verify:
             _vlog(f"[Score] {sum(1 for r in results if r['status']=='Verified')} verified · "
                   f"{sum(1 for r in results if r['status']=='Quarantine')} quarantined.")
 
-            # Log run to Supabase
+            # Persist every parsed account to Supabase (verified + quarantine)
             try:
                 rows = [{
                     "target_company": (v_company.strip() if discover_mode else None) or None,
@@ -5486,10 +5486,15 @@ with tab_verify:
                     "cost_estimate": round(0.03 * max(1, len(r.get("provider_chain", "").split("→"))), 3),
                 } for r in results]
                 if rows:
-                    supabase.table("lead_verification_log").insert(rows).execute()
-                    _vlog(f"[Supabase] Logged {len(rows)} row(s) to lead_verification_log.")
+                    resp = supabase.table("lead_verification_log").insert(rows).execute()
+                    n_saved = len(getattr(resp, "data", None) or rows)
+                    st.session_state["verify_save_status"] = {"ok": True, "n": n_saved}
+                    _vlog(f"[Supabase] Saved {n_saved} account(s) to lead_verification_log.")
+                else:
+                    st.session_state["verify_save_status"] = {"ok": True, "n": 0}
             except Exception as e:
-                _vlog(f"[Supabase] Log skipped: {e}")
+                st.session_state["verify_save_status"] = {"ok": False, "error": str(e)[:200]}
+                _vlog(f"[Supabase] Save FAILED: {e}")
 
             st.session_state["verify_results"] = results
             st.session_state["verify_provider_counts"] = provider_counts
@@ -5509,6 +5514,17 @@ with tab_verify:
         if pcounts:
             st.caption("Provider hits: " + " · ".join(f"{k} {v}" for k, v in pcounts.items() if v))
 
+        # Persistent save-to-table status
+        _save = st.session_state.get("verify_save_status")
+        if _save:
+            if _save.get("ok"):
+                st.success(f"💾 Saved {_save.get('n',0)} account(s) to Supabase table "
+                           f"`lead_verification_log`.")
+            else:
+                st.error(f"💾 Save to `lead_verification_log` FAILED: {_save.get('error','')}. "
+                         "Accounts are still shown below — check the SUPABASE_KEY has insert "
+                         "rights (service role) and that RLS allows inserts.")
+
         _df = pd.DataFrame([{
             "Name": r.get("name",""), "Title": r.get("title",""),
             "Company": r.get("company",""), "Authority": r.get("authority",""),
@@ -5518,11 +5534,41 @@ with tab_verify:
             "Status": r.get("status",""),
         } for r in results])
 
+        def _acc_badge(s):
+            s = int(s or 0)
+            dot = "🟢" if s >= 60 else ("🟡" if s >= 40 else "🔴")
+            return f"{dot} {s}/100"
+
+        def _render_cards(rows, key_prefix):
+            for i in range(0, len(rows), 2):
+                cols = st.columns(2)
+                for j, r in enumerate(rows[i:i + 2]):
+                    with cols[j].container(border=True):
+                        st.markdown(f"**{r.get('name') or '(no name)'}**  {_acc_badge(r.get('accuracy_score',0))}")
+                        meta = []
+                        if r.get("authority"):
+                            meta.append(f"🎯 {r['authority']}")
+                        meta.append(("✅ " if r.get("status") == "Verified" else "🟠 ") + r.get("status",""))
+                        st.caption(" · ".join(meta))
+                        st.markdown(f"{r.get('title') or '—'} · **{r.get('company') or '—'}**")
+                        loc = r.get("country") or r.get("location") or ""
+                        if loc:
+                            st.caption(f"📍 {loc}")
+                        st.markdown(f"📧 {r.get('email') or '—'}  \n📞 {r.get('phone') or '—'}")
+                        if r.get("linkedin"):
+                            st.markdown(f"[🔗 LinkedIn profile]({r['linkedin']})")
+                        if r.get("provider_chain") and r["provider_chain"] != "—":
+                            st.caption(f"Source: {r['provider_chain']}")
+                        if r.get("opener"):
+                            st.markdown(f"_{r['opener']}_")
+                            copy_button(r["opener"], label="📋 Copy opener",
+                                        key=f"{key_prefix}_op_{i+j}")
+
         st.markdown("#### ✅ Verified leads")
         verified = [r for r in results if r["status"] == "Verified"]
         if verified:
-            st.dataframe(_df[_df["Status"] == "Verified"].drop(columns=["Status"]),
-                         use_container_width=True, hide_index=True)
+            _render_cards(verified, "vcard")
+            st.write("")
             if _MONDAY_AVAILABLE:
                 if st.button(f"📤 Push {len(verified)} verified lead(s) to Monday", key="verify_push"):
                     pushed, failed = 0, 0
@@ -5541,22 +5587,39 @@ with tab_verify:
         st.markdown("#### 🟠 Quarantine (review before CRM write)")
         quarantine = [r for r in results if r["status"] == "Quarantine"]
         if quarantine:
-            st.dataframe(_df[_df["Status"] == "Quarantine"].drop(columns=["Status"]),
-                         use_container_width=True, hide_index=True)
+            _render_cards(quarantine, "qcard")
             st.caption("Low-confidence contacts (missing/invalid email or phone). Verify manually "
                        "before pushing — they are not written to the CRM automatically.")
         else:
             st.caption("Nothing quarantined.")
 
-        # Outreach openers
-        _openers = [r for r in verified if r.get("opener")]
-        if _openers:
-            with st.expander("✍️ AI outreach openers (verified leads)"):
-                for _oi, r in enumerate(_openers):
-                    st.markdown(f"**{r.get('name','')}** — {r.get('authority','')}")
-                    st.write(r.get("opener",""))
-                    copy_button(r.get("opener",""), label="📋 Copy opener",
-                                key=f"vop_{_oi}")
+        # Table view + CSV export
+        with st.expander("📋 Table view / export CSV"):
+            st.dataframe(_df, use_container_width=True, hide_index=True)
+            st.download_button("⬇️ Export all parsed accounts as CSV",
+                               _df.to_csv(index=False), file_name="verified_leads.csv",
+                               mime="text/csv", key="verif_csv")
+
+    # ── Saved accounts (read back from the Supabase table) ──────────────────
+    with st.expander("💾 Saved accounts in Supabase (lead_verification_log)", expanded=False):
+        try:
+            _saved = (supabase.table("lead_verification_log")
+                      .select("run_at,contact_name,contact_title,company,country,email,"
+                              "phone,linkedin,authority,accuracy_score,status,provider_chain")
+                      .order("run_at", desc=True).limit(100).execute())
+            _sdata = _saved.data or []
+            if _sdata:
+                st.caption(f"{len(_sdata)} most-recent saved account(s), newest first.")
+                _sdf = pd.DataFrame(_sdata)
+                st.dataframe(_sdf, use_container_width=True, hide_index=True)
+                st.download_button("⬇️ Export saved accounts as CSV", _sdf.to_csv(index=False),
+                                   file_name="lead_verification_log.csv", mime="text/csv",
+                                   key="saved_csv")
+            else:
+                st.info("No saved accounts yet — run a cascade that returns contacts and they'll "
+                        "be written here automatically.")
+        except Exception as e:
+            st.caption(f"Couldn't read saved accounts: {e}")
 
 
 # ══════════════════════════════════════════════
