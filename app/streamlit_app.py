@@ -2310,17 +2310,66 @@ def scrape_ocds_country(country: str, out):
     _upsert_awarded(awarded_records, country, f"Awarded (all history, {len(awarded_records)} records)", out)
 
 
+def _count_rows(table: str, **filters) -> int:
+    """Exact row count for a table, with optional .eq() filters. Returns 0 on error."""
+    try:
+        q = supabase.table(table).select("id", count="exact")
+        for k, v in filters.items():
+            q = q.eq(k, v)
+        return q.execute().count or 0
+    except Exception:
+        return 0
+
+
+def _country_counts(table: str, **filters):
+    """Return a Counter of {country: rows} for a table, paginating past the
+    1000-row API cap so large tables (e.g. awarded_tenders) count correctly."""
+    import collections as _collections
+    counter = _collections.Counter()
+    step, start = 1000, 0
+    while True:
+        try:
+            q = supabase.table(table).select("country")
+            for k, v in filters.items():
+                q = q.eq(k, v)
+            rows = q.range(start, start + step - 1).execute().data or []
+        except Exception:
+            break
+        if not rows:
+            break
+        counter.update((r.get("country") or "Unknown") for r in rows)
+        if len(rows) < step:
+            break
+        start += step
+    return counter
+
+
 def run_all_scrapers():
-    """Run every country scraper with a live progress log in the main area."""
+    """Full country refresh: scrape every live source, filter each record through
+    the CRS relevance keyword set, upsert (dedupe) into Supabase, then render a
+    before/after comparison and log the run to pipeline_runs."""
+    import time as _t
+
     st.subheader("🔄 Refreshing tender data across Africa…")
     log = st.empty()
     lines = []
 
     def out_write(msg):
         lines.append(msg)
-        log.markdown("\n\n".join(lines))
+        log.markdown("\n\n".join(lines[-40:]))
 
-    # South Africa: live eTenders API (most current), registry fallback if unreachable
+    t0 = _t.time()
+    errors = []
+
+    # ── 1. Snapshot BEFORE — so we can show true new-vs-existing deltas ───────
+    before_open    = _count_rows("sa_tenders", status="Open")
+    before_awarded = _count_rows("awarded_tenders")
+    out_write(
+        f"📦 Starting state — **{before_open:,}** open tenders, "
+        f"**{before_awarded:,}** awarded already in Supabase."
+    )
+
+    # ── 2. South Africa: live eTenders API (primary), OCDS registry (fallback) ─
     sa_ok = False
     try:
         scrape_south_africa(out_write)
@@ -2332,25 +2381,85 @@ def run_all_scrapers():
         try:
             scrape_ocds_country("South Africa", out_write)
         except Exception as e:
+            errors.append(f"South Africa: {e}")
             out_write(f"  ❌ South Africa registry fallback also failed: {e}")
 
-    # OCDS countries
+    # ── 3. OCDS countries ─────────────────────────────────────────────────────
     for country in OCDS_REGISTRY:
         if country == "South Africa":
             continue  # handled above with live API + fallback
         try:
             scrape_ocds_country(country, out_write)
         except Exception as e:
+            errors.append(f"{country}: {e}")
             out_write(f"  ❌ {country} crashed: {e}")
 
-    # Non-OCDS countries via World Bank + UNDP
+    # ── 4. Non-OCDS countries via World Bank + UNDP ──────────────────────────
     try:
         out_write("\n🌍 Scraping non-OCDS countries via World Bank & UNDP…")
         scrape_non_ocds_countries(out_write)
     except Exception as e:
+        errors.append(f"Non-OCDS sources: {e}")
         out_write(f"  ❌ Non-OCDS scraper crashed: {e}")
 
-    out_write("\n✅ **All 28 countries done!**")
+    # ── 5. Snapshot AFTER + clear cache so the dashboard reads fresh data ─────
+    after_open    = _count_rows("sa_tenders", status="Open")
+    after_awarded = _count_rows("awarded_tenders")
+    duration      = int(round(_t.time() - t0))
+    new_open      = after_open - before_open
+    new_awarded   = max(after_awarded - before_awarded, 0)
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
+
+    out_write(f"\n✅ **Refresh complete in {duration}s.**")
+
+    # ── 6. Per-country comparison (what's relevant & live in Supabase now) ────
+    open_by = _country_counts("sa_tenders", status="Open")
+    awd_by  = _country_counts("awarded_tenders")
+    all_countries = sorted(set(open_by) | set(awd_by))
+
+    st.divider()
+    st.subheader("📊 Refresh Comparison")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Open tenders (now)", f"{after_open:,}",    f"{new_open:+,}")
+    m2.metric("Awarded (now)",      f"{after_awarded:,}", f"{new_awarded:+,} new")
+    m3.metric("Countries with data", f"{len(all_countries)}")
+    m4.metric("Duration",           f"{duration}s")
+
+    if all_countries:
+        comp_df = pd.DataFrame([
+            {"Country": c,
+             "Open (relevant)":    open_by.get(c, 0),
+             "Awarded (relevant)": awd_by.get(c, 0)}
+            for c in all_countries
+        ]).sort_values(["Open (relevant)", "Awarded (relevant)"], ascending=False)
+        st.dataframe(comp_df, use_container_width=True, hide_index=True)
+    else:
+        st.warning(
+            "No relevant tenders landed in Supabase. Either the source portals were "
+            "unreachable, or nothing matched the CRS keyword filter this run."
+        )
+
+    if errors:
+        with st.expander(f"⚠️ {len(errors)} source(s) reported errors"):
+            for e in errors:
+                st.write(f"- {e}")
+
+    st.info("Tables updated — open any tab to load the refreshed data.")
+
+    # ── 7. Log this refresh to pipeline_runs so it appears in run history ────
+    try:
+        supabase.table("pipeline_runs").insert({
+            "trigger": "refresh_countries",
+            "status":  "failed" if errors and (new_open + new_awarded) <= 0 else "success",
+            "tenders_scraped": max(new_open, 0) + new_awarded,
+            "duration_secs":   duration,
+            "error_log": ("\n".join(errors))[:5000] if errors else None,
+        }).execute()
+    except Exception:
+        pass
 
 # ─────────────────────────────────────────────
 # 9. MAIN DASHBOARD
@@ -2370,9 +2479,10 @@ if _MONDAY_AVAILABLE:
 else:
     st.sidebar.caption("⚪ Monday.com — add MONDAY_API_KEY to secrets")
 if st.sidebar.button("🔄 Refresh All Countries"):
+    # run_all_scrapers() clears the data cache and renders its own comparison
+    # summary in the main area — do NOT st.rerun() here or the summary is wiped.
     run_all_scrapers()
-    st.cache_data.clear()
-    st.rerun()
+    st.stop()
 
 if st.sidebar.button("🚀 Run Full Pipeline Now"):
     with st.spinner("Running full pipeline…"):
