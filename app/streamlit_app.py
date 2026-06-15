@@ -303,7 +303,7 @@ def scrape_non_ocds_countries(out):
 
 
 def run_pipeline(trigger: str = "scheduled", years_back: int = 3, skip_scrape: bool = False,
-                 live_out=None):
+                 live_out=None, max_score: int = 40):
     """
     Full autonomous pipeline:
     1. Scrape all countries (skipped when skip_scrape=True — e.g. when a refresh
@@ -367,14 +367,32 @@ def run_pipeline(trigger: str = "scheduled", years_back: int = 3, skip_scrape: b
             counters["tenders_scraped"] = len(tenders_df)
 
             # ── 2. Score open tenders ─────────────────────────────────────
+            # Capped + time-budgeted so a big backlog can never run long enough
+            # to exhaust Streamlit Cloud's container. Remaining tenders are
+            # scored on the next run.
             out("Scoring open tenders…")
             open_df = tenders_df[tenders_df["status"] == "Open"].copy()
             for col in ["ai_score", "ai_rationale"]:
                 if col not in open_df.columns:
                     open_df[col] = None
-            unscored = open_df[open_df["ai_score"].isna()]
+            unscored = open_df[open_df["ai_score"].isna()].copy()
+
+            # Prioritise soonest-closing tenders so the most urgent score first
+            if "closing_date" in unscored.columns:
+                unscored["_cd"] = pd.to_datetime(unscored["closing_date"], errors="coerce")
+                unscored = unscored.sort_values("_cd", na_position="last").drop(columns=["_cd"])
+
+            total_unscored = len(unscored)
+            batch = unscored.head(max(int(max_score), 0))
+            _score_budget_s = 90              # hard wall-clock cap for this phase
+            _score_start = _pt.time()
             score_rows = []
-            for _, row in unscored.iterrows():
+            _stopped_early = False
+            for _, row in batch.iterrows():
+                if _pt.time() - _score_start > _score_budget_s:
+                    out("  ⏱️ Scoring time budget (90s) reached — stopping this run early.")
+                    _stopped_early = True
+                    break
                 try:
                     scored = ai_score_tender(row.to_dict())
                     supabase.table("sa_tenders").update({
@@ -392,9 +410,16 @@ def run_pipeline(trigger: str = "scheduled", years_back: int = 3, skip_scrape: b
                         "status":        "Open",
                     })
                     counters["tenders_scored"] += 1
-                    _time.sleep(2)  # throttle
+                    _time.sleep(1)  # throttle to respect free-tier rate limits
                 except Exception as e:
                     out(f"  Scoring error {row.get('tender_number')}: {e}")
+
+            _remaining = total_unscored - len(score_rows)
+            if _remaining > 0:
+                out(f"  ℹ️ Scored {len(score_rows)} this run · {_remaining} tender(s) still "
+                    f"unscored — run again to continue (capped at {max_score}/run to protect the app).")
+            else:
+                out(f"  ✅ Scored all {len(score_rows)} open tender(s).")
             if score_rows:
                 try:
                     supabase.table("tender_score_history").insert(score_rows).execute()
@@ -1689,28 +1714,52 @@ def ai_match_tenders(open_df: pd.DataFrame) -> pd.DataFrame:
 # 7. SCORE BADGE HELPER
 # ─────────────────────────────────────────────
 def copy_button(text: str, label: str = "📋 Copy", key: str = "copy") -> None:
-    """Render a small copy-to-clipboard button using an HTML component.
-    Escapes the text so any quotes or newlines are safe inside JS."""
+    """Render a copy-to-clipboard button as an HTML component.
+
+    Two fixes over the naive version:
+    1. The text is JSON-encoded into a JS string literal (the old code ran
+       decodeURIComponent on HTML-escaped text, which throws on any '%').
+    2. Uses a hidden-textarea + document.execCommand('copy') fallback, because
+       navigator.clipboard is blocked inside Streamlit's sandboxed component
+       iframe — so the old button said "Copied!" but copied nothing.
+    """
     import streamlit.components.v1 as _comp
-    import html as _html
-    safe = _html.escape(str(text), quote=True).replace("\n", "&#10;").replace("\r", "")
-    unique = abs(hash(key + text[:30])) % 10_000_000
+    import json as _json
+    payload  = _json.dumps(str(text))
+    label_js = _json.dumps(str(label))
+    unique = abs(hash(key + str(text)[:40])) % 10_000_000
     _comp.html(f"""
 <style>
-#cbtn_{unique} {{
-    background: #1e3a5f; color: #e8f0fe; border: 1px solid #3a6fa8;
-    border-radius: 6px; padding: 4px 12px; font-size: 13px;
-    cursor: pointer; font-family: sans-serif; transition: background 0.2s;
-}}
-#cbtn_{unique}:hover {{ background: #2a5298; }}
-#cbtn_{unique}.copied {{ background: #1a5c2e; border-color: #2d9e52; color: #b7ffd0; }}
+#cbtn_{unique} {{ background:#1e3a5f; color:#e8f0fe; border:1px solid #3a6fa8;
+  border-radius:6px; padding:4px 12px; font-size:13px; cursor:pointer;
+  font-family:sans-serif; transition:background .2s; }}
+#cbtn_{unique}:hover {{ background:#2a5298; }}
+#cbtn_{unique}.copied {{ background:#1a5c2e; border-color:#2d9e52; color:#b7ffd0; }}
 </style>
-<button id="cbtn_{unique}"
-  onclick="navigator.clipboard.writeText(decodeURIComponent('{safe}'.replace(/&#10;/g,'\\n')));
-           this.textContent='✅ Copied!'; this.classList.add('copied');
-           setTimeout(()=>{{this.textContent='{label}';this.classList.remove('copied')}},2000)">
-  {label}
-</button>""", height=38)
+<button id="cbtn_{unique}">{label}</button>
+<script>
+(function() {{
+  const txt = {payload};
+  const lbl = {label_js};
+  const btn = document.getElementById("cbtn_{unique}");
+  function mark() {{
+    btn.textContent = '✅ Copied!'; btn.classList.add('copied');
+    setTimeout(function() {{ btn.textContent = lbl; btn.classList.remove('copied'); }}, 2000);
+  }}
+  function fallback() {{
+    const ta = document.createElement('textarea');
+    ta.value = txt; ta.style.position = 'fixed'; ta.style.top = '-1000px';
+    document.body.appendChild(ta); ta.focus(); ta.select();
+    try {{ document.execCommand('copy'); }} catch (e) {{}}
+    document.body.removeChild(ta); mark();
+  }}
+  btn.addEventListener('click', function() {{
+    if (navigator.clipboard && window.isSecureContext) {{
+      navigator.clipboard.writeText(txt).then(mark).catch(fallback);
+    }} else {{ fallback(); }}
+  }});
+}})();
+</script>""", height=40)
 
 
 def format_tender_card(t) -> str:
@@ -2597,32 +2646,48 @@ _refresh_years = st.sidebar.slider(
          "history but slower. Awarded rows accumulate across runs, so you can "
          "build deep history with repeated low-year refreshes too.",
 )
+_max_score = st.sidebar.number_input(
+    "Max tenders to AI-score per run",
+    min_value=10, max_value=500, value=40, step=10,
+    help="Caps the AI scoring phase so a big backlog can't run long enough to "
+         "crash the app. Soonest-closing tenders score first; the rest score on "
+         "the next run. There's also a hard 90-second time budget per run.",
+)
 
 if st.sidebar.button("🚀 Run Everything (Scrape → AI)", type="primary",
                      help="One click: scrape every country, then AI-score tenders, "
                           "analyse partners, and collect attack signals — writing all "
-                          "history tables. The AI phase can take several minutes."):
-    # 1) Scrape + comparison summary. log_run=False so only the AI pipeline below
-    #    logs the combined run to history.
-    run_all_scrapers(_refresh_years, log_run=False)
-    # 2) AI analysis on the freshly-scraped data, with a live log.
-    st.divider()
-    st.subheader("🤖 AI Analysis")
-    _ai_log = st.empty()
-    _ai_lines = []
-    def _ai_out(m):
-        _ai_lines.append(m)
-        _ai_log.markdown("\n\n".join(_ai_lines[-25:]))
-    with st.spinner("Scoring tenders → analysing partners → collecting attack signals…"):
-        run_pipeline("manual_full", years_back=_refresh_years,
-                     skip_scrape=True, live_out=_ai_out)
-    st.success("✅ Full cycle complete — scraping + AI analysis done. Open any tab to view results.")
+                          "history tables. The AI phase is capped to stay within limits."):
+    try:
+        # 1) Scrape + comparison summary. log_run=False so only the AI pipeline
+        #    below logs the combined run to history.
+        run_all_scrapers(_refresh_years, log_run=False)
+        # 2) AI analysis on the freshly-scraped data, with a live log.
+        st.divider()
+        st.subheader("🤖 AI Analysis")
+        _ai_log = st.empty()
+        _ai_lines = []
+        def _ai_out(m):
+            _ai_lines.append(m)
+            _ai_log.markdown("\n\n".join(_ai_lines[-25:]))
+        with st.spinner("Scoring tenders → analysing partners → collecting attack signals…"):
+            run_pipeline("manual_full", years_back=_refresh_years, skip_scrape=True,
+                         max_score=int(_max_score), live_out=_ai_out)
+        st.success("✅ Full cycle complete. Open any tab to view results. "
+                   "If some tenders are still unscored, just run it again.")
+    except Exception as e:
+        # A guard so a failure in the long run shows a message instead of a
+        # raw crash. (Container-level OOM/timeouts are prevented by the caps above.)
+        st.error(f"The run stopped on an error, but the app is still up: {e}")
     st.stop()
 
 if st.sidebar.button("🔄 Scrape Only (skip AI)",
                      help="Just refresh tender data from every country — no AI scoring. "
                           "Use when you only want fresh listings fast."):
-    run_all_scrapers(_refresh_years)
+    try:
+        run_all_scrapers(_refresh_years)
+    except Exception as e:
+        st.error(f"Scrape stopped on an error, but the app is still up: {e}")
     st.stop()
 
 if st.sidebar.button("🩺 Check Provider Health"):
@@ -3028,7 +3093,7 @@ with tab2:
                 st.divider()
 
                 # Expandable cards — one per partner
-                for p in sorted(partners, key=lambda x: {"high": 0, "medium": 1, "low": 2}.get(x.get("urgency","low"), 2)):
+                for _pi, p in enumerate(sorted(partners, key=lambda x: {"high": 0, "medium": 1, "low": 2}.get(x.get("urgency","low"), 2))):
                     urgency_icon = URGENCY_ICON.get(p.get("urgency", "low"), "⚪")
                     ptype = p.get("partner_classification") or p.get("partnership_type", "")
                     company = p.get("company", "Unknown")
@@ -3070,11 +3135,11 @@ with tab2:
 
                         copy_button(format_partner_card(p),
                                     label="📋 Copy Partner Card",
-                                    key=f"cp_p_{company[:20].replace(' ','_')}")
+                                    key=f"cp_p_{_pi}")
 
                         # Per-company Monday push button
                         if _MONDAY_AVAILABLE:
-                            btn_key = f"push_co_{company[:30].replace(' ','_')}"
+                            btn_key = f"push_co_{_pi}"
                             if st.button(f"📋 Push to Monday Companies", key=btn_key,
                                          help="Create or update this company on the 2.1 - Companies board"):
                                 with st.spinner(f"Pushing {company}…"):
@@ -3913,7 +3978,7 @@ Return ONLY a valid JSON object:
                 "Training Provider": "🟩",
                 "Consulting/Advisory": "🟧",
             }
-            for co in scored_cos_sorted:
+            for _li, co in enumerate(scored_cos_sorted):
                 score     = co.get("crs_score", 0)
                 icon      = URGENCY.get(co.get("urgency","low"), "⚪")
                 badge     = "🟢" if score >= 8 else "🟡" if score >= 5 else "🔴"
@@ -3933,7 +3998,7 @@ Return ONLY a valid JSON object:
 
                     enr = res.get("enriched",{}).get(co.get("name",""), {})
                     copy_button(format_lead_card(co, enr), label="📋 Copy Lead Card",
-                                key=f"cp_lead_{co.get('name','')[:25]}")
+                                key=f"cp_lead_{_li}")
                     if enr:
                         ec1, ec2 = st.columns(2)
                         ec1.write(f"**Employees:** {enr.get('employees','?')}")
@@ -3948,10 +4013,17 @@ Return ONLY a valid JSON object:
         all_people = res.get("apollo_contacts",[]) + res.get("top_people",[])
         st.subheader(f"👤 Decision-Makers — CRS Relevance Ranked ({len(all_people)} found)")
 
-        if scored_contacts:
-            scored_contacts_sorted = sorted(scored_contacts, key=lambda x: x.get("crs_score",0), reverse=True)
+        # Drop placeholder rows the AI emits when Apollo returned no contacts
+        _placeholder = {"", "not available", "n/a", "na", "unknown", "none"}
+        real_contacts = [
+            c for c in scored_contacts
+            if str(c.get("name", "")).strip().lower() not in _placeholder
+        ]
+
+        if real_contacts:
+            scored_contacts_sorted = sorted(real_contacts, key=lambda x: x.get("crs_score", 0), reverse=True)
             st.write("**🎯 AI-scored contacts — highest relevance first:**")
-            for c in scored_contacts_sorted:
+            for _ci, c in enumerate(scored_contacts_sorted):
                 score = c.get("crs_score", 0)
                 badge = "🟢" if score >= 8 else "🟡" if score >= 5 else "🔴"
                 with st.expander(
@@ -3969,7 +4041,13 @@ Return ONLY a valid JSON object:
                         f"LinkedIn: {c.get('linkedin','N/A')}"
                     )
                     copy_button(_contact_txt, label="📋 Copy Contact",
-                                key=f"cp_contact_{c.get('name','')[:25]}")
+                                key=f"cp_contact_{_ci}")
+        elif not all_people:
+            st.info(
+                "No decision-makers found. This usually means Apollo returned no "
+                "contacts — check that **APOLLO_API_KEY** is set in your Streamlit "
+                "secrets, or widen the job titles / target countries above."
+            )
 
         if all_people:
             people_df = pd.DataFrame(all_people)
@@ -4048,8 +4126,10 @@ Return ONLY a valid JSON object:
                         if s.get("url"):
                             st.markdown(f"[🔗 Source]({s['url']})")
 
-                        # Quick Apollo contact search button for this specific org
-                        btn_key = f"find_{_si}_{str(s.get('victim_org',''))[:20]}_{s.get('crs_score')}"
+                        # Quick Apollo contact search button for this specific org.
+                        # Key uses the loop index alone so it can never collide,
+                        # even when two signals share a victim org and score.
+                        btn_key = f"apollo_find_signal_{_si}"
                         if s.get("victim_org") and st.button(
                             f"🔍 Find {s.get('contact_title','contact')} at {s.get('victim_org','')} in Apollo",
                             key=btn_key
@@ -4411,7 +4491,11 @@ Groq → Cerebras → OpenRouter → GitHub → **NVIDIA** → **DeepSeek** → 
         def _tab_out(msg):
             log_lines_tab.append(msg)
             log_container.markdown("\n\n".join(log_lines_tab[-20:]))
-        with st.spinner("Pipeline running…"):
-            run_pipeline("manual", years_back=_refresh_years, live_out=_tab_out)
-        st.cache_data.clear()
-        st.success("Done! Refresh the other tabs to see updated data.")
+        try:
+            with st.spinner("Pipeline running…"):
+                run_pipeline("manual", years_back=_refresh_years,
+                             max_score=int(_max_score), live_out=_tab_out)
+            st.cache_data.clear()
+            st.success("Done! Refresh the other tabs to see updated data.")
+        except Exception as e:
+            st.error(f"Pipeline stopped on an error, but the app is still up: {e}")
