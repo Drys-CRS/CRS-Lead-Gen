@@ -1855,6 +1855,58 @@ def format_lead_card(co, enriched: dict = None) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# APOLLO COMPANY ENRICHMENT (reusable, module-level)
+# Looks up a company by name and returns the fields the Monday Companies board
+# needs: office number, LinkedIn, website, org size, location.
+# ═══════════════════════════════════════════════════════════════════════════
+def _apollo_company_enrich(name: str, country: str = "") -> dict:
+    """Best-effort Apollo org lookup by company name. Returns a dict with
+    office_number, linkedin, website, org_size and location (any may be blank).
+    Returns {} when there's no APOLLO_API_KEY or no match. Uses orgs/search,
+    which does not consume enrichment credits."""
+    import requests
+    try:
+        key = st.secrets.get("APOLLO_API_KEY", "")
+    except Exception:
+        key = ""
+    if not key or not str(name).strip():
+        return {}
+    headers = {"Content-Type": "application/json", "Cache-Control": "no-cache",
+               "x-api-key": key}
+    payload = {"q_organization_name": name, "per_page": 5, "page": 1}
+    if country:
+        payload["organization_locations"] = [country]
+    try:
+        r = requests.post("https://api.apollo.io/api/v1/organizations/search",
+                          json=payload, headers=headers, timeout=20)
+        if not r.ok:
+            return {}
+        orgs = r.json().get("organizations", []) or []
+        if not orgs:
+            return {}
+        nl = str(name).strip().lower()
+        best = next((o for o in orgs
+                     if (o.get("name") or "").lower() == nl
+                     or nl in (o.get("name") or "").lower()
+                     or (o.get("name") or "").lower() in nl), orgs[0])
+        # Phone can live in a few fields depending on Apollo's record
+        phone = (best.get("phone") or best.get("sanitized_phone")
+                 or (best.get("primary_phone") or {}).get("number") or "")
+        domain = best.get("primary_domain") or best.get("website_url") or ""
+        loc = ", ".join([b for b in (best.get("city"), best.get("state"),
+                                     best.get("country")) if b])
+        return {
+            "office_number": str(phone or "").strip(),
+            "linkedin":      best.get("linkedin_url") or "",
+            "website":       domain or "",
+            "org_size":      best.get("estimated_num_employees"),
+            "location":      loc,
+        }
+    except Exception:
+        return {}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # GITHUB SYNC MODULE
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -2974,13 +3026,30 @@ with tab1:
     )
 
     # Detail panel — use tender_number as stable key, not row index
-    if event.selection.rows:
-        idx = event.selection.rows[0]
+    # Resolve the tender to show: a NEW table selection wins; otherwise the
+    # Prev/Next navigation index persists across reruns.
+    _sel_rows = event.selection.rows
+    if _sel_rows and st.session_state.get("open_last_sel") != _sel_rows[0]:
+        st.session_state["open_card_idx"] = _sel_rows[0]
+        st.session_state["open_last_sel"] = _sel_rows[0]
+    _cur = st.session_state.get("open_card_idx")
 
+    if _cur is not None:
+        idx = _cur
         # Guard: idx must be a valid integer within bounds
-        if not isinstance(idx, int) or idx >= len(open_df):
+        if not isinstance(idx, int) or idx >= len(open_df) or idx < 0:
             st.warning("Selection lost after refresh — please re-select a tender.")
         else:
+            # ⬅️ Prev / Next ➡️ through the current (filtered/sorted) list
+            _nav_p, _nav_n, _nav_i = st.columns([1, 1, 4])
+            if _nav_p.button("⬅️ Previous", key="open_prev", disabled=(idx <= 0)):
+                st.session_state["open_card_idx"] = max(idx - 1, 0)
+                st.rerun()
+            if _nav_n.button("Next ➡️", key="open_next", disabled=(idx >= len(open_df) - 1)):
+                st.session_state["open_card_idx"] = min(idx + 1, len(open_df) - 1)
+                st.rerun()
+            _nav_i.caption(f"Tender {idx + 1} of {len(open_df)}")
+
             row = open_df.iloc[idx]
             # Guard: row must be a Series/dict-like with a tender_number
             if not hasattr(row, "get") or not row.get("tender_number"):
@@ -3295,18 +3364,36 @@ with tab2:
                         if _MONDAY_AVAILABLE:
                             btn_key = f"push_co_{_pi}"
                             if st.button(f"📋 Push to Monday Companies", key=btn_key,
-                                         help="Create or update this company on the 2.1 - Companies board"):
-                                with st.spinner(f"Pushing {company}…"):
+                                         help="Create or update this company on the 2.1 - Companies board, "
+                                              "filling office number, website, LinkedIn, org size, location "
+                                              "and flagging solutions of interest as Warm Lead"):
+                                with st.spinner(f"Enriching & pushing {company}…"):
                                     try:
-                                        result = push_partner_to_companies(p)
+                                        # Enrich with Apollo (office number, LinkedIn,
+                                        # website, org size, location) so the board
+                                        # columns get filled as a warm lead.
+                                        _enr = _apollo_company_enrich(company, p.get("country", ""))
+                                        p_enriched = {**p, **{k: v for k, v in _enr.items()
+                                                              if v not in (None, "", 0)}}
+                                        result = push_partner_to_companies(p_enriched)
                                         action = result.get("action","?")
                                         item_id = result.get("item_id","")
+                                        _fields = result.get("fields_set") or []
                                         if action == "created":
                                             st.success(f"✅ **{company}** created on Companies board (ID: {item_id})")
                                         elif action == "updated":
-                                            st.success(f"✅ **{company}** already exists — AI analysis added as update (ID: {item_id})")
+                                            st.success(f"✅ **{company}** already existed — note added"
+                                                       + (f" and {len(_fields)} column(s) refreshed" if _fields else "")
+                                                       + f" (ID: {item_id})")
                                         else:
                                             st.info(f"ℹ️ {company}: {action}")
+                                        if _enr:
+                                            _have = [k for k in ("office_number","linkedin","website","org_size","location") if _enr.get(k)]
+                                            if _have:
+                                                st.caption("Enriched from Apollo: " + ", ".join(_have))
+                                        else:
+                                            st.caption("No Apollo enrichment found (check APOLLO_API_KEY) — "
+                                                       "solutions of interest were still flagged as Warm Lead.")
                                     except Exception as e:
                                         st.error(f"Push failed: {e}")
 
@@ -3465,35 +3552,59 @@ with tab4:
             key="disc_table",
         )
 
-        # Detail card for the selected discovered tender
-        if disc_event.selection.rows:
-            _di = disc_event.selection.rows[0]
-            if isinstance(_di, int) and _di < len(discovered):
-                d = discovered[_di]
-                _card = {
-                    "tender_number":           "AI-DISCOVERED",
-                    "title":                   d.get("title", ""),
-                    "department_name":         d.get("organisation", ""),
-                    "country":                 d.get("country", ""),
-                    "closing_date":            d.get("closing_date") or "Verify on portal",
-                    "description":             d.get("description", ""),
-                    "compliance_requirements": "Verify on source portal",
-                    "portal_link":             d.get("source_url") or "",
-                }
-                st.divider()
-                st.subheader(f"📄 {d.get('title', '(untitled)')}")
-                _cpc, _ = st.columns([1, 5])
-                with _cpc:
-                    copy_button(format_tender_card(_card),
-                                label="📋 Copy Tender",
-                                key=f"cp_disc_{_di}")
-                st.write(f"**Organisation:** {d.get('organisation', 'N/A')}  |  "
-                         f"**Country:** {d.get('country', 'N/A')}")
-                st.write(f"**Sector:** {d.get('sector', 'N/A')}")
-                st.write(f"**Closing Date:** {d.get('closing_date') or 'Verify on portal'}")
-                st.write(f"**Description:** {d.get('description', 'N/A')}")
-                if d.get("source_url"):
-                    st.markdown(f"[🔗 Source notice]({d['source_url']})")
+        # Detail card for the selected discovered tender, with Prev/Next and a
+        # per-candidate "Mark as Irrelevant" that removes it from the review list.
+        _dsel = disc_event.selection.rows
+        if _dsel and st.session_state.get("disc_last_sel") != _dsel[0]:
+            st.session_state["disc_card_idx"] = _dsel[0]
+            st.session_state["disc_last_sel"] = _dsel[0]
+        _dcur = st.session_state.get("disc_card_idx")
+
+        if isinstance(_dcur, int) and 0 <= _dcur < len(discovered):
+            d = discovered[_dcur]
+            _card = {
+                "tender_number":           "AI-DISCOVERED",
+                "title":                   d.get("title", ""),
+                "department_name":         d.get("organisation", ""),
+                "country":                 d.get("country", ""),
+                "closing_date":            d.get("closing_date") or "Verify on portal",
+                "description":             d.get("description", ""),
+                "compliance_requirements": "Verify on source portal",
+                "portal_link":             d.get("source_url") or "",
+            }
+            st.divider()
+            _dp, _dn, _dx, _dinfo = st.columns([1, 1, 1.5, 3])
+            if _dp.button("⬅️ Previous", key="disc_prev", disabled=(_dcur <= 0)):
+                st.session_state["disc_card_idx"] = max(_dcur - 1, 0)
+                st.rerun()
+            if _dn.button("Next ➡️", key="disc_next", disabled=(_dcur >= len(discovered) - 1)):
+                st.session_state["disc_card_idx"] = min(_dcur + 1, len(discovered) - 1)
+                st.rerun()
+            if _dx.button("🚫 Mark Irrelevant", key="disc_irrelevant",
+                          help="Remove this candidate from the review list"):
+                discovered.pop(_dcur)
+                st.session_state["discovered"] = discovered
+                st.session_state.pop("disc_last_sel", None)
+                if discovered:
+                    st.session_state["disc_card_idx"] = min(_dcur, len(discovered) - 1)
+                else:
+                    st.session_state.pop("disc_card_idx", None)
+                st.rerun()
+            _dinfo.caption(f"Candidate {_dcur + 1} of {len(discovered)}")
+
+            st.subheader(f"📄 {d.get('title', '(untitled)')}")
+            _cpc, _ = st.columns([1, 5])
+            with _cpc:
+                copy_button(format_tender_card(_card),
+                            label="📋 Copy Tender",
+                            key=f"cp_disc_{_dcur}")
+            st.write(f"**Organisation:** {d.get('organisation', 'N/A')}  |  "
+                     f"**Country:** {d.get('country', 'N/A')}")
+            st.write(f"**Sector:** {d.get('sector', 'N/A')}")
+            st.write(f"**Closing Date:** {d.get('closing_date') or 'Verify on portal'}")
+            st.write(f"**Description:** {d.get('description', 'N/A')}")
+            if d.get("source_url"):
+                st.markdown(f"[🔗 Source notice]({d['source_url']})")
 
         st.divider()
         save_col1, save_col2 = st.columns(2)

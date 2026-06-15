@@ -362,6 +362,113 @@ _INDUSTRY_MAP = {
     "Consulting/Advisory": 11,  # "Consultants"
 }
 
+# ── Enrichment column IDs on the Companies board (verified via board schema) ──
+_CO_COL_OFFICE_NUMBER = "phone"                # type: phone  ("Office Number")
+_CO_COL_WEBSITE       = "link"                 # type: link   ("Website URL")
+_CO_COL_LINKEDIN      = "dup__of_website_url"  # type: link   ("Linkedin URL")
+_CO_COL_ORG_SIZE      = "numbers"              # type: numbers ("Organisational Count")
+_CO_COL_LOCATION      = "location"             # type: location ("Location")
+
+# ── CRS solution → product status column on the Companies board ──────────────
+# Each of these status columns carries a "Warm Lead" label (used below). Setting
+# the column flags the company as a warm lead for that specific CRS solution.
+_SOLUTION_COLUMN_MAP = {
+    "vectra":            "dup__of_topia8",
+    "flare":             "dup__of_vectra",
+    "flare io":          "dup__of_vectra",
+    "flare.io":          "dup__of_vectra",
+    "aikido":            "dup__of_flare_io_mkm6bhdb",
+    "telivy":            "dup__of_aikido_mkm6mddw",
+    "strobes":           "dup__of_telivy_mkm6hk4g",
+    "strobes security":  "dup__of_telivy_mkm6hk4g",
+    "standss":           "color_mknsfg2c",
+    "blue flag":         "color_mkwbcf78",
+    "blue flag security":"color_mkwbcf78",
+    "beachhead":         "status0",
+    "beachheadsecure":   "status0",
+    "vrx":               "dup__of_reaqta4",
+    "smbsecure":         "dup__of_topia4",
+    "bh email encrypt":  "dup__of_smbsecure0",
+    "email encryption":  "dup__of_smbsecure0",
+    "cre":               "dup__of_bh_email_encrypt6",
+    "gp":                "dup__of_bh_email_encrypt6",
+    "preventi":          "dup__of_bh_email_encrypt6",
+    "vapt":              "dup__of_cyber_risk_essentials",
+    "ps":                "dup__of_pen_test__va",
+    "professional services": "dup__of_pen_test__va",
+    "ibm training":      "dup__of_beachhead7",
+    "ibm":               "dup__of_beachhead7",
+    "redhat training":   "dup__of_ibm_training0",
+    "redhat":            "dup__of_ibm_training0",
+    "red hat":           "dup__of_ibm_training0",
+    "suse training":     "dup__of_redhat",
+    "suse":              "dup__of_redhat",
+    "agile training":    "color8",
+    "agile":             "color8",
+    "comptia training":  "color6",
+    "comptia":           "color6",
+}
+_WARM_LEAD_LABEL = "Warm Lead"
+
+
+def _match_solution_columns(solutions: list) -> dict:
+    """Map a partner's proposed CRS solutions to the matching product status
+    columns, each set to 'Warm Lead'. Fuzzy-matches on substring so e.g.
+    'VECTRA NDR' still resolves to the VECTRA column."""
+    out = {}
+    for sol in (solutions or []):
+        key = str(sol).strip().lower()
+        if not key:
+            continue
+        col = _SOLUTION_COLUMN_MAP.get(key)
+        if not col:
+            # substring fallback (longest key first to avoid 'ps' clobbering)
+            for name in sorted(_SOLUTION_COLUMN_MAP, key=len, reverse=True):
+                if name in key or key in name:
+                    col = _SOLUTION_COLUMN_MAP[name]
+                    break
+        if col:
+            out[col] = {"label": _WARM_LEAD_LABEL}
+    return out
+
+
+def _enrichment_col_vals(partner: dict, region_code: str = "ZA") -> dict:
+    """Build Monday column values for the enrichment fields (office number,
+    website, LinkedIn, org size, location) from whatever the partner dict
+    carries. Only includes columns that actually have data, so partial
+    enrichment never blanks an existing value or breaks the mutation."""
+    cv = {}
+    phone = str(partner.get("office_number") or partner.get("phone") or "").strip()
+    if phone:
+        cv[_CO_COL_OFFICE_NUMBER] = {"phone": phone, "countryShortName": region_code}
+
+    website = str(partner.get("website") or partner.get("website_url") or "").strip()
+    if website:
+        if not website.startswith("http"):
+            website = "https://" + website
+        cv[_CO_COL_WEBSITE] = {"url": website, "text": "Website"}
+
+    linkedin = str(partner.get("linkedin") or partner.get("linkedin_url") or "").strip()
+    if linkedin:
+        if not linkedin.startswith("http"):
+            linkedin = "https://" + linkedin
+        cv[_CO_COL_LINKEDIN] = {"url": linkedin, "text": "LinkedIn"}
+
+    size = partner.get("org_size") or partner.get("employees") or partner.get("organisational_count")
+    try:
+        if size not in (None, "", 0):
+            cv[_CO_COL_ORG_SIZE] = str(int(float(size)))
+    except (ValueError, TypeError):
+        pass
+
+    location = str(partner.get("location") or partner.get("location_address") or "").strip()
+    if location:
+        # Monday location columns accept an address; lat/lng are optional and
+        # left blank when we only have a text location from enrichment.
+        cv[_CO_COL_LOCATION] = {"address": location, "lat": "", "lng": ""}
+
+    return cv
+
 
 def _find_company_by_name(name: str) -> str | None:
     """Search Companies board for an existing item by name. Returns item_id or None."""
@@ -458,14 +565,29 @@ def push_partner_to_companies(partner: dict) -> dict:
         # Check if company already exists
     existing_id = _find_company_by_name(company_name)
 
+    region    = _REGION_MAP_CO.get(country, "Africa")
+    region_code = "ZA" if country == "South Africa" else "ZA"
+    # Enrichment columns (office number, website, LinkedIn, org size, location)
+    enrich_cv = _enrichment_col_vals(partner, region_code)
+    # Solution columns of interest → "Warm Lead"
+    solution_cv = _match_solution_columns(solutions)
+
     if existing_id:
-        # Company exists — just add the update, never modify existing data
+        # Company exists — add the analysis note, then fill in the enrichment
+        # columns and flag the solutions of interest as Warm Lead. We only set
+        # solution columns that are provided (we never blank existing data).
         _add_monday_update(existing_id, COMPANIES_BOARD_ID, update_body)
-        return {"item_id": existing_id, "action": "updated", "company": company_name}
+        merge_cv = {**enrich_cv, **solution_cv}
+        if merge_cv:
+            try:
+                _update_item(COMPANIES_BOARD_ID, existing_id, merge_cv)
+            except Exception:
+                pass
+        return {"item_id": existing_id, "action": "updated", "company": company_name,
+                "fields_set": list(merge_cv.keys())}
 
     # Company does not exist — create it with full column values
     acct_type = _ACCT_TYPE_MAP.get(ptype, "Reseller / MSP")
-    region    = _REGION_MAP_CO.get(country, "Africa")
     industry_id = _INDUSTRY_MAP.get(ptype, 9)
 
     col_vals = {
@@ -476,6 +598,10 @@ def push_partner_to_companies(partner: dict) -> dict:
         "text3":       f"Source: CRS Dashboard AI Analysis | Partner Type: {ptype} | Urgency: {urgency}",
         "industry":    str(industry_id),
     }
+    # Add enrichment (office number, website, LinkedIn, org size, location) and
+    # flag every solution of interest as a Warm Lead.
+    col_vals.update(enrich_cv)
+    col_vals.update(solution_cv)
 
     q = """
     mutation ($bid: ID!, $gid: String!, $name: String!, $cv: JSON!) {
