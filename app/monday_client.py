@@ -623,6 +623,45 @@ def push_partner_to_companies(partner: dict) -> dict:
     return {"item_id": new_id, "action": "created", "company": company_name}
 
 
+def push_verified_lead(contact: dict) -> dict:
+    """Push a verified contact (from the Lead Verification cascade) to the
+    Leads board. Creates the item by name and writes all verified details as
+    the first update note — no per-column mapping needed. Dedupes by name."""
+    name = str(contact.get("name") or "").strip()
+    if not name:
+        raise ValueError("contact must have a name")
+    nl = "\n"
+    note = (
+        f"**CRS Verified Lead** | {_sched_dt_str()}{nl}"
+        f"Title: {contact.get('title','')}{nl}"
+        f"Company: {contact.get('company','')}{nl}"
+        f"Email: {contact.get('email','')}{nl}"
+        f"Phone: {contact.get('phone','')}{nl}"
+        f"LinkedIn: {contact.get('linkedin','')}{nl}"
+        f"Country: {contact.get('country','')}{nl}"
+        f"Authority: {contact.get('authority','')}{nl}"
+        f"Accuracy: {contact.get('accuracy_score','')}/100{nl}"
+        f"Source: {contact.get('provider_chain','')}{nl}"
+        f"Outreach opener: {contact.get('opener','')}"
+    )
+    try:
+        existing = find_item_by_column(LEADS_BOARD_ID, "name", name)
+    except Exception:
+        existing = None
+    if existing:
+        _add_monday_update(existing, LEADS_BOARD_ID, note)
+        return {"item_id": existing, "action": "updated", "name": name}
+
+    q = """
+    mutation ($bid: ID!, $name: String!) {
+      create_item(board_id: $bid, item_name: $name) { id }
+    }"""
+    data = _gql(q, {"bid": str(LEADS_BOARD_ID), "name": name})
+    new_id = data["data"]["create_item"]["id"]
+    _add_monday_update(new_id, LEADS_BOARD_ID, note)
+    return {"item_id": new_id, "action": "created", "name": name}
+
+
 def _sched_dt_str() -> str:
     """Return current datetime as a readable string."""
     import datetime

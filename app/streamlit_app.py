@@ -18,6 +18,7 @@ try:
     from monday_client import (
         push_tender_to_monday,
         push_partner_to_companies,
+        push_verified_lead,
         get_ticket_board_id, get_leads_board_id, get_companies_board_id,
     )
     _MONDAY_AVAILABLE = bool(st.secrets.get("MONDAY_API_KEY") if hasattr(st, 'secrets') else False)
@@ -1928,6 +1929,194 @@ def _apollo_company_enrich(name: str, country: str = "") -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# LEAD VERIFICATION CASCADE (Apollo → Lusha) + validation, scoring, AI classify
+# Powers the "Lead Verification" tab. All REST, keys from st.secrets. The
+# deployed app cannot use MCP connectors, so these call the vendor REST APIs.
+# ═══════════════════════════════════════════════════════════════════════════
+import re as _re
+
+def _apollo_people_search(titles: list, countries: list, company: str = "",
+                          per_page: int = 10) -> list:
+    """Apollo mixed_people/search — find contacts by title/country (+ optional
+    company). Returns lightweight contact dicts. Email is often masked until
+    enrichment; phone is rarely present here (Lusha fills it)."""
+    import requests
+    try:
+        key = st.secrets.get("APOLLO_API_KEY", "")
+    except Exception:
+        key = ""
+    if not key:
+        return []
+    headers = {"Content-Type": "application/json", "Cache-Control": "no-cache",
+               "x-api-key": key}
+    payload = {"page": 1, "per_page": max(1, min(per_page, 25))}
+    if titles:
+        payload["person_titles"] = titles[:8]
+    if countries:
+        payload["person_locations"] = countries
+    if company:
+        payload["q_organization_name"] = company
+    try:
+        r = requests.post("https://api.apollo.io/api/v1/mixed_people/search",
+                          json=payload, headers=headers, timeout=25)
+        if not r.ok:
+            return []
+        out = []
+        for p in r.json().get("people", []) or []:
+            org = p.get("organization") or {}
+            out.append({
+                "name":     f"{p.get('first_name','')} {p.get('last_name','')}".strip(),
+                "first":    p.get("first_name", ""),
+                "last":     p.get("last_name", ""),
+                "title":    p.get("title", ""),
+                "company":  org.get("name", "") or p.get("organization_name", ""),
+                "domain":   org.get("primary_domain", "") or "",
+                "email":    p.get("email", "") or "",
+                "email_status": p.get("email_status", "") or "",
+                "phone":    "",
+                "linkedin": p.get("linkedin_url", "") or "",
+                "country":  (p.get("country") or org.get("country") or ""),
+            })
+        return [c for c in out if c["name"]]
+    except Exception:
+        return []
+
+
+def _lusha_enrich_person(first: str = "", last: str = "", company: str = "",
+                         domain: str = "", email: str = "", linkedin: str = "") -> dict:
+    """Lusha Person API V2 (GET /v2/person, api_key header). Looks up a contact
+    by email / LinkedIn / name+company and returns phone + email. Best-effort;
+    returns {} with no LUSHA_API_KEY or no match."""
+    import requests
+    try:
+        key = st.secrets.get("LUSHA_API_KEY", "")
+    except Exception:
+        key = ""
+    if not key:
+        return {}
+    params = {}
+    if email:
+        params["email"] = email
+    elif linkedin:
+        params["linkedinUrl"] = linkedin
+    elif first and last and (company or domain):
+        params["firstName"] = first
+        params["lastName"] = last
+        if domain:
+            params["companyDomain"] = domain
+        else:
+            params["companyName"] = company
+    else:
+        return {}
+    try:
+        r = requests.get("https://api.lusha.com/v2/person", params=params,
+                         headers={"api_key": key, "Accept": "*/*"}, timeout=20)
+        if not r.ok:
+            return {}
+        data = r.json().get("data", r.json()) or {}
+        # Phones / emails can appear as arrays of objects or strings
+        def _first_val(obj, *keys):
+            for k in keys:
+                v = obj.get(k)
+                if isinstance(v, list) and v:
+                    item = v[0]
+                    if isinstance(item, dict):
+                        return item.get("number") or item.get("email") or item.get("value") or ""
+                    return str(item)
+                if isinstance(v, str) and v:
+                    return v
+            return ""
+        phone = _first_val(data, "phoneNumbers", "phones", "phoneNumber", "phone")
+        em    = _first_val(data, "emailAddresses", "emails", "email")
+        return {
+            "phone":    phone or "",
+            "email":    em or "",
+            "title":    data.get("jobTitle") or data.get("title") or "",
+            "linkedin": data.get("linkedinUrl") or "",
+        }
+    except Exception:
+        return {}
+
+
+_EMAIL_RE = _re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+def _valid_email(email: str) -> bool:
+    return bool(email and _EMAIL_RE.match(str(email).strip()))
+
+
+def _normalize_phone(phone: str, country: str = "") -> str:
+    """Light E.164 normalisation. Strips formatting; applies a country dialling
+    code when the number looks national (leading 0). Not a full libphonenumber,
+    but good enough to standardise display + dedup."""
+    if not phone:
+        return ""
+    raw = str(phone).strip()
+    digits = _re.sub(r"[^\d+]", "", raw)
+    if digits.startswith("+"):
+        return digits
+    _cc = {"South Africa": "27", "Nigeria": "234", "Kenya": "254", "Ghana": "233",
+           "Egypt": "20", "Morocco": "212", "Tanzania": "255", "Uganda": "256",
+           "Zambia": "260", "Rwanda": "250", "Ethiopia": "251", "Senegal": "221"}
+    code = _cc.get(country, "")
+    if digits.startswith("0") and code:
+        return "+" + code + digits[1:]
+    if code and not digits.startswith(code):
+        return "+" + code + digits
+    return "+" + digits if digits else ""
+
+
+def _verification_score(contact: dict) -> int:
+    """Accuracy score 0–100 from which verified fields are present and how
+    confident the providers were."""
+    score = 0
+    if _valid_email(contact.get("email")):
+        score += 35
+        if str(contact.get("email_status", "")).lower() in ("verified", "valid"):
+            score += 10
+    if contact.get("phone"):
+        score += 30
+    if contact.get("linkedin"):
+        score += 10
+    if contact.get("title"):
+        score += 10
+    if contact.get("company"):
+        score += 5
+    return min(score, 100)
+
+
+def _classify_authority(contact: dict) -> dict:
+    """Use the CRS AI cascade to classify a contact's buying authority
+    (VITO / Decision Maker / Influencer / Advocate) and draft a one-line
+    personalised outreach opener. Falls back to a title heuristic."""
+    title = (contact.get("title") or "").lower()
+    # Heuristic fallback
+    if any(t in title for t in ("ceo", "cfo", "coo", "founder", "owner", "president", "chief")):
+        fallback = "VITO"
+    elif any(t in title for t in ("head", "director", "vp", "chief information", "ciso", "cto")):
+        fallback = "Decision maker"
+    elif any(t in title for t in ("manager", "lead", "architect")):
+        fallback = "Influencer"
+    else:
+        fallback = "Advocate"
+    prompt = (
+        "Classify this B2B contact's buying authority for a cybersecurity / IT-training "
+        "vendor (Cyber Retaliator Solutions). Return ONLY JSON: "
+        '{"authority":"VITO|Decision maker|Influencer|Advocate","opener":"one-sentence personalised outreach opener"}.\n\n'
+        f"Name: {contact.get('name','')}\nTitle: {contact.get('title','')}\n"
+        f"Company: {contact.get('company','')}\nCountry: {contact.get('country','')}"
+    )
+    try:
+        raw = _call_ai(prompt, max_tokens=200)
+        parsed = _safe_json(raw, expect_list=False)
+        if isinstance(parsed, dict) and parsed.get("authority"):
+            return {"authority": parsed.get("authority", fallback),
+                    "opener": parsed.get("opener", "")}
+    except Exception:
+        pass
+    return {"authority": fallback, "opener": ""}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # GITHUB SYNC MODULE
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -2899,13 +3088,14 @@ if selected_countries and "country" in df_filtered.columns:
     df_filtered = df_filtered[df_filtered["country"].isin(selected_countries)]
 
 # ─────────────────────────────────────────────
-tab_home, tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab_home, tab1, tab2, tab3, tab4, tab5, tab_verify, tab6 = st.tabs([
     "🏠 Overview",
     "📢 Open Opportunities",
     "🏆 Competitive Intelligence",
     "🤖 AI Tender Parser",
     "🔎 AI Discovery (Private Sector)",
     "🎯 Lead Intelligence",
+    "✅ Lead Verification",
     "⚙️ Pipeline & Health"
 ])
 
@@ -4606,6 +4796,211 @@ Return ONLY a valid JSON object:
                     "⬇️ Export All Contacts as CSV",
                     data=csv, file_name="crs_leads.csv", mime="text/csv"
                 )
+
+# ══════════════════════════════════════════════
+# TAB — LEAD VERIFICATION (Apollo → Lusha cascade)
+# ══════════════════════════════════════════════
+with tab_verify:
+    st.subheader("✅ Lead Verification")
+    st.caption("Find and verify decision-maker contacts through a waterfall cascade "
+               "(**Apollo → Lusha**), validate + score them, AI-classify buying authority, "
+               "and push verified leads to Monday. Quarantines low-confidence contacts for review.")
+
+    _has_apollo = bool(st.secrets.get("APOLLO_API_KEY", "")) if hasattr(st, "secrets") else False
+    _has_lusha  = bool(st.secrets.get("LUSHA_API_KEY", "")) if hasattr(st, "secrets") else False
+    pc1, pc2, pc3, pc4 = st.columns(4)
+    pc1.metric("Layer 1 · Apollo", "✅ ready" if _has_apollo else "⚠️ no key")
+    pc2.metric("Layer 3 · Lusha",  "✅ ready" if _has_lusha else "⚠️ no key")
+    pc3.metric("Layer 2 · RocketReach", "Phase 2")
+    pc4.metric("Layer 4 · Cognism",     "Phase 2")
+    if not _has_apollo:
+        st.info("Add **APOLLO_API_KEY** to Streamlit secrets to run the cascade. "
+                "Add **LUSHA_API_KEY** as well to enable phone enrichment (Layer 3).")
+
+    # ── Step 1: input trigger / filters ────────────────────────────────────
+    st.markdown("#### 1 · Target filters")
+    vf1, vf2 = st.columns(2)
+    with vf1:
+        v_titles = multiselect_all(
+            "Job titles / ICP",
+            ["CISO", "CIO", "CTO", "IT Director", "Head of Cybersecurity", "IT Manager",
+             "Head of IT", "Security Manager", "Procurement Manager", "L&D Manager",
+             "Head of Infrastructure", "Network Manager", "CEO", "CFO", "Managing Director"],
+            key="verify_titles",
+            default=["CISO", "IT Director", "Head of Cybersecurity"],
+        )
+        v_company = st.text_input("Company (optional — narrows to one org)", key="verify_company")
+    with vf2:
+        v_countries = multiselect_all(
+            "Target countries",
+            ["South Africa", "Nigeria", "Kenya", "Ghana", "Egypt", "Morocco",
+             "Tanzania", "Uganda", "Zambia", "Rwanda", "Ethiopia", "Senegal"],
+            key="verify_countries",
+            default=["South Africa"],
+        )
+        vc1, vc2 = st.columns(2)
+        v_limit = vc1.number_input("Max contacts", 1, 25, 10, key="verify_limit")
+        v_threshold = vc2.number_input("Min score (verified)", 0, 100, 60, step=5, key="verify_threshold")
+    v_use_lusha = st.checkbox("Use Lusha for phone/email gap-fill (Layer 3)", value=_has_lusha,
+                              disabled=not _has_lusha, key="verify_use_lusha")
+    v_classify  = st.checkbox("AI-classify authority + draft outreach opener", value=True, key="verify_classify")
+
+    run_verify = st.button("▶️ Run Cascade", type="primary", key="verify_run",
+                           disabled=not _has_apollo)
+
+    if run_verify:
+        log_box = st.empty()
+        _log = []
+        def _vlog(m):
+            _log.append(m)
+            log_box.code("\n".join(_log[-16:]))
+
+        try:
+            # ── Step 2: cascade enrichment ────────────────────────────────
+            _vlog("[Apollo] Searching contacts by title / country…")
+            people = _apollo_people_search(v_titles, v_countries, v_company.strip(),
+                                           per_page=int(v_limit))
+            _vlog(f"[Apollo] Found {len(people)} contact(s).")
+
+            results, provider_counts = [], {"Apollo": 0, "Lusha": 0}
+            seen = set()
+            for c in people[: int(v_limit)]:
+                chain = ["Apollo"]
+                provider_counts["Apollo"] += 1
+
+                # Step 3: dedup within this run (email → phone → linkedin → name)
+                k = (c.get("email") or c.get("linkedin") or c.get("name") or "").lower()
+                if k in seen:
+                    _vlog(f"[Dedup] {c.get('name')} skipped (duplicate in run).")
+                    continue
+                seen.add(k)
+
+                # Layer 3: Lusha gap-fill for phone / email
+                if v_use_lusha and (not c.get("phone") or not _valid_email(c.get("email"))):
+                    lu = _lusha_enrich_person(c.get("first",""), c.get("last",""),
+                                              c.get("company",""), c.get("domain",""),
+                                              c.get("email",""), c.get("linkedin",""))
+                    if lu:
+                        chain.append("Lusha")
+                        provider_counts["Lusha"] += 1
+                        c["phone"]    = c.get("phone") or lu.get("phone","")
+                        c["email"]    = c.get("email") or lu.get("email","")
+                        c["title"]    = c.get("title") or lu.get("title","")
+                        c["linkedin"] = c.get("linkedin") or lu.get("linkedin","")
+                        _vlog(f"[Lusha] {c.get('name')} → phone/email enriched.")
+
+                # Step 4: validate + normalise + score
+                c["phone"] = _normalize_phone(c.get("phone",""), c.get("country",""))
+                c["email_valid"] = _valid_email(c.get("email"))
+                c["accuracy_score"] = _verification_score(c)
+                c["provider_chain"] = " → ".join(chain)
+
+                # Step 5: AI authority classification + opener
+                if v_classify:
+                    cls = _classify_authority(c)
+                    c["authority"] = cls.get("authority","")
+                    c["opener"]    = cls.get("opener","")
+                else:
+                    c["authority"] = ""
+                    c["opener"]    = ""
+
+                # Step 6: verified vs quarantine
+                c["status"] = "Verified" if c["accuracy_score"] >= int(v_threshold) else "Quarantine"
+                results.append(c)
+
+            _vlog(f"[Score] {sum(1 for r in results if r['status']=='Verified')} verified · "
+                  f"{sum(1 for r in results if r['status']=='Quarantine')} quarantined.")
+
+            # Step 8: log the run to Supabase
+            try:
+                rows = [{
+                    "target_company": v_company.strip() or None,
+                    "country": (r.get("country") or (v_countries[0] if v_countries else "")),
+                    "title": r.get("title",""),
+                    "contact_name": r.get("name",""),
+                    "contact_title": r.get("title",""),
+                    "company": r.get("company",""),
+                    "email": r.get("email",""),
+                    "phone": r.get("phone",""),
+                    "linkedin": r.get("linkedin",""),
+                    "provider_chain": r.get("provider_chain",""),
+                    "accuracy_score": int(r.get("accuracy_score",0)),
+                    "authority": r.get("authority",""),
+                    "status": r.get("status",""),
+                    "cost_estimate": round(0.03 * len(r.get("provider_chain","").split("→")), 3),
+                } for r in results]
+                if rows:
+                    supabase.table("lead_verification_log").insert(rows).execute()
+                    _vlog(f"[Supabase] Logged {len(rows)} row(s) to lead_verification_log.")
+            except Exception as e:
+                _vlog(f"[Supabase] Log skipped: {e}")
+
+            st.session_state["verify_results"] = results
+            st.session_state["verify_provider_counts"] = provider_counts
+        except Exception as e:
+            st.error(f"Cascade stopped on an error, but the app is still up: {e}")
+
+    # ── Results ────────────────────────────────────────────────────────────
+    results = st.session_state.get("verify_results", [])
+    if results:
+        pcounts = st.session_state.get("verify_provider_counts", {})
+        st.divider()
+        rc1, rc2, rc3, rc4 = st.columns(4)
+        rc1.metric("Processed", len(results))
+        rc2.metric("✅ Verified", sum(1 for r in results if r["status"] == "Verified"))
+        rc3.metric("🟠 Quarantine", sum(1 for r in results if r["status"] == "Quarantine"))
+        rc4.metric("Avg score", round(sum(r["accuracy_score"] for r in results) / len(results)))
+        if pcounts:
+            st.caption("Provider hits: " + " · ".join(f"{k} {v}" for k, v in pcounts.items() if v))
+
+        _df = pd.DataFrame([{
+            "Name": r.get("name",""), "Title": r.get("title",""),
+            "Company": r.get("company",""), "Authority": r.get("authority",""),
+            "Email": r.get("email",""), "Phone": r.get("phone",""),
+            "Score": r.get("accuracy_score",0), "Source": r.get("provider_chain",""),
+            "Status": r.get("status",""),
+        } for r in results])
+
+        st.markdown("#### ✅ Verified leads")
+        verified = [r for r in results if r["status"] == "Verified"]
+        if verified:
+            st.dataframe(_df[_df["Status"] == "Verified"].drop(columns=["Status"]),
+                         use_container_width=True, hide_index=True)
+            if _MONDAY_AVAILABLE:
+                if st.button(f"📤 Push {len(verified)} verified lead(s) to Monday", key="verify_push"):
+                    pushed, failed = 0, 0
+                    with st.spinner("Pushing to Monday Leads board…"):
+                        for r in verified:
+                            try:
+                                push_verified_lead(r); pushed += 1
+                            except Exception:
+                                failed += 1
+                    st.success(f"Pushed {pushed} lead(s) to Monday" + (f" · {failed} failed" if failed else ""))
+            else:
+                st.caption("Add MONDAY_API_KEY to enable push-to-CRM.")
+        else:
+            st.info("No verified leads above the score threshold this run.")
+
+        st.markdown("#### 🟠 Quarantine (review before CRM write)")
+        quarantine = [r for r in results if r["status"] == "Quarantine"]
+        if quarantine:
+            st.dataframe(_df[_df["Status"] == "Quarantine"].drop(columns=["Status"]),
+                         use_container_width=True, hide_index=True)
+            st.caption("Low-confidence contacts (missing/invalid email or phone). Verify manually "
+                       "before pushing — they are not written to the CRM automatically.")
+        else:
+            st.caption("Nothing quarantined.")
+
+        # Outreach openers
+        _openers = [r for r in verified if r.get("opener")]
+        if _openers:
+            with st.expander("✍️ AI outreach openers (verified leads)"):
+                for _oi, r in enumerate(_openers):
+                    st.markdown(f"**{r.get('name','')}** — {r.get('authority','')}")
+                    st.write(r.get("opener",""))
+                    copy_button(r.get("opener",""), label="📋 Copy opener",
+                                key=f"vop_{_oi}")
+
 
 # ══════════════════════════════════════════════
 # TAB 6 — PIPELINE & HEALTH
