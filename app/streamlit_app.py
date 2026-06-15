@@ -19,6 +19,7 @@ try:
         push_tender_to_monday,
         push_partner_to_companies,
         push_verified_lead,
+        sync_lead_to_monday,
         get_ticket_board_id, get_leads_board_id, get_companies_board_id,
     )
     _MONDAY_AVAILABLE = bool(st.secrets.get("MONDAY_API_KEY") if hasattr(st, 'secrets') else False)
@@ -2258,16 +2259,21 @@ def _apollo_people_match(name: str = "", first: str = "", last: str = "",
 
 def _verify_process_contacts(raw: list, use_lusha: bool, classify: bool, threshold: int,
                              default_country: str = "", apollo_match: bool = False,
-                             base_provider: str = None, vlog=None):
-    """Shared cascade processor used by both Lead-Verification modes (Discover and
+                             base_provider: str = None, vlog=None, persist: bool = True):
+    """Shared cascade processor used by all Lead-Verification modes (Dork, Discover,
     Enrich-seed-list). For each contact: optional Apollo people/match enrich →
     Lusha gap-fill → validate/normalise → score → AI authority classification →
-    verified/quarantine split. Returns (results, provider_counts)."""
+    verified/quarantine split. When persist=True, each processed contact is written
+    to Supabase IMMEDIATELY (not in one batch at the end) so data survives long or
+    interrupted runs. Returns (results, provider_counts)."""
     def _log(m):
         if vlog:
             vlog(m)
     results, counts = [], {"Apollo": 0, "Lusha": 0}
     seen = set()
+    if persist:
+        st.session_state["_verify_saved_count"] = 0
+        st.session_state.pop("_verify_save_err", None)
     for c in raw:
         chain = []
         if base_provider:
@@ -2329,6 +2335,29 @@ def _verify_process_contacts(raw: list, use_lusha: bool, classify: bool, thresho
             c["opener"]    = ""
 
         c["status"] = "Verified" if c["accuracy_score"] >= int(threshold) else "Quarantine"
+
+        # Persist this contact immediately (survives long/interrupted runs)
+        if persist:
+            try:
+                supabase.table("lead_verification_log").insert({
+                    "country": c.get("country") or default_country,
+                    "title": c.get("title", ""),
+                    "contact_name": c.get("name", ""),
+                    "contact_title": c.get("title", ""),
+                    "company": c.get("company", ""),
+                    "email": c.get("email", ""),
+                    "phone": c.get("phone", ""),
+                    "linkedin": c.get("linkedin", ""),
+                    "provider_chain": c.get("provider_chain", ""),
+                    "accuracy_score": int(c.get("accuracy_score", 0)),
+                    "authority": c.get("authority", ""),
+                    "status": c.get("status", ""),
+                    "cost_estimate": round(0.03 * max(1, len(c.get("provider_chain", "").split("→"))), 3),
+                }).execute()
+                st.session_state["_verify_saved_count"] = st.session_state.get("_verify_saved_count", 0) + 1
+            except Exception as e:
+                st.session_state["_verify_save_err"] = str(e)[:200]
+
         results.append(c)
     return results, counts
 
@@ -5467,34 +5496,15 @@ with tab_verify:
             _vlog(f"[Score] {sum(1 for r in results if r['status']=='Verified')} verified · "
                   f"{sum(1 for r in results if r['status']=='Quarantine')} quarantined.")
 
-            # Persist every parsed account to Supabase (verified + quarantine)
-            try:
-                rows = [{
-                    "target_company": (v_company.strip() if discover_mode else None) or None,
-                    "country": r.get("country") or default_country,
-                    "title": r.get("title", ""),
-                    "contact_name": r.get("name", ""),
-                    "contact_title": r.get("title", ""),
-                    "company": r.get("company", ""),
-                    "email": r.get("email", ""),
-                    "phone": r.get("phone", ""),
-                    "linkedin": r.get("linkedin", ""),
-                    "provider_chain": r.get("provider_chain", ""),
-                    "accuracy_score": int(r.get("accuracy_score", 0)),
-                    "authority": r.get("authority", ""),
-                    "status": r.get("status", ""),
-                    "cost_estimate": round(0.03 * max(1, len(r.get("provider_chain", "").split("→"))), 3),
-                } for r in results]
-                if rows:
-                    resp = supabase.table("lead_verification_log").insert(rows).execute()
-                    n_saved = len(getattr(resp, "data", None) or rows)
-                    st.session_state["verify_save_status"] = {"ok": True, "n": n_saved}
-                    _vlog(f"[Supabase] Saved {n_saved} account(s) to lead_verification_log.")
-                else:
-                    st.session_state["verify_save_status"] = {"ok": True, "n": 0}
-            except Exception as e:
-                st.session_state["verify_save_status"] = {"ok": False, "error": str(e)[:200]}
-                _vlog(f"[Supabase] Save FAILED: {e}")
+            # Accounts are saved incrementally inside _verify_process_contacts.
+            _saved_n = st.session_state.get("_verify_saved_count", 0)
+            _save_err = st.session_state.get("_verify_save_err")
+            if _save_err:
+                st.session_state["verify_save_status"] = {"ok": False, "error": _save_err, "n": _saved_n}
+                _vlog(f"[Supabase] Saved {_saved_n}, then error: {_save_err}")
+            else:
+                st.session_state["verify_save_status"] = {"ok": True, "n": _saved_n}
+                _vlog(f"[Supabase] Saved {_saved_n} account(s) to lead_verification_log (incremental).")
 
             st.session_state["verify_results"] = results
             st.session_state["verify_provider_counts"] = provider_counts
@@ -5524,6 +5534,37 @@ with tab_verify:
                 st.error(f"💾 Save to `lead_verification_log` FAILED: {_save.get('error','')}. "
                          "Accounts are still shown below — check the SUPABASE_KEY has insert "
                          "rights (service role) and that RLS allows inserts.")
+
+        # ── Sync ALL collected profiles to Monday (dedupe + enrich + notes) ──
+        if _MONDAY_AVAILABLE:
+            sc1, sc2 = st.columns([3, 2])
+            with sc1:
+                if st.button(f"🔄 Sync all {len(results)} collected profiles to Monday",
+                             type="primary", key="verify_sync_all"):
+                    synced = {"created": 0, "updated": 0, "failed": 0}
+                    prog = st.progress(0.0)
+                    stat = st.empty()
+                    for _i, r in enumerate(results):
+                        try:
+                            res = sync_lead_to_monday(r)
+                            synced[res.get("action", "failed")] = synced.get(res.get("action", "failed"), 0) + 1
+                            stat.caption(f"{r.get('name','')}: {res.get('action')} "
+                                         f"({len(res.get('fields_set',[]))} fields)")
+                        except Exception as e:
+                            synced["failed"] += 1
+                            stat.caption(f"{r.get('name','')}: failed — {str(e)[:80]}")
+                        prog.progress((_i + 1) / max(1, len(results)))
+                    st.session_state["verify_sync_result"] = synced
+                    st.success(f"Monday sync complete — {synced['created']} created, "
+                               f"{synced['updated']} updated (Contact Notes appended)"
+                               + (f", {synced['failed']} failed" if synced['failed'] else ""))
+            with sc2:
+                st.caption("Checks the Leads board for each profile (by name → email → "
+                           "LinkedIn), appends the outreach opener to **Contact Notes**, and "
+                           "fills Title, Phone, Email, LinkedIn, Authority, Accuracy Score on "
+                           "empty fields. New contacts land in the **NEW Leads** group.")
+        else:
+            st.caption("Add MONDAY_API_KEY to Streamlit secrets to enable Monday sync.")
 
         _df = pd.DataFrame([{
             "Name": r.get("name",""), "Title": r.get("title",""),

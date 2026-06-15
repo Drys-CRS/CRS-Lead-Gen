@@ -662,6 +662,127 @@ def push_verified_lead(contact: dict) -> dict:
     return {"item_id": new_id, "action": "created", "name": name}
 
 
+# ── Rich Leads-board sync (dedupe → append Contact Notes → fill columns) ────────
+# Real column IDs on board 7677528134 ("1.0 - Leads - 2.0"):
+_LEAD_COL_TITLE     = "title"            # Title (text)
+_LEAD_COL_LINKEDIN  = "link"             # Linkedin (link)
+_LEAD_COL_PHONE     = "phone"            # Phone (phone)
+_LEAD_COL_EMAIL     = "email"            # Email (email)
+_LEAD_COL_AUTHORITY = "priority"         # Authority (status)
+_LEAD_COL_SCORE     = "text__1"          # Accuracy Score (text)
+_LEAD_COL_NOTES     = "text_mm3zejkw"    # Contact Notes (text)
+_LEAD_COL_INDUSTRY  = "text1__1"         # Industry (text)
+_LEAD_NEW_GROUP     = "group_mm471gfq"   # "NEW Leads" group
+_LEAD_AUTHORITY_MAP = {
+    "vito": "VITO",
+    "decision maker": "Decision Maker",
+    "decision-maker": "Decision Maker",
+    "influencer": "Influencer",
+    "advocate": "Advocate",
+}
+
+
+def _get_item_column_texts(item_id: str, col_ids: list) -> dict:
+    """Read current text values for the given columns of an item."""
+    q = """
+    query ($id: [ID!], $cols: [String!]) {
+      items(ids: $id) { column_values(ids: $cols) { id text } }
+    }"""
+    try:
+        data = _gql(q, {"id": [str(item_id)], "cols": col_ids})
+        cvs = data["data"]["items"][0]["column_values"]
+        return {cv["id"]: (cv.get("text") or "") for cv in cvs}
+    except Exception:
+        return {}
+
+
+def _lead_update_body(contact: dict) -> str:
+    nl = "\n"
+    return (
+        f"**CRS Lead Gen — verified contact** | {_sched_dt_str()}{nl}"
+        f"Title: {contact.get('title','')}{nl}"
+        f"Company: {contact.get('company','')}{nl}"
+        f"Email: {contact.get('email','')}{nl}"
+        f"Phone: {contact.get('phone','')}{nl}"
+        f"LinkedIn: {contact.get('linkedin','')}{nl}"
+        f"Authority: {contact.get('authority','')}{nl}"
+        f"Accuracy: {contact.get('accuracy_score','')}/100{nl}"
+        f"Source: {contact.get('provider_chain','')}{nl}"
+        f"Outreach opener: {contact.get('opener','')}"
+    )
+
+
+def sync_lead_to_monday(contact: dict) -> dict:
+    """Dedupe-check a collected/verified contact against the Leads board, append
+    the AI outreach opener to Contact Notes, and fill in as many board columns as
+    possible from the enrichment data. Existing items: only empty columns are
+    filled (existing data is preserved), Contact Notes are APPENDED. New items:
+    created in the 'NEW Leads' group with everything mapped. Returns a result dict."""
+    name = str(contact.get("name") or "").strip()
+    if not name:
+        raise ValueError("contact needs a name")
+    email    = (contact.get("email") or "").strip()
+    linkedin = (contact.get("linkedin") or "").strip()
+    opener   = (contact.get("opener") or "").strip()
+    title    = (contact.get("title") or "").strip()
+    phone    = (contact.get("phone") or "").strip()
+    industry = (contact.get("industry") or contact.get("company") or "").strip()
+    score    = contact.get("accuracy_score")
+    authority = (contact.get("authority") or "").strip()
+    auth_label = _LEAD_AUTHORITY_MAP.get(authority.lower())
+
+    # Dedupe: try name, then email, then LinkedIn
+    item_id = find_item_by_column(LEADS_BOARD_ID, "name", name)
+    if not item_id and email:
+        item_id = find_item_by_column(LEADS_BOARD_ID, _LEAD_COL_EMAIL, email)
+    if not item_id and linkedin:
+        item_id = find_item_by_column(LEADS_BOARD_ID, _LEAD_COL_LINKEDIN, linkedin)
+
+    note_line = (f"[{_sched_dt_str()}] CRS outreach: {opener}" if opener
+                 else f"[{_sched_dt_str()}] Verified via CRS Lead Gen "
+                      f"({contact.get('provider_chain','')})")
+
+    def _fill(existing: dict) -> dict:
+        """Build column values; on existing items only set columns that are empty."""
+        cv = {}
+        if title and not existing.get(_LEAD_COL_TITLE):
+            cv[_LEAD_COL_TITLE] = title
+        if linkedin and not existing.get(_LEAD_COL_LINKEDIN):
+            cv[_LEAD_COL_LINKEDIN] = {"url": linkedin, "text": "LinkedIn"}
+        if phone and not existing.get(_LEAD_COL_PHONE):
+            cv[_LEAD_COL_PHONE] = phone
+        if email and not existing.get(_LEAD_COL_EMAIL):
+            cv[_LEAD_COL_EMAIL] = {"email": email, "text": email}
+        if score is not None and not existing.get(_LEAD_COL_SCORE):
+            cv[_LEAD_COL_SCORE] = str(score)
+        if industry and not existing.get(_LEAD_COL_INDUSTRY):
+            cv[_LEAD_COL_INDUSTRY] = industry
+        if auth_label and not existing.get(_LEAD_COL_AUTHORITY):
+            cv[_LEAD_COL_AUTHORITY] = {"label": auth_label}
+        return cv
+
+    if item_id:
+        existing = _get_item_column_texts(item_id, [
+            _LEAD_COL_TITLE, _LEAD_COL_LINKEDIN, _LEAD_COL_PHONE, _LEAD_COL_EMAIL,
+            _LEAD_COL_SCORE, _LEAD_COL_INDUSTRY, _LEAD_COL_AUTHORITY, _LEAD_COL_NOTES,
+        ])
+        cv = _fill(existing)
+        cur_notes = existing.get(_LEAD_COL_NOTES, "")
+        cv[_LEAD_COL_NOTES] = ((cur_notes + ("\n" if cur_notes else "") + note_line))[:2000]
+        if cv:
+            _update_item(LEADS_BOARD_ID, item_id, cv)
+        _add_monday_update(item_id, LEADS_BOARD_ID, _lead_update_body(contact))
+        return {"action": "updated", "item_id": item_id, "name": name,
+                "fields_set": [k for k in cv if k != _LEAD_COL_NOTES], "notes_appended": True}
+
+    cv = _fill({})
+    cv[_LEAD_COL_NOTES] = note_line
+    new_id = _create_item(LEADS_BOARD_ID, _LEAD_NEW_GROUP, name, cv)
+    _add_monday_update(new_id, LEADS_BOARD_ID, _lead_update_body(contact))
+    return {"action": "created", "item_id": new_id, "name": name,
+            "fields_set": list(cv.keys()), "notes_appended": True}
+
+
 def _sched_dt_str() -> str:
     """Return current datetime as a readable string."""
     import datetime
