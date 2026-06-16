@@ -14,13 +14,32 @@ jobs:
           fetch-depth: 0
           lfs: true
 
+      - name: Verify HF token
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer ${HF_TOKEN}" \
+            https://huggingface.co/api/whoami-v2)
+          echo "HF API status: ${STATUS}"
+          [ "${STATUS}" = "200" ] || (echo "Token invalid or missing" && exit 1)
+
+      - name: Check Space is reachable
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          git config --global credential.helper "store --file ~/.hf-creds"
+          printf 'https://DrystanGovender:%s@huggingface.co\n' "${HF_TOKEN}" > ~/.hf-creds
+          echo "Probing remote..."
+          git ls-remote https://huggingface.co/spaces/DrystanGovender/crs-competitive-intelligence \
+            && echo "Remote OK" \
+            || (echo "Remote not found or not accessible" && exit 1)
+
       - name: Push to HF Space
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           git config user.email "action@github.com"
           git config user.name "GitHub Action"
-          git config --global credential.helper "store --file ~/.hf-creds"
-          printf 'https://DrystanGovender:%s@huggingface.co\n' "${HF_TOKEN}" > ~/.hf-creds
           git remote add hf https://huggingface.co/spaces/DrystanGovender/crs-competitive-intelligence
           git push hf main:main --force
