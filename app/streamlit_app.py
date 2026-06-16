@@ -508,7 +508,7 @@ Return JSON array only: [{{"index":1,"victim_org":"...","attack_type":"...","crs
                         "outreach_angle": str(s.get("outreach_angle",""))[:500],
                         "url":            str(s.get("url",""))[:500],
                         "published":      str(s.get("published",""))[:20],
-                        "country_context":"Africa",
+                        "country_context": s.get("country_context") or "Africa",
                     } for s in signals]
                     supabase.table("attack_signal_history").insert(signal_rows).execute()
                     counters["signals_found"] = len(signal_rows)
@@ -2461,14 +2461,18 @@ def _db_winning_bidder_leads(limit: int = 50, ict_only: bool = True) -> list:
     return out
 
 
-def _db_breach_leads(limit: int = 30) -> list:
+def _db_breach_leads(limit: int = 30, country: str = "") -> list:
     """Turn captured breach/attack signals into hot leads — victim orgs that need
-    cybersecurity NOW, with the breach context as the outreach opener."""
+    cybersecurity NOW, with the breach context as the outreach opener. Optionally
+    filter to one country (matched against the signal's country_context)."""
     out = []
     try:
-        rows = (supabase.table("attack_signal_history")
-                .select("victim_org,attack_type,contact_title,outreach_angle,url,country_context,crs_score,title")
-                .order("run_at", desc=True).limit(limit).execute()).data or []
+        q = (supabase.table("attack_signal_history")
+             .select("victim_org,attack_type,contact_title,outreach_angle,url,country_context,crs_score,title")
+             .order("run_at", desc=True).limit(max(limit * 3, 60)))
+        if country and country != "All Africa":
+            q = q.eq("country_context", country)
+        rows = q.execute().data or []
         for r in rows:
             org = (r.get("victim_org") or "").strip()
             if not org:
@@ -2481,6 +2485,8 @@ def _db_breach_leads(limit: int = 30) -> list:
                 "opener_seed": r.get("outreach_angle") or "",
                 "_source_note": f"Breach signal: {r.get('attack_type') or ''} — {(r.get('title') or '')[:60]}",
             })
+            if len(out) >= limit:
+                break
     except Exception as e:
         st.session_state["_db_diag"] = f"breach read error: {str(e)[:80]}"
     return out[:limit]
@@ -4640,7 +4646,8 @@ with tab5:
     st.subheader("🎯 Lead Intelligence")
     st.write(
         "Find companies and decision-makers showing buying signals for CRS solutions. "
-        "Sources: Reddit pain-point threads, African tech news, JSE-listed ICT companies, "
+        "Sources: African tech & security news (RSS: MyBroadband, ITWeb, TechCentral, BusinessTech, "
+        "IT News Africa, TechCabal…), JSE-listed ICT companies, "
         "and Apollo contact search — all free."
     )
 
@@ -4723,77 +4730,147 @@ with tab5:
         "Nairobi", "Lagos", "Accra", "Pretoria", "Durban",
     ]
 
+    _AFRICAN_NEWS_DOMAINS = [
+        "mybroadband.co.za", "techcentral.co.za", "businesstech.co.za",
+        "itweb.co.za", "itnewsafrica.com", "disrupt-africa.com", "techcabal.com",
+        "techpoint.africa", "htxt.co.za", "memeburn.com", "ventureburn.com",
+        "iol.co.za", "news24.com", "engineeringnews.co.za", "moneyweb.co.za",
+        "nation.africa", "businessday.ng", "punchng.com", "citizen.co.za",
+        "ghanaweb.com", "theeastafrican.co.ke", "thecitizen.co.tz",
+    ]
+    # (name, RSS url, primary country) — country is the feed default, refined per-article
+    _AFRICAN_NEWS_RSS = [
+        ("MyBroadband",     "https://mybroadband.co.za/news/feed/",   "South Africa"),
+        ("TechCentral",     "https://techcentral.co.za/feed/",        "South Africa"),
+        ("BusinessTech",    "https://businesstech.co.za/feed/",       "South Africa"),
+        ("htxt.africa",     "https://www.htxt.co.za/feed/",           "South Africa"),
+        ("Moneyweb",        "https://www.moneyweb.co.za/feed/",       "South Africa"),
+        ("The Citizen",     "https://www.citizen.co.za/feed/",        "South Africa"),
+        ("Ventureburn",     "https://ventureburn.com/feed/",          "South Africa"),
+        ("IT News Africa",  "https://www.itnewsafrica.com/feed/",     ""),
+        ("Disrupt Africa",  "https://disrupt-africa.com/feed/",       ""),
+        ("TechCabal",       "https://techcabal.com/feed/",            "Nigeria"),
+        ("Techpoint Africa","https://techpoint.africa/feed/",         "Nigeria"),
+        ("Technext",        "https://technext24.com/feed/",           "Nigeria"),
+        ("Nairametrics",    "https://nairametrics.com/feed/",         "Nigeria"),
+        ("Techweez",        "https://techweez.com/feed/",             "Kenya"),
+    ]
+    _COUNTRY_CITIES = {
+        "South Africa": ["south africa", "south african", "johannesburg", "cape town",
+                         "pretoria", "durban", "sandton", "gauteng", "soweto", "joburg"],
+        "Nigeria": ["nigeria", "nigerian", "lagos", "abuja"],
+        "Kenya": ["kenya", "kenyan", "nairobi", "mombasa"],
+        "Ghana": ["ghana", "ghanaian", "accra"],
+        "Egypt": ["egypt", "egyptian", "cairo"],
+        "Morocco": ["morocco", "moroccan", "casablanca", "rabat"],
+        "Tanzania": ["tanzania", "tanzanian", "dar es salaam", "dodoma"],
+        "Uganda": ["uganda", "ugandan", "kampala"],
+        "Zambia": ["zambia", "zambian", "lusaka"],
+        "Rwanda": ["rwanda", "rwandan", "kigali"],
+        "Ethiopia": ["ethiopia", "ethiopian", "addis ababa"],
+        "Senegal": ["senegal", "senegalese", "dakar"],
+    }
+
+    def _detect_country(text: str, default: str = "") -> str:
+        """Detect an African country from article text (city/country mentions),
+        falling back to the feed's primary country."""
+        t = (text or "").lower()
+        for country, terms in _COUNTRY_CITIES.items():
+            if any(term in t for term in terms):
+                return country
+        return default or "Africa"
+
+    def _parse_rss(url: str, limit: int = 20) -> list:
+        """Parse an RSS/Atom feed into title/url/body/published dicts (stdlib only)."""
+        import requests, xml.etree.ElementTree as ET
+        try:
+            r = requests.get(url, headers={"User-Agent": "CRS-LeadGen/1.0"}, timeout=12)
+            if not r.ok:
+                return []
+            root = ET.fromstring(r.content)
+        except Exception:
+            return []
+        out = []
+        for it in root.iter("item"):                       # RSS 2.0
+            t = (it.findtext("title") or "").strip()
+            if not t:
+                continue
+            out.append({"title": t,
+                        "url": (it.findtext("link") or "").strip(),
+                        "body": _re.sub("<[^>]+>", "", (it.findtext("description") or ""))[:400],
+                        "published": (it.findtext("pubDate") or "")[:16]})
+            if len(out) >= limit:
+                break
+        if not out:                                        # Atom fallback
+            A = "{http://www.w3.org/2005/Atom}"
+            for e in root.iter(f"{A}entry"):
+                t = (e.findtext(f"{A}title") or "").strip()
+                if not t:
+                    continue
+                le = e.find(f"{A}link")
+                out.append({"title": t,
+                            "url": le.get("href") if le is not None else "",
+                            "body": _re.sub("<[^>]+>", "", (e.findtext(f"{A}summary") or ""))[:400],
+                            "published": (e.findtext(f"{A}updated") or "")[:16]})
+                if len(out) >= limit:
+                    break
+        return out
+
     def _search_attack_news(countries: list, limit: int = 30) -> list:
-        """NewsAPI — African cyber attack news. Each article = a company in distress."""
+        """African cyber-attack news ONLY. Primary source = free African tech/security
+        news RSS feeds; NewsAPI (when keyed) is restricted to African news domains.
+        Each matching article = an African organisation in distress = a hot lead."""
         import requests
-        key = st.secrets.get("NEWSAPI_KEY", "")
+        _kw = [k.lower() for k in _ATTACK_KEYWORDS]
         results = []
 
-        # Two complementary queries for maximum coverage
-        _geo = " OR ".join(countries[:4] + ["Africa"])
-        queries = [
-            f"(ransomware OR cyberattack OR hacked OR breach) AND ({_geo})",
-            f"(malware OR phishing OR ransomware OR DDoS) AND ({_geo})",
-        ]
-
-        if key:
-            for q in queries:
-                try:
-                    r = requests.get("https://newsapi.org/v2/everything", params={
-                        "q": q, "sortBy": "publishedAt", "language": "en",
-                        "pageSize": limit // 2, "apiKey": key,
-                    }, timeout=15)
-                    if r.ok:
-                        for a in r.json().get("articles", []):
-                            results.append({
-                                "source":      f"News: {a.get('source',{}).get('name','')}",
-                                "title":       a.get("title", ""),
-                                "url":         a.get("url", ""),
-                                "body":        (a.get("description") or "")[:400],
-                                "published":   a.get("publishedAt", "")[:10],
-                                "victim_org":  "",   # filled by AI
-                                "attack_type": "",   # filled by AI
-                                "crs_score":   None,
-                                "contact_title": "",
-                            })
-                except Exception as e:
-                    st.toast(f"NewsAPI error: {e}")
-
-        # Reddit fallback / supplement — no key needed
-        try:
-            import requests as _req
-            geo_part = " OR ".join(f'"{g}"' for g in _AFRICA_GEO_TERMS[:5])
-            atk_part = " OR ".join(f'"{k}"' for k in _ATTACK_KEYWORDS[:5])
-            q = f"({atk_part}) ({geo_part})"
-            r = _req.get("https://www.reddit.com/search.json",
-                         params={"q": q, "sort": "new", "t": "year",
-                                 "limit": 15, "type": "link"},
-                         headers={"User-Agent": "CRS-LeadGen/1.0"}, timeout=15)
-            if r.ok:
-                for post in r.json().get("data", {}).get("children", []):
-                    d = post.get("data", {})
+        # 1) Free African news RSS feeds (no key) — keep only attack-related items
+        for _name, _feed, _fcountry in _AFRICAN_NEWS_RSS:
+            for it in _parse_rss(_feed, limit=20):
+                blob = (it["title"] + " " + it["body"]).lower()
+                if any(k in blob for k in _kw):
                     results.append({
-                        "source":      f"Reddit r/{d.get('subreddit','')}",
-                        "title":       d.get("title", ""),
-                        "url":         f"https://reddit.com{d.get('permalink','')}",
-                        "body":        d.get("selftext", "")[:400],
-                        "published":   "",
-                        "victim_org":  "",
-                        "attack_type": "",
-                        "crs_score":   None,
+                        "source": f"RSS: {_name}", "title": it["title"],
+                        "url": it["url"], "body": it["body"], "published": it["published"],
+                        "victim_org": "", "attack_type": "", "crs_score": None,
                         "contact_title": "",
+                        "country_context": _detect_country(it["title"] + " " + it["body"], _fcountry),
                     })
-        except Exception as e:
-            st.toast(f"Reddit fetch error: {e}")
+
+        # 2) NewsAPI restricted to African news domains (only if a key is present)
+        key = st.secrets.get("NEWSAPI_KEY", "")
+        if key:
+            q = ('ransomware OR cyberattack OR hacked OR breach OR malware OR '
+                 'phishing OR "data leak" OR "data breach"')
+            try:
+                r = requests.get("https://newsapi.org/v2/everything", params={
+                    "q": q, "domains": ",".join(_AFRICAN_NEWS_DOMAINS),
+                    "sortBy": "publishedAt", "language": "en",
+                    "pageSize": limit, "apiKey": key,
+                }, timeout=15)
+                if r.ok:
+                    for a in r.json().get("articles", []):
+                        results.append({
+                            "source": f"News: {a.get('source',{}).get('name','')}",
+                            "title": a.get("title", ""), "url": a.get("url", ""),
+                            "body": (a.get("description") or "")[:400],
+                            "published": a.get("publishedAt", "")[:10],
+                            "victim_org": "", "attack_type": "", "crs_score": None,
+                            "contact_title": "",
+                            "country_context": _detect_country(
+                                (a.get("title") or "") + " " + (a.get("description") or "")),
+                        })
+            except Exception as e:
+                st.toast(f"NewsAPI error: {e}")
 
         # Deduplicate by title
         seen, deduped = set(), []
         for s in results:
-            key_str = s["title"][:60]
-            if key_str not in seen:
-                seen.add(key_str)
+            k = s["title"][:60]
+            if k and k not in seen:
+                seen.add(k)
                 deduped.append(s)
-        return deduped
+        return deduped[:limit]
 
     def _jse_ict_companies() -> list:
         """Return a curated list of JSE-listed ICT / financial services companies
@@ -5015,7 +5092,7 @@ with tab5:
 
 CRS sells: {", ".join(focus[:8])} and more. Full profile: {CRS_PROFILE[:400]}
 
-TASK: For each news/Reddit item below, extract:
+TASK: For each African news item below, extract:
 1. The VICTIM ORGANISATION (company/government body that was attacked) — if named
 2. The ATTACK TYPE (ransomware / data breach / phishing / DDoS / malware / unknown)
 3. CRS FIT SCORE 1-10: how relevant is this incident for CRS to approach the victim?
@@ -5127,9 +5204,9 @@ Return ONLY a valid JSON object:
     # RUN LEAD SEARCH
     # ────────────────────────────────────────────────────────────────────────
     if run_leads:
-        with st.spinner("🔍 Gathering signals from Reddit, news, Apollo, and JSE data…"):
+        with st.spinner("🔍 Gathering signals from African news, Apollo, and JSE data…"):
 
-            # 1. Cyber attack signals — Africa-focused (Reddit + NewsAPI)
+            # 1. Cyber attack signals — African news RSS + NewsAPI (African domains)
             all_signals = _search_attack_news(lead_countries)
             st.toast(f"📡 {len(all_signals)} African cyber attack signals collected")
 
@@ -5232,7 +5309,7 @@ Return ONLY a valid JSON object:
                     "outreach_angle":  str(s.get("outreach_angle", ""))[:500],
                     "url":             str(s.get("url", ""))[:500],
                     "published":       str(s.get("published", ""))[:20],
-                    "country_context": "Africa",
+                    "country_context": s.get("country_context") or "Africa",
                 } for s in merged_signals if s.get("title") or s.get("victim_org")]
                 if sig_rows:
                     supabase.table("attack_signal_history").insert(sig_rows).execute()
@@ -5732,7 +5809,13 @@ with tab_verify:
         st.markdown("Turn captured **breach / attack signals** into hot leads — victim "
                     "organisations that need cybersecurity now. The breach context becomes "
                     "the outreach angle.")
-        v_breach_limit = st.number_input("Max breach signals", 5, 50, 20, step=5, key="breach_limit")
+        bc1, bc2 = st.columns(2)
+        v_breach_limit = bc1.number_input("Max breach signals", 5, 50, 20, step=5, key="breach_limit")
+        v_breach_country = bc2.selectbox(
+            "Country",
+            ["All Africa", "South Africa", "Nigeria", "Kenya", "Ghana", "Egypt", "Morocco",
+             "Tanzania", "Uganda", "Zambia", "Rwanda", "Ethiopia", "Senegal"],
+            key="breach_country")
         st.caption("These are company-level; enable **Hunter.io** above to find emails at the "
                    "victim org's domain, or push them and dork for decision-makers.")
         run_verify = st.button("▶️ Pull breach leads + Cascade", type="primary", key="verify_run_breach")
@@ -5850,8 +5933,8 @@ with tab_verify:
                     use_hunter=v_use_hunter, use_pattern=v_use_pattern)
 
             elif breach_mode:
-                _vlog("[Breach] Pulling captured attack signals…")
-                raw_contacts = _db_breach_leads(int(v_breach_limit))
+                _vlog(f"[Breach] Pulling captured attack signals ({v_breach_country})…")
+                raw_contacts = _db_breach_leads(int(v_breach_limit), v_breach_country)
                 _ddiag = st.session_state.get("_db_diag", "")
                 if _ddiag:
                     _vlog(f"[Breach] {_ddiag}")
