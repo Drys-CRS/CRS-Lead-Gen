@@ -1,0 +1,10 @@
+.git
+.github
+scripts
+__pycache__/
+*.pyc
+*.pyo
+*.ipynb
+.env
+.streamlit/secrets.toml
+.DS_Store
