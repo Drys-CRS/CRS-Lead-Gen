@@ -783,6 +783,69 @@ def sync_lead_to_monday(contact: dict) -> dict:
             "fields_set": list(cv.keys()), "notes_appended": True}
 
 
+# ── Cross-reference a contact against existing CRM boards ───────────────────────
+_MONDAY_SUBDOMAIN = "cyberretaliatorsolutions-crs"
+
+# People-bearing boards to check, in priority order (Contacts is the curated CRM).
+_CRM_LOOKUP_BOARDS = [
+    {"id": 3664655500, "label": "Contacts", "name": "name", "email": "email",
+     "linkedin": "link", "title": "title", "phone": "phone", "authority": "priority",
+     "notes": "text0", "last_method": "color", "last_date": "date",
+     "account_type": "lookup9", "status": "mirror3", "heat": "color_mkq8qyqr"},
+    {"id": 7677528134, "label": "Leads", "name": "name", "email": "email",
+     "linkedin": "link", "title": "title", "phone": "phone", "authority": "priority",
+     "notes": "text_mm3zejkw", "last_method": "status_1", "last_date": "date",
+     "account_type": "lookup9", "status": "mirror3", "heat": None},
+]
+
+
+def lookup_monday_crm(contact: dict) -> dict:
+    """Check whether a collected contact already exists on the Monday CRM (Contacts
+    board, then Leads board). Matches by name → email → LinkedIn. On a hit, returns
+    on_crm=True, which board, a deep link, and the existing CRM field values so the
+    caller can show a tag and merge CRM data. Returns {'on_crm': False} if not found."""
+    name = str(contact.get("name") or "").strip()
+    email = str(contact.get("email") or "").strip()
+    linkedin = str(contact.get("linkedin") or "").strip()
+    if not (name or email or linkedin):
+        return {"on_crm": False}
+
+    for b in _CRM_LOOKUP_BOARDS:
+        item_id = None
+        if name:
+            item_id = find_item_by_column(b["id"], b["name"], name)
+        if not item_id and email:
+            item_id = find_item_by_column(b["id"], b["email"], email)
+        if not item_id and linkedin:
+            item_id = find_item_by_column(b["id"], b["linkedin"], linkedin)
+        if not item_id:
+            continue
+
+        want = [b[k] for k in ("title", "phone", "email", "linkedin", "authority",
+                               "notes", "last_method", "last_date", "account_type",
+                               "status", "heat") if b.get(k)]
+        cols = _get_item_column_texts(item_id, want)
+        return {
+            "on_crm": True,
+            "crm_board": b["label"],
+            "crm_board_id": b["id"],
+            "crm_item_id": item_id,
+            "crm_url": f"https://{_MONDAY_SUBDOMAIN}.monday.com/boards/{b['id']}/pulses/{item_id}",
+            "crm_title":       cols.get(b["title"], ""),
+            "crm_phone":       cols.get(b["phone"], ""),
+            "crm_email":       cols.get(b["email"], ""),
+            "crm_linkedin":    cols.get(b["linkedin"], ""),
+            "crm_authority":   cols.get(b["authority"], ""),
+            "crm_last_method": cols.get(b["last_method"], ""),
+            "crm_last_date":   cols.get(b["last_date"], ""),
+            "crm_account_type": cols.get(b.get("account_type", ""), ""),
+            "crm_status":      cols.get(b.get("status", ""), ""),
+            "crm_heat":        cols.get(b.get("heat", ""), "") if b.get("heat") else "",
+            "crm_notes":       (cols.get(b["notes"], "") or "")[:200],
+        }
+    return {"on_crm": False}
+
+
 def _sched_dt_str() -> str:
     """Return current datetime as a readable string."""
     import datetime

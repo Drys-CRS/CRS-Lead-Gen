@@ -20,6 +20,7 @@ try:
         push_partner_to_companies,
         push_verified_lead,
         sync_lead_to_monday,
+        lookup_monday_crm,
         get_ticket_board_id, get_leads_board_id, get_companies_board_id,
     )
     _MONDAY_AVAILABLE = bool(st.secrets.get("MONDAY_API_KEY") if hasattr(st, 'secrets') else False)
@@ -2576,7 +2577,8 @@ def _apollo_people_match(name: str = "", first: str = "", last: str = "",
 def _verify_process_contacts(raw: list, use_lusha: bool, classify: bool, threshold: int,
                              default_country: str = "", apollo_match: bool = False,
                              base_provider: str = None, vlog=None, persist: bool = True,
-                             use_hunter: bool = False, use_pattern: bool = False):
+                             use_hunter: bool = False, use_pattern: bool = False,
+                             crossref: bool = False):
     """Shared cascade processor used by all Lead-Verification modes (Dork, Discover,
     Enrich-seed-list). For each contact: optional Apollo people/match enrich →
     Lusha gap-fill → validate/normalise → score → AI authority classification →
@@ -2648,6 +2650,32 @@ def _verify_process_contacts(raw: list, use_lusha: bool, classify: bool, thresho
             if _hunter_verify(c["email"]) == "verified":
                 c["email_status"] = "verified"
 
+        # Cross-reference against Monday CRM (Contacts → Leads); tag + merge CRM data
+        if crossref:
+            try:
+                xr = lookup_monday_crm(c)
+            except Exception:
+                xr = {"on_crm": False}
+            c["on_crm"] = bool(xr.get("on_crm"))
+            c["crm_board"] = xr.get("crm_board", "")
+            c["crm_url"] = xr.get("crm_url", "")
+            if xr.get("on_crm"):
+                c["title"]    = c.get("title")    or xr.get("crm_title", "")
+                c["phone"]    = c.get("phone")    or xr.get("crm_phone", "")
+                c["email"]    = c.get("email")    or xr.get("crm_email", "")
+                c["linkedin"] = c.get("linkedin") or xr.get("crm_linkedin", "")
+                c["crm_authority"]    = xr.get("crm_authority", "")
+                c["crm_last_method"]  = xr.get("crm_last_method", "")
+                c["crm_last_date"]    = xr.get("crm_last_date", "")
+                c["crm_account_type"] = xr.get("crm_account_type", "")
+                c["crm_status"]       = xr.get("crm_status", "")
+                c["crm_heat"]         = xr.get("crm_heat", "")
+                c["crm_notes"]        = xr.get("crm_notes", "")
+                _log(f"[CRM] {c.get('name')} already on {xr.get('crm_board')} board.")
+        else:
+            c["on_crm"] = False
+            c["crm_board"] = ""
+
         # Validate + normalise + score
         c["country"] = c.get("country") or default_country
         c["phone"] = _normalize_phone(c.get("phone", ""), c.get("country", ""))
@@ -2682,6 +2710,8 @@ def _verify_process_contacts(raw: list, use_lusha: bool, classify: bool, thresho
                     "accuracy_score": int(c.get("accuracy_score", 0)),
                     "authority": c.get("authority", ""),
                     "status": c.get("status", ""),
+                    "on_crm": bool(c.get("on_crm")),
+                    "crm_board": c.get("crm_board", ""),
                     "cost_estimate": round(0.03 * max(1, len(c.get("provider_chain", "").split("→"))), 3),
                 }).execute()
                 st.session_state["_verify_saved_count"] = st.session_state.get("_verify_saved_count", 0) + 1
@@ -5698,6 +5728,9 @@ with tab_verify:
                                 disabled=not _has_hunter, key="verify_use_hunter")
     v_use_pattern = ec2.checkbox("Email pattern + MX (free)", value=True, key="verify_use_pattern")
     v_classify = st.checkbox("AI-classify authority + draft outreach opener", value=True, key="verify_classify")
+    v_crossref = st.checkbox("Cross-reference against Monday CRM (Contacts + Leads) — tag who's "
+                             "already in the CRM and pull their data", value=_MONDAY_AVAILABLE,
+                             disabled=not _MONDAY_AVAILABLE, key="verify_crossref")
 
     # Hunter credit meter
     if _has_hunter:
@@ -5910,7 +5943,7 @@ with tab_verify:
                     raw_contacts, v_use_lusha, v_classify, int(v_threshold),
                     default_country=default_country, apollo_match=_has_apollo,
                     base_provider="LinkedIn", vlog=_vlog,
-                    use_hunter=v_use_hunter, use_pattern=v_use_pattern)
+                    use_hunter=v_use_hunter, use_pattern=v_use_pattern, crossref=v_crossref)
                 _mdiag = st.session_state.get("_apollo_match_diag", "")
                 if _mdiag:
                     _vlog(f"[Apollo] {_mdiag}")
@@ -5930,7 +5963,7 @@ with tab_verify:
                     raw_contacts, v_use_lusha, v_classify, int(v_threshold),
                     default_country=default_country, apollo_match=_has_apollo,
                     base_provider="Tender DB", vlog=_vlog,
-                    use_hunter=v_use_hunter, use_pattern=v_use_pattern)
+                    use_hunter=v_use_hunter, use_pattern=v_use_pattern, crossref=v_crossref)
 
             elif breach_mode:
                 _vlog(f"[Breach] Pulling captured attack signals ({v_breach_country})…")
@@ -5943,7 +5976,7 @@ with tab_verify:
                     raw_contacts, v_use_lusha, v_classify, int(v_threshold),
                     default_country=default_country, apollo_match=_has_apollo,
                     base_provider="Breach Signal", vlog=_vlog,
-                    use_hunter=v_use_hunter, use_pattern=v_use_pattern)
+                    use_hunter=v_use_hunter, use_pattern=v_use_pattern, crossref=v_crossref)
                 # Use the breach angle as the opener where the AI didn't supply one
                 for r in results:
                     if r.get("opener_seed") and not r.get("opener"):
@@ -5961,14 +5994,14 @@ with tab_verify:
                     raw_contacts[: int(v_limit)], v_use_lusha, v_classify, int(v_threshold),
                     default_country=default_country, apollo_match=False,
                     base_provider="Apollo", vlog=_vlog,
-                    use_hunter=v_use_hunter, use_pattern=v_use_pattern)
+                    use_hunter=v_use_hunter, use_pattern=v_use_pattern, crossref=v_crossref)
             else:
                 _vlog(f"[Seed] Enriching {len(raw_contacts)} contact(s)…")
                 results, provider_counts = _verify_process_contacts(
                     raw_contacts[: int(v_limit)], v_use_lusha, v_classify, int(v_threshold),
                     default_country=default_country, apollo_match=_has_apollo,
                     base_provider=None, vlog=_vlog,
-                    use_hunter=v_use_hunter, use_pattern=v_use_pattern)
+                    use_hunter=v_use_hunter, use_pattern=v_use_pattern, crossref=v_crossref)
                 _mdiag = st.session_state.get("_apollo_match_diag", "")
                 if _mdiag:
                     _vlog(f"[Apollo] {_mdiag}")
@@ -5996,11 +6029,13 @@ with tab_verify:
     if results:
         pcounts = st.session_state.get("verify_provider_counts", {})
         st.divider()
-        rc1, rc2, rc3, rc4 = st.columns(4)
+        rc1, rc2, rc3, rc4, rc5 = st.columns(5)
         rc1.metric("Processed", len(results))
         rc2.metric("✅ Verified", sum(1 for r in results if r["status"] == "Verified"))
         rc3.metric("🟠 Quarantine", sum(1 for r in results if r["status"] == "Quarantine"))
         rc4.metric("Avg score", round(sum(r["accuracy_score"] for r in results) / len(results)))
+        _on_crm_n = sum(1 for r in results if r.get("on_crm"))
+        rc5.metric("🗂️ Already on CRM", f"{_on_crm_n} / {len(results)}")
         if pcounts:
             st.caption("Provider hits: " + " · ".join(f"{k} {v}" for k, v in pcounts.items() if v))
 
@@ -6052,6 +6087,8 @@ with tab_verify:
             "Email": r.get("email",""), "Phone": r.get("phone",""),
             "LinkedIn": r.get("linkedin",""),
             "Score": r.get("accuracy_score",0), "Source": r.get("provider_chain",""),
+            "On CRM": "Yes" if r.get("on_crm") else "No",
+            "CRM Board": r.get("crm_board",""),
             "Status": r.get("status",""),
         } for r in results])
 
@@ -6070,6 +6107,10 @@ with tab_verify:
                         if r.get("authority"):
                             meta.append(f"🎯 {r['authority']}")
                         meta.append(("✅ " if r.get("status") == "Verified" else "🟠 ") + r.get("status",""))
+                        if r.get("on_crm"):
+                            meta.append(f"🗂️ On CRM · {r.get('crm_board','')}")
+                        else:
+                            meta.append("🆕 Not on CRM")
                         st.caption(" · ".join(meta))
                         st.markdown(f"{r.get('title') or '—'} · **{r.get('company') or '—'}**")
                         loc = r.get("country") or r.get("location") or ""
@@ -6078,6 +6119,21 @@ with tab_verify:
                         st.markdown(f"📧 {r.get('email') or '—'}  \n📞 {r.get('phone') or '—'}")
                         if r.get("linkedin"):
                             st.markdown(f"[🔗 LinkedIn profile]({r['linkedin']})")
+                        if r.get("on_crm"):
+                            crm_bits = []
+                            if r.get("crm_last_method") or r.get("crm_last_date"):
+                                crm_bits.append(f"last contact: {r.get('crm_last_method','')} "
+                                                f"{r.get('crm_last_date','')}".strip())
+                            if r.get("crm_account_type"):
+                                crm_bits.append(f"type: {r['crm_account_type']}")
+                            if r.get("crm_heat"):
+                                crm_bits.append(f"heat: {r['crm_heat']}")
+                            if r.get("crm_authority"):
+                                crm_bits.append(f"authority: {r['crm_authority']}")
+                            if crm_bits:
+                                st.caption("🗂️ CRM — " + " · ".join(crm_bits))
+                            if r.get("crm_url"):
+                                st.markdown(f"[↗ Open in Monday ({r.get('crm_board','')})]({r['crm_url']})")
                         if r.get("provider_chain") and r["provider_chain"] != "—":
                             st.caption(f"Source: {r['provider_chain']}")
                         if r.get("opener"):
@@ -6126,7 +6182,7 @@ with tab_verify:
         try:
             _saved = (supabase.table("lead_verification_log")
                       .select("run_at,contact_name,contact_title,company,country,email,"
-                              "phone,linkedin,authority,accuracy_score,status,provider_chain")
+                              "phone,linkedin,authority,accuracy_score,status,on_crm,crm_board,provider_chain")
                       .order("run_at", desc=True).limit(100).execute())
             _sdata = _saved.data or []
             if _sdata:
