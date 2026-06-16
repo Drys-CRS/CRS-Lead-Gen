@@ -115,7 +115,7 @@ def _load_lead_verifications() -> pd.DataFrame:
 def _load_pipeline_runs() -> pd.DataFrame:
     r = (supabase.table("pipeline_runs")
          .select("*")
-         .order("created_at", desc=True)
+         .order("run_at", desc=True)
          .limit(10)
          .execute())
     return pd.DataFrame(r.data or [])
@@ -181,7 +181,7 @@ with tab_overview:
     if not df_run.empty:
         st.divider()
         st.markdown("#### Recent pipeline runs")
-        show_r = [c for c in ["created_at", "status", "trigger",
+        show_r = [c for c in ["run_at", "status", "trigger",
                                "tenders_scraped", "tenders_scored", "duration_secs"]
                   if c in df_run.columns]
         st.dataframe(
