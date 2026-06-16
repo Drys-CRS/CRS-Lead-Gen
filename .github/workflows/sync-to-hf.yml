@@ -1,0 +1,33 @@
+name: Sync to Hugging Face Space
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+# Don't let two syncs race each other
+concurrency:
+  group: hf-sync
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+
+      - name: Mirror repo to the HF Space
+        env:
+          HF_TOKEN:    ${{ secrets.HF_TOKEN }}      # HF access token with WRITE scope
+          HF_USERNAME: ${{ secrets.HF_USERNAME }}   # e.g. Drys-CRS
+          HF_SPACE:    ${{ secrets.HF_SPACE }}      # e.g. crs-competitive-intelligence
+        run: |
+          # GitHub is the source of truth, so we force-push main onto the Space.
+          # (Overwrites the Space's git history — expected for a mirror.)
+          git push --force \
+            "https://${HF_USERNAME}:${HF_TOKEN}@huggingface.co/spaces/${HF_USERNAME}/${HF_SPACE}" \
+            HEAD:main
