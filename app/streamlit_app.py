@@ -471,6 +471,9 @@ def run_pipeline(trigger: str = "scheduled", years_back: int = 3, skip_scrape: b
             out("Collecting attack signals…")
             try:
                 signals = _search_attack_news(["South Africa","Kenya","Nigeria","Ghana"])
+                _fdiag = st.session_state.get("_flare_diag", "")
+                if _fdiag:
+                    out(f"Flare.io: {_fdiag}")
                 if signals:
                     # AI-parse them
                     nl = "\n"
@@ -4677,7 +4680,8 @@ with tab5:
     st.write(
         "Find companies and decision-makers showing buying signals for CRS solutions. "
         "Sources: African tech & security news (RSS: MyBroadband, ITWeb, TechCentral, BusinessTech, "
-        "IT News Africa, TechCabal…), JSE-listed ICT companies, "
+        "IT News Africa, TechCabal…), Flare.io threat intel (leaked credentials / dark web), "
+        "JSE-listed ICT companies, "
         "and Apollo contact search — all free."
     )
 
@@ -4810,6 +4814,103 @@ with tab5:
                 return country
         return default or "Africa"
 
+    def _flare_token() -> str:
+        """Exchange the Flare API key for a 1-hour bearer token (cached ~55 min).
+        Auth: POST https://api.flare.io/tokens/generate with the raw key in the
+        Authorization header. Optional FLARE_TENANT_ID for multi-tenant accounts."""
+        import time, requests
+        tok = st.session_state.get("_flare_token")
+        if tok and time.time() < st.session_state.get("_flare_token_exp", 0):
+            return tok
+        try:
+            key = st.secrets.get("FLARE_API_KEY", "")
+        except Exception:
+            key = ""
+        if not key:
+            return ""
+        body = {}
+        try:
+            tid = st.secrets.get("FLARE_TENANT_ID", "")
+            if tid:
+                body["tenant_id"] = int(tid)
+        except Exception:
+            pass
+        try:
+            r = requests.post("https://api.flare.io/tokens/generate",
+                              headers={"Authorization": key, "Content-Type": "application/json"},
+                              json=body, timeout=20)
+            if not r.ok:
+                st.session_state["_flare_diag"] = f"Flare token HTTP {r.status_code}: {r.text[:80]}"
+                return ""
+            tok = (r.json() or {}).get("token", "")
+            st.session_state["_flare_token"] = tok
+            st.session_state["_flare_token_exp"] = time.time() + 3300
+            return tok
+        except Exception as e:
+            st.session_state["_flare_diag"] = f"Flare token error: {str(e)[:80]}"
+            return ""
+
+    def _flare_search_events(country: str = "", limit: int = 20, days: int = 45) -> list:
+        """Query Flare's Global Search (POST /firework/v4/events/global/_search) for
+        recent breach / leaked-credential / dark-web events with an African focus.
+        Returns signal dicts compatible with the attack-signal pipeline. Requires
+        FLARE_API_KEY and Global Search on the Flare licence."""
+        import datetime, requests
+        tok = _flare_token()
+        if not tok:
+            return []
+        if country and country != "All Africa":
+            q = f'"{country}"'
+        else:
+            q = ('"South Africa" OR "Nigeria" OR "Kenya" OR "Ghana" OR "Egypt" OR '
+                 '".co.za" OR ".org.za" OR ".ng" OR ".co.ke" OR ".com.gh"')
+        since = (datetime.datetime.now(datetime.timezone.utc) -
+                 datetime.timedelta(days=int(days))).isoformat()
+        body = {
+            "size": min(int(limit), 50), "order": "desc", "from": None, "query": q,
+            "filters": {"estimated_created_at": {"gte": since}},
+        }
+        try:
+            r = requests.post("https://api.flare.io/firework/v4/events/global/_search",
+                              headers={"Authorization": f"Bearer {tok}",
+                                       "Content-Type": "application/json"},
+                              json=body, timeout=30)
+            if not r.ok:
+                st.session_state["_flare_diag"] = (
+                    f"Flare search HTTP {r.status_code}: {r.text[:100]}"
+                    + (" (Global Search may not be on your licence)" if r.status_code == 403 else ""))
+                return []
+            data = r.json() or {}
+            items = data.get("items") or data.get("results") or []
+            out = []
+            for e in items:
+                ev = e.get("event", e) if isinstance(e, dict) else {}
+                meta = ev.get("metadata") or {}
+                title = (ev.get("name") or ev.get("title") or meta.get("title")
+                         or ev.get("type") or "Flare breach event")
+                desc = (ev.get("description") or meta.get("description") or "")
+                src = ev.get("source")
+                src_name = src.get("name") if isinstance(src, dict) else (src or "global")
+                uid = ev.get("id") or e.get("id") or ""
+                url = ev.get("url") or (f"https://app.flare.io/#/events/{uid}" if uid else "")
+                blob = f"{title} {desc}"
+                out.append({
+                    "source": f"Flare: {src_name}",
+                    "title": str(title)[:300], "url": url,
+                    "body": str(desc)[:400],
+                    "published": str(ev.get("estimated_created_at")
+                                     or ev.get("created_at") or "")[:10],
+                    "victim_org": "", "attack_type": "", "crs_score": None,
+                    "contact_title": "",
+                    "country_context": _detect_country(
+                        blob, country if (country and country != "All Africa") else ""),
+                })
+            st.session_state["_flare_diag"] = f"{len(out)} Flare event(s)"
+            return out[: int(limit)]
+        except Exception as e:
+            st.session_state["_flare_diag"] = f"Flare search error: {str(e)[:100]}"
+            return []
+
     def _parse_rss(url: str, limit: int = 20) -> list:
         """Parse an RSS/Atom feed into title/url/body/published dicts (stdlib only)."""
         import requests, xml.etree.ElementTree as ET
@@ -4892,6 +4993,13 @@ with tab5:
                         })
             except Exception as e:
                 st.toast(f"NewsAPI error: {e}")
+
+        # 3) Flare.io Global Search — leaked-credential / dark-web breach events
+        try:
+            if st.secrets.get("FLARE_API_KEY", ""):
+                results.extend(_flare_search_events(limit=min(limit, 25)))
+        except Exception:
+            pass
 
         # Deduplicate by title
         seen, deduped = set(), []
@@ -5239,6 +5347,9 @@ Return ONLY a valid JSON object:
             # 1. Cyber attack signals — African news RSS + NewsAPI (African domains)
             all_signals = _search_attack_news(lead_countries)
             st.toast(f"📡 {len(all_signals)} African cyber attack signals collected")
+            _fdiag = st.session_state.get("_flare_diag", "")
+            if _fdiag:
+                st.caption(f"🔦 Flare.io: {_fdiag}")
 
             # 2. Apollo CRM contacts (contacts/search — searches your existing CRM)
             apollo_contacts = _apollo_search_contacts(job_titles, lead_countries)
