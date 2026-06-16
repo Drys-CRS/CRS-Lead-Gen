@@ -20,5 +20,7 @@ jobs:
         run: |
           git config user.email "action@github.com"
           git config user.name "GitHub Action"
-          git remote add hf https://DrystanGovender:${HF_TOKEN}@huggingface.co/spaces/DrystanGovender/crs-competitive-intelligence
-          git push hf main:main --force --verbose
+          git config --global credential.helper "store --file ~/.hf-creds"
+          printf 'https://DrystanGovender:%s@huggingface.co\n' "${HF_TOKEN}" > ~/.hf-creds
+          git remote add hf https://huggingface.co/spaces/DrystanGovender/crs-competitive-intelligence
+          git push hf main:main --force
