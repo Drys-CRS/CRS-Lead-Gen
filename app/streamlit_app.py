@@ -2176,6 +2176,316 @@ def _verification_score(contact: dict) -> int:
     return min(score, 100)
 
 
+# ── Free email discovery / verification: Hunter.io + pattern inference + MX ──
+def _company_domain_guess(company: str) -> str:
+    """Best-effort domain from a company name (last-resort; Hunter is preferred)."""
+    if not company:
+        return ""
+    base = _re.sub(r"\b(pty|ltd|limited|inc|llc|group|holdings|solutions|technologies|"
+                   r"services|company|co|corporation|corp)\b", "", company.lower())
+    base = _re.sub(r"[^a-z0-9]", "", base)
+    return f"{base}.co.za" if base else ""
+
+
+def _domain_has_mx(domain: str) -> bool:
+    """True if the domain has MX (or at least resolves). Uses dnspython when
+    available, else falls back to a socket A-record check."""
+    if not domain:
+        return False
+    try:
+        import dns.resolver  # type: ignore
+        try:
+            ans = dns.resolver.resolve(domain, "MX")
+            return len(ans) > 0
+        except Exception:
+            return False
+    except Exception:
+        import socket
+        try:
+            socket.gethostbyname(domain)
+            return True
+        except Exception:
+            return False
+
+
+def _infer_emails(first: str, last: str, domain: str) -> list:
+    """Generate likely B2B email patterns for a person at a domain (free, no API)."""
+    f = _re.sub(r"[^a-z]", "", (first or "").lower())
+    l = _re.sub(r"[^a-z]", "", (last or "").lower())
+    if not domain or not (f or l):
+        return []
+    out = []
+    if f and l:
+        out += [f"{f}.{l}@{domain}", f"{f}{l}@{domain}", f"{f[0]}{l}@{domain}",
+                f"{f}_{l}@{domain}", f"{f}.{l[0]}@{domain}", f"{f}{l[0]}@{domain}"]
+    if f:
+        out.append(f"{f}@{domain}")
+    if l:
+        out.append(f"{l}@{domain}")
+    # de-dup preserving order
+    seen, uniq = set(), []
+    for e in out:
+        if e not in seen:
+            seen.add(e); uniq.append(e)
+    return uniq
+
+
+def _hunter_domain_search(domain: str = "", company: str = "", limit: int = 10) -> list:
+    """Hunter.io Domain Search — emails at a company (by domain or company name).
+    Free tier ~25 searches/month. Needs HUNTER_API_KEY. Returns list of contacts."""
+    import requests
+    try:
+        key = st.secrets.get("HUNTER_API_KEY", "")
+    except Exception:
+        key = ""
+    if not key or not (domain or company):
+        return []
+    params = {"api_key": key, "limit": max(1, min(limit, 25))}
+    if domain:
+        params["domain"] = domain
+    else:
+        params["company"] = company
+    try:
+        r = requests.get("https://api.hunter.io/v2/domain-search", params=params, timeout=20)
+        if not r.ok:
+            st.session_state["_hunter_diag"] = f"Hunter domain-search HTTP {r.status_code}"
+            return []
+        data = (r.json() or {}).get("data", {}) or {}
+        dom = data.get("domain", domain)
+        out = []
+        for e in data.get("emails", []) or []:
+            out.append({
+                "name": f"{e.get('first_name','')} {e.get('last_name','')}".strip(),
+                "first": e.get("first_name", "") or "",
+                "last": e.get("last_name", "") or "",
+                "title": e.get("position", "") or "",
+                "company": company or dom,
+                "domain": dom,
+                "email": e.get("value", "") or "",
+                "email_status": "verified" if (e.get("confidence") or 0) >= 80 else "",
+                "phone": e.get("phone_number", "") or "",
+                "linkedin": e.get("linkedin", "") or "",
+                "country": "",
+            })
+        return [c for c in out if c["email"]]
+    except Exception as e:
+        st.session_state["_hunter_diag"] = f"Hunter error: {str(e)[:80]}"
+        return []
+
+
+def _hunter_email_finder(first: str, last: str, domain: str = "", company: str = "") -> dict:
+    """Hunter.io Email Finder — one person's email by name + domain/company."""
+    import requests
+    try:
+        key = st.secrets.get("HUNTER_API_KEY", "")
+    except Exception:
+        key = ""
+    if not key or not (first or last) or not (domain or company):
+        return {}
+    params = {"api_key": key, "first_name": first, "last_name": last}
+    if domain:
+        params["domain"] = domain
+    else:
+        params["company"] = company
+    try:
+        r = requests.get("https://api.hunter.io/v2/email-finder", params=params, timeout=20)
+        if not r.ok:
+            return {}
+        data = (r.json() or {}).get("data", {}) or {}
+        return {"email": data.get("email", "") or "",
+                "confidence": data.get("score", 0) or 0,
+                "domain": data.get("domain", domain) or domain}
+    except Exception:
+        return {}
+
+
+def _hunter_verify(email: str) -> str:
+    """Hunter.io Email Verifier — returns 'verified' for deliverable, '' otherwise.
+    Free tier ~50 verifications/month."""
+    import requests
+    try:
+        key = st.secrets.get("HUNTER_API_KEY", "")
+    except Exception:
+        key = ""
+    if not key or not _valid_email(email):
+        return ""
+    try:
+        r = requests.get("https://api.hunter.io/v2/email-verifier",
+                         params={"api_key": key, "email": email}, timeout=20)
+        if not r.ok:
+            return ""
+        status = ((r.json() or {}).get("data", {}) or {}).get("status", "")
+        return "verified" if status in ("valid", "deliverable", "webmail") else ""
+    except Exception:
+        return ""
+
+
+@st.cache_data(ttl=300)
+def _hunter_account() -> dict:
+    """Hunter.io account usage — remaining searches/verifications this month."""
+    import requests
+    try:
+        key = st.secrets.get("HUNTER_API_KEY", "")
+    except Exception:
+        key = ""
+    if not key:
+        return {}
+    try:
+        r = requests.get("https://api.hunter.io/v2/account", params={"api_key": key}, timeout=15)
+        if not r.ok:
+            return {"_error": f"HTTP {r.status_code}"}
+        d = (r.json() or {}).get("data", {}) or {}
+        reqs = d.get("requests", {}) or {}
+        searches = reqs.get("searches", {}) or {}
+        verifs = reqs.get("verifications", {}) or {}
+        return {
+            "plan": d.get("plan_name", ""),
+            "searches_used": searches.get("used"), "searches_avail": searches.get("available"),
+            "verifs_used": verifs.get("used"), "verifs_avail": verifs.get("available"),
+        }
+    except Exception as e:
+        return {"_error": str(e)[:80]}
+
+
+def _enrich_email_free(contact: dict, use_hunter: bool, use_pattern: bool) -> str:
+    """Try to fill a missing email using free methods, in order:
+    1) Hunter Email Finder (name + domain/company), 2) pattern inference + MX check.
+    Returns a short provider tag added to the chain ('' if nothing found)."""
+    if _valid_email(contact.get("email")):
+        return ""
+    domain = contact.get("domain") or ""
+    company = contact.get("company") or ""
+    first, last = contact.get("first", ""), contact.get("last", "")
+
+    if use_hunter and (first or last) and (domain or company):
+        hf = _hunter_email_finder(first, last, domain, company)
+        if hf.get("email") and (hf.get("confidence", 0) >= 50):
+            contact["email"] = hf["email"]
+            contact["domain"] = contact.get("domain") or hf.get("domain", "")
+            contact["email_status"] = "verified" if hf["confidence"] >= 80 else ""
+            return "Hunter"
+
+    if use_pattern and (first or last):
+        dom = domain or _company_domain_guess(company)
+        if dom and _domain_has_mx(dom):
+            cands = _infer_emails(first, last, dom)
+            if cands:
+                contact["email"] = cands[0]      # best-guess pattern
+                contact["email_status"] = ""      # inferred, not verified
+                contact["email_inferred"] = True
+                contact["domain"] = contact.get("domain") or dom
+                return "Pattern"
+    return ""
+
+
+def _db_tender_leads(limit: int = 50, ict_only: bool = True, include_awarded: bool = True) -> list:
+    """Pull ready-made contacts from your own tender tables (sa_tenders open +
+    awarded_tenders) where a contact person/email exists. Free, already collected."""
+    out = []
+    ict = "%security%"
+    try:
+        q = (supabase.table("sa_tenders")
+             .select("contact_person,contact_email,contact_phone,department_name,title,country,category,portal_link")
+             .neq("contact_email", None).limit(limit))
+        rows = q.execute().data or []
+        for r in rows:
+            if not (r.get("contact_email") or r.get("contact_person")):
+                continue
+            out.append({
+                "name": r.get("contact_person") or r.get("department_name") or "Tender contact",
+                "first": (r.get("contact_person") or "").split()[0] if r.get("contact_person") else "",
+                "last": " ".join((r.get("contact_person") or "").split()[1:]) if r.get("contact_person") else "",
+                "title": "Procurement / Tender contact",
+                "company": r.get("department_name") or "",
+                "domain": "", "email": r.get("contact_email") or "",
+                "phone": r.get("contact_phone") or "", "linkedin": "",
+                "country": r.get("country") or "South Africa",
+                "_source_note": f"Open tender: {(r.get('title') or '')[:80]}",
+            })
+    except Exception as e:
+        st.session_state["_db_diag"] = f"sa_tenders read error: {str(e)[:80]}"
+    if include_awarded and len(out) < limit:
+        try:
+            q2 = (supabase.table("awarded_tenders")
+                  .select("contact_person,contact_email,contact_phone,department_name,winning_bidder,title,country,category")
+                  .neq("contact_email", None).limit(limit - len(out)))
+            for r in q2.execute().data or []:
+                if not (r.get("contact_email") or r.get("contact_person")):
+                    continue
+                out.append({
+                    "name": r.get("contact_person") or r.get("department_name") or "Tender contact",
+                    "first": (r.get("contact_person") or "").split()[0] if r.get("contact_person") else "",
+                    "last": " ".join((r.get("contact_person") or "").split()[1:]) if r.get("contact_person") else "",
+                    "title": "Procurement / Tender contact",
+                    "company": r.get("department_name") or "",
+                    "domain": "", "email": r.get("contact_email") or "",
+                    "phone": r.get("contact_phone") or "", "linkedin": "",
+                    "country": r.get("country") or "South Africa",
+                    "_source_note": f"Awarded — winner: {(r.get('winning_bidder') or '')[:60]}",
+                })
+        except Exception as e:
+            st.session_state["_db_diag"] = f"awarded read error: {str(e)[:80]}"
+    return out[:limit]
+
+
+def _db_winning_bidder_leads(limit: int = 50, ict_only: bool = True) -> list:
+    """Distinct companies that have WON tenders → company-level targets for the
+    reseller/partner motion. No contact yet — enrich downstream (Hunter/dork)."""
+    out, seen = [], set()
+    try:
+        sel = (supabase.table("awarded_tenders")
+               .select("winning_bidder,category,title,country,award_value")
+               .neq("winning_bidder", None).limit(1000))
+        rows = sel.execute().data or []
+        ict_terms = ("security", "ict", " it ", "network", "software", "cyber",
+                     "technology", "data", "cloud", "information")
+        for r in rows:
+            wb = (r.get("winning_bidder") or "").strip()
+            if not wb or wb.lower() in seen:
+                continue
+            if ict_only:
+                blob = f"{r.get('category','')} {r.get('title','')}".lower()
+                if not any(t in blob for t in ict_terms):
+                    continue
+            seen.add(wb.lower())
+            out.append({
+                "name": wb, "first": "", "last": "", "title": "",
+                "company": wb, "domain": "", "email": "", "phone": "", "linkedin": "",
+                "country": r.get("country") or "South Africa",
+                "_source_note": f"Tender winner: {(r.get('title') or '')[:70]}",
+            })
+            if len(out) >= limit:
+                break
+    except Exception as e:
+        st.session_state["_db_diag"] = f"winning_bidder read error: {str(e)[:80]}"
+    return out
+
+
+def _db_breach_leads(limit: int = 30) -> list:
+    """Turn captured breach/attack signals into hot leads — victim orgs that need
+    cybersecurity NOW, with the breach context as the outreach opener."""
+    out = []
+    try:
+        rows = (supabase.table("attack_signal_history")
+                .select("victim_org,attack_type,contact_title,outreach_angle,url,country_context,crs_score,title")
+                .order("run_at", desc=True).limit(limit).execute()).data or []
+        for r in rows:
+            org = (r.get("victim_org") or "").strip()
+            if not org:
+                continue
+            out.append({
+                "name": org, "first": "", "last": "",
+                "title": r.get("contact_title") or "CISO",
+                "company": org, "domain": "", "email": "", "phone": "", "linkedin": "",
+                "country": r.get("country_context") or "South Africa",
+                "opener_seed": r.get("outreach_angle") or "",
+                "_source_note": f"Breach signal: {r.get('attack_type') or ''} — {(r.get('title') or '')[:60]}",
+            })
+    except Exception as e:
+        st.session_state["_db_diag"] = f"breach read error: {str(e)[:80]}"
+    return out[:limit]
+
+
 def _classify_authority(contact: dict) -> dict:
     """Use the CRS AI cascade to classify a contact's buying authority
     (VITO / Decision Maker / Influencer / Advocate) and draft a one-line
@@ -2259,7 +2569,8 @@ def _apollo_people_match(name: str = "", first: str = "", last: str = "",
 
 def _verify_process_contacts(raw: list, use_lusha: bool, classify: bool, threshold: int,
                              default_country: str = "", apollo_match: bool = False,
-                             base_provider: str = None, vlog=None, persist: bool = True):
+                             base_provider: str = None, vlog=None, persist: bool = True,
+                             use_hunter: bool = False, use_pattern: bool = False):
     """Shared cascade processor used by all Lead-Verification modes (Dork, Discover,
     Enrich-seed-list). For each contact: optional Apollo people/match enrich →
     Lusha gap-fill → validate/normalise → score → AI authority classification →
@@ -2317,6 +2628,19 @@ def _verify_process_contacts(raw: list, use_lusha: bool, classify: bool, thresho
                 c["title"]    = c.get("title") or lu.get("title", "")
                 c["linkedin"] = c.get("linkedin") or lu.get("linkedin", "")
                 _log(f"[Lusha] {c.get('name')} → phone/email enriched.")
+
+        # Free email discovery (Hunter.io → pattern+MX) when still missing
+        if (use_hunter or use_pattern) and not _valid_email(c.get("email")):
+            tag = _enrich_email_free(c, use_hunter, use_pattern)
+            if tag:
+                if tag not in chain:
+                    chain.append(tag)
+                counts[tag] = counts.get(tag, 0) + 1
+                _log(f"[{tag}] {c.get('name')} → email {'found' if tag=='Hunter' else 'inferred'}.")
+        # Verify an existing email cheaply via Hunter when available
+        elif use_hunter and _valid_email(c.get("email")) and not c.get("email_status"):
+            if _hunter_verify(c["email"]) == "verified":
+                c["email_status"] = "verified"
 
         # Validate + normalise + score
         c["country"] = c.get("country") or default_country
@@ -5246,48 +5570,41 @@ Return ONLY a valid JSON object:
 # ══════════════════════════════════════════════
 with tab_verify:
     st.subheader("✅ Lead Verification")
-    st.caption("Discover decision-makers via **Google dorking → LinkedIn**, then run the "
-               "enrichment cascade (**Apollo + Lusha** by LinkedIn URL), validate + score, "
-               "AI-classify buying authority, and push verified leads to Monday. "
-               "Low-confidence contacts are quarantined for review.")
+    st.caption("Discover decision-makers via **Google dorking → LinkedIn** or your own "
+               "**tender database**, enrich emails for free (**Hunter.io + pattern/MX**), "
+               "validate + score, AI-classify buying authority, and push verified leads to "
+               "Monday. Low-confidence contacts are quarantined for review.")
 
     _has_apollo = bool(st.secrets.get("APOLLO_API_KEY", "")) if hasattr(st, "secrets") else False
-    _has_lusha  = bool(st.secrets.get("LUSHA_API_KEY", "")) if hasattr(st, "secrets") else False
+    _has_lusha  = False  # Lusha disabled for now
+    _hunter_ready = bool(st.secrets.get("HUNTER_API_KEY", "")) if hasattr(st, "secrets") else False
     pc1, pc2, pc3, pc4 = st.columns(4)
-    pc1.metric("Layer 1 · Apollo", "✅ ready" if _has_apollo else "⚠️ no key")
-    pc2.metric("Layer 3 · Lusha",  "✅ ready" if _has_lusha else "⚠️ no key")
-    pc3.metric("Layer 2 · RocketReach", "Phase 2")
-    pc4.metric("Layer 4 · Cognism",     "Phase 2")
-    if not _has_apollo:
-        st.info("Add **APOLLO_API_KEY** to Streamlit secrets to run the cascade. "
-                "Add **LUSHA_API_KEY** as well to enable phone enrichment (Layer 3).")
-
-    # Lusha credit meter (Account API — cached 5 min)
-    if _has_lusha:
-        _lu = _lusha_account_usage()
-        if _lu and not _lu.get("_error"):
-            lc1, lc2, lc3 = st.columns(3)
-            _rem = _lu.get("remaining")
-            lc1.metric("Lusha credits remaining", f"{_rem:,}" if isinstance(_rem, (int, float)) else "—")
-            _used = _lu.get("used")
-            lc2.metric("Lusha credits used", f"{_used:,}" if isinstance(_used, (int, float)) else "—")
-            lc3.metric("Lusha plan", str(_lu.get("plan") or "—").title())
-            if isinstance(_rem, (int, float)) and _rem <= 0:
-                st.warning("Lusha credits are exhausted — phone enrichment will return no data until they reset.")
-        elif _lu.get("_error"):
-            st.caption(f"Lusha credit check unavailable ({_lu['_error']}).")
+    pc1.metric("Apollo (enrich)", "✅ ready" if _has_apollo else "⚠️ no key")
+    pc2.metric("Hunter.io (email)", "✅ ready" if _hunter_ready else "⚠️ no key")
+    pc3.metric("Pattern + MX", "✅ free")
+    pc4.metric("Tender DB", "✅ free")
+    if not _has_apollo and not _hunter_ready:
+        st.info("Add **APOLLO_API_KEY** and/or **HUNTER_API_KEY** to Streamlit secrets for "
+                "richer enrichment. The free **pattern + MX** layer and **Tender DB** source "
+                "work with no keys at all.")
 
     # ── Mode selector ──────────────────────────────────────────────────────
     st.markdown("#### 1 · Choose mode")
     v_mode = st.radio(
         "How do you want to source contacts?",
         ["🔎 Google Dork → LinkedIn (discover, works on current plans)",
+         "🗄️ Database Leads (your tenders — free, 3,479 companies)",
+         "🔥 Breach Signals (hot cyber leads)",
          "📋 Enrich a seed list (paste contacts)",
          "🔍 Discover (Apollo People Search) — needs Apollo plan with Search API"],
         key="verify_mode",
     )
     dork_mode     = v_mode.startswith("🔎")
+    db_mode       = v_mode.startswith("🗄️")
+    breach_mode   = v_mode.startswith("🔥")
     discover_mode = v_mode.startswith("🔍")
+
+    _has_hunter = bool(st.secrets.get("HUNTER_API_KEY", "")) if hasattr(st, "secrets") else False
 
     # Shared options
     oc1, oc2 = st.columns(2)
@@ -5298,9 +5615,25 @@ with tab_verify:
          "Tanzania", "Uganda", "Zambia", "Rwanda", "Ethiopia", "Senegal"],
         key="verify_default_country",
     )
-    v_use_lusha = st.checkbox("Use Lusha for phone/email enrichment", value=_has_lusha,
-                              disabled=not _has_lusha, key="verify_use_lusha")
-    v_classify  = st.checkbox("AI-classify authority + draft outreach opener", value=True, key="verify_classify")
+    v_use_lusha = False  # Lusha disabled for now
+    ec1, ec2 = st.columns(2)
+    v_use_hunter = ec1.checkbox("Hunter.io (email)", value=_has_hunter,
+                                disabled=not _has_hunter, key="verify_use_hunter")
+    v_use_pattern = ec2.checkbox("Email pattern + MX (free)", value=True, key="verify_use_pattern")
+    v_classify = st.checkbox("AI-classify authority + draft outreach opener", value=True, key="verify_classify")
+
+    # Hunter credit meter
+    if _has_hunter:
+        _hu = _hunter_account()
+        if _hu and not _hu.get("_error"):
+            hc1, hc2, hc3 = st.columns(3)
+            _sa, _su = _hu.get("searches_avail"), _hu.get("searches_used")
+            _va, _vu = _hu.get("verifs_avail"), _hu.get("verifs_used")
+            hc1.metric("Hunter searches left",
+                       f"{(_sa - _su)}" if isinstance(_sa, int) and isinstance(_su, int) else "—")
+            hc2.metric("Hunter verifies left",
+                       f"{(_va - _vu)}" if isinstance(_va, int) and isinstance(_vu, int) else "—")
+            hc3.metric("Hunter plan", str(_hu.get("plan") or "Free").title())
 
     raw_contacts, run_verify = [], False
 
@@ -5340,7 +5673,7 @@ with tab_verify:
                        "Only an **older pre-2025 project** can use it. For a recurring free allowance, "
                        "use **SerpApi** instead (100/month, resets monthly).")
         st.markdown("Builds: `site:linkedin.com/in/ \"<term>\" \"<country>\"` per term, "
-                    "collects LinkedIn profiles, then enriches via Lusha (by LinkedIn URL) "
+                    "collects LinkedIn profiles, then enriches emails (Hunter.io + pattern/MX) "
                     "+ Apollo, scores and classifies.")
         gd1, gd2 = st.columns(2)
         with gd1:
@@ -5378,6 +5711,32 @@ with tab_verify:
                                key="verify_run_dork",
                                disabled=not _provider_ready or not _terms_all)
 
+    elif db_mode:
+        st.markdown("Pull contacts you've **already collected** in your tender database — "
+                    "free, no API. These flow through the same enrichment + scoring cascade.")
+        db_source = st.radio(
+            "Source",
+            ["Tender contacts (named person + email)",
+             "Winning-bidder companies (need contact enrichment)"],
+            key="db_source")
+        dbc1, dbc2 = st.columns(2)
+        v_db_limit = dbc1.number_input("Max records", 5, 200, 50, step=5, key="db_limit")
+        v_db_ict = dbc2.checkbox("ICT / security tenders only", value=True, key="db_ict")
+        if db_source.startswith("Winning"):
+            st.caption("Winning-bidder companies have no contact yet — enable **Hunter.io** "
+                       "(domain search) above, or run them, then use the dork to find people. "
+                       "Hunter will try company → emails.")
+        run_verify = st.button("▶️ Pull + Cascade", type="primary", key="verify_run_db")
+
+    elif breach_mode:
+        st.markdown("Turn captured **breach / attack signals** into hot leads — victim "
+                    "organisations that need cybersecurity now. The breach context becomes "
+                    "the outreach angle.")
+        v_breach_limit = st.number_input("Max breach signals", 5, 50, 20, step=5, key="breach_limit")
+        st.caption("These are company-level; enable **Hunter.io** above to find emails at the "
+                   "victim org's domain, or push them and dork for decision-makers.")
+        run_verify = st.button("▶️ Pull breach leads + Cascade", type="primary", key="verify_run_breach")
+
     elif discover_mode:
         st.info("⚠️ **Discover** uses Apollo's People Search API. Your current Apollo key "
                 "returned **403 — not accessible with this api_key**, meaning your plan doesn't "
@@ -5408,7 +5767,7 @@ with tab_verify:
     else:
         st.markdown("Paste contacts — **one per line** as `Name, Company` "
                     "(optionally `Name, Company, Title, Country`). The cascade enriches each "
-                    "via Apollo people/match + Lusha, then scores and classifies them.")
+                    "via Apollo people/match + Hunter.io/pattern, then scores and classifies them.")
         seed_text = st.text_area(
             "Seed contacts",
             height=160,
@@ -5434,7 +5793,7 @@ with tab_verify:
             st.caption(f"Parsed {len(raw_contacts)} contact(s).")
         run_verify = st.button("▶️ Run Enrichment Cascade", type="primary",
                                key="verify_run_seed",
-                               disabled=not (_has_apollo or _has_lusha) or not raw_contacts)
+                               disabled=not raw_contacts)
 
     if run_verify:
         log_box = st.empty()
@@ -5467,10 +5826,46 @@ with tab_verify:
                 results, provider_counts = _verify_process_contacts(
                     raw_contacts, v_use_lusha, v_classify, int(v_threshold),
                     default_country=default_country, apollo_match=_has_apollo,
-                    base_provider="LinkedIn", vlog=_vlog)
+                    base_provider="LinkedIn", vlog=_vlog,
+                    use_hunter=v_use_hunter, use_pattern=v_use_pattern)
                 _mdiag = st.session_state.get("_apollo_match_diag", "")
                 if _mdiag:
                     _vlog(f"[Apollo] {_mdiag}")
+
+            elif db_mode:
+                if db_source.startswith("Winning"):
+                    _vlog("[DB] Pulling winning-bidder companies…")
+                    raw_contacts = _db_winning_bidder_leads(int(v_db_limit), ict_only=v_db_ict)
+                else:
+                    _vlog("[DB] Pulling tender contacts (named person + email)…")
+                    raw_contacts = _db_tender_leads(int(v_db_limit), ict_only=v_db_ict)
+                _ddiag = st.session_state.get("_db_diag", "")
+                if _ddiag:
+                    _vlog(f"[DB] {_ddiag}")
+                _vlog(f"[DB] {len(raw_contacts)} record(s) pulled from your database.")
+                results, provider_counts = _verify_process_contacts(
+                    raw_contacts, v_use_lusha, v_classify, int(v_threshold),
+                    default_country=default_country, apollo_match=_has_apollo,
+                    base_provider="Tender DB", vlog=_vlog,
+                    use_hunter=v_use_hunter, use_pattern=v_use_pattern)
+
+            elif breach_mode:
+                _vlog("[Breach] Pulling captured attack signals…")
+                raw_contacts = _db_breach_leads(int(v_breach_limit))
+                _ddiag = st.session_state.get("_db_diag", "")
+                if _ddiag:
+                    _vlog(f"[Breach] {_ddiag}")
+                _vlog(f"[Breach] {len(raw_contacts)} victim org(s) pulled.")
+                results, provider_counts = _verify_process_contacts(
+                    raw_contacts, v_use_lusha, v_classify, int(v_threshold),
+                    default_country=default_country, apollo_match=_has_apollo,
+                    base_provider="Breach Signal", vlog=_vlog,
+                    use_hunter=v_use_hunter, use_pattern=v_use_pattern)
+                # Use the breach angle as the opener where the AI didn't supply one
+                for r in results:
+                    if r.get("opener_seed") and not r.get("opener"):
+                        r["opener"] = r["opener_seed"]
+
             elif discover_mode:
                 _vlog("[Apollo] Searching contacts by title / country…")
                 raw_contacts = _apollo_people_search(v_titles, v_countries, v_company.strip(),
@@ -5482,13 +5877,15 @@ with tab_verify:
                 results, provider_counts = _verify_process_contacts(
                     raw_contacts[: int(v_limit)], v_use_lusha, v_classify, int(v_threshold),
                     default_country=default_country, apollo_match=False,
-                    base_provider="Apollo", vlog=_vlog)
+                    base_provider="Apollo", vlog=_vlog,
+                    use_hunter=v_use_hunter, use_pattern=v_use_pattern)
             else:
                 _vlog(f"[Seed] Enriching {len(raw_contacts)} contact(s)…")
                 results, provider_counts = _verify_process_contacts(
                     raw_contacts[: int(v_limit)], v_use_lusha, v_classify, int(v_threshold),
                     default_country=default_country, apollo_match=_has_apollo,
-                    base_provider=None, vlog=_vlog)
+                    base_provider=None, vlog=_vlog,
+                    use_hunter=v_use_hunter, use_pattern=v_use_pattern)
                 _mdiag = st.session_state.get("_apollo_match_diag", "")
                 if _mdiag:
                     _vlog(f"[Apollo] {_mdiag}")
