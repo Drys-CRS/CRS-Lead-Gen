@@ -14,32 +14,31 @@ jobs:
           fetch-depth: 0
           lfs: true
 
-      - name: Verify HF token
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: |
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-            -H "Authorization: Bearer ${HF_TOKEN}" \
-            https://huggingface.co/api/whoami-v2)
-          echo "HF API status: ${STATUS}"
-          [ "${STATUS}" = "200" ] || (echo "Token invalid or missing" && exit 1)
+      - name: Install huggingface_hub
+        run: pip install huggingface_hub
 
-      - name: Check Space is reachable
+      - name: Upload to HF Space
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          git config --global credential.helper "store --file ~/.hf-creds"
-          printf 'https://DrystanGovender:%s@huggingface.co\n' "${HF_TOKEN}" > ~/.hf-creds
-          echo "Probing remote..."
-          git ls-remote https://huggingface.co/spaces/DrystanGovender/crs-competitive-intelligence \
-            && echo "Remote OK" \
-            || (echo "Remote not found or not accessible" && exit 1)
+          python3 - <<'EOF'
+          import os
+          from huggingface_hub import HfApi
 
-      - name: Push to HF Space
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: |
-          git config user.email "action@github.com"
-          git config user.name "GitHub Action"
-          git remote add hf https://huggingface.co/spaces/DrystanGovender/crs-competitive-intelligence
-          git push hf main:main --force
+          api = HfApi(token=os.environ["HF_TOKEN"])
+          api.upload_folder(
+              folder_path=".",
+              repo_id="DrystanGovender/crs-competitive-intelligence",
+              repo_type="space",
+              ignore_patterns=[
+                  ".git", ".git/**",
+                  ".github", ".github/**",
+                  ".venv", ".venv/**",
+                  "__pycache__", "**/__pycache__/**",
+                  "*.pyc",
+                  ".claudeignore",
+                  ".clauderules",
+              ],
+          )
+          print("Upload complete!")
+          EOF
