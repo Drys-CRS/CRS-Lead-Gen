@@ -1522,13 +1522,16 @@ def multiselect_all(label, options, *, key, default=None, help=None, sidebar=Fal
     if key not in st.session_state:
         st.session_state[key] = list(default) if default is not None else []
 
-    current = st.session_state.get(key) or []
+   current = st.session_state.get(key) or []
     all_on = len(options) > 0 and set(current) >= set(options)
-    if container.button("☑️ Clear all" if all_on else "✅ Select all",
-                        key=f"{key}__toggle_all",
-                        help="Toggle every option on or off"):
-        st.session_state[key] = [] if all_on else options
-        st.rerun()
+
+    def _toggle_all(_k=key, _opts=list(options), _all=all_on):
+        st.session_state[_k] = [] if _all else _opts
+
+    container.button("☑️ Clear all" if all_on else "✅ Select all",
+                     key=f"{key}__toggle_all",
+                     help="Toggle every option on or off",
+                     on_click=_toggle_all)
 
     return container.multiselect(label, options, key=key, help=help)
 
@@ -4029,12 +4032,11 @@ with tab1:
                     prog.empty()
                     st.success(f"✅ {pushed} leads pushed to Monday.com ({skipped} skipped/errors)")
 
-        if _score_btn and _can_score:
+   if _score_btn and _can_score:
             _record_op("score_all")
-            ai_match_tenders(open_df)
+            open_df = ai_match_tenders(open_df)   # progress bar runs inside; keep scored df
             st.cache_data.clear()
-            st.success("Scoring complete! Reloading…")
-            st.rerun()
+            st.success("✅ Scoring complete.")
 
     # Sort by score if available
     if "ai_score" in open_df.columns and open_df["ai_score"].notna().any():
@@ -4068,13 +4070,14 @@ with tab1:
             st.warning("Selection lost after refresh — please re-select a tender.")
         else:
             # ⬅️ Prev / Next ➡️ through the current (filtered/sorted) list
-            _nav_p, _nav_n, _nav_i = st.columns([1, 1, 4])
-            if _nav_p.button("⬅️ Previous", key="open_prev", disabled=(idx <= 0)):
-                st.session_state["open_card_idx"] = max(idx - 1, 0)
-                st.rerun()
-            if _nav_n.button("Next ➡️", key="open_next", disabled=(idx >= len(open_df) - 1)):
-                st.session_state["open_card_idx"] = min(idx + 1, len(open_df) - 1)
-                st.rerun()
+    _nav_p, _nav_n, _nav_i = st.columns([1, 1, 4])
+
+            def _open_go(_t): st.session_state["open_card_idx"] = _t
+
+            _nav_p.button("⬅️ Previous", key="open_prev", disabled=(idx <= 0),
+                          on_click=_open_go, args=(max(idx - 1, 0),))
+            _nav_n.button("Next ➡️", key="open_next", disabled=(idx >= len(open_df) - 1),
+                          on_click=_open_go, args=(min(idx + 1, len(open_df) - 1),))
             _nav_i.caption(f"Tender {idx + 1} of {len(open_df)}")
 
             row = open_df.iloc[idx]
@@ -4140,18 +4143,20 @@ with tab1:
                         else:
                             st.info(_rat_raw)
                 else:
-                    if st.button("🤖 Analyse Partner Opportunity", key=f"score_{_tn}"):
-                        with st.spinner("Analysing partner opportunity…"):
-                            try:
-                                result = ai_score_tender(t.to_dict())
-                                supabase.table("sa_tenders").update({
-                                    "ai_score": result["score"],
-                                    "ai_rationale": result["rationale"]
-                                }).eq("tender_number", _tn).execute()
-                                st.cache_data.clear()
-                                st.rerun()
-                            except Exception as e:
-                                st.error(f"Scoring failed: {e}")
+  def _analyse_one(_t=_tn, _row=t.to_dict()):
+                        try:
+                            result = ai_score_tender(_row)
+                            supabase.table("sa_tenders").update({
+                                "ai_score": result["score"],
+                                "ai_rationale": result["rationale"]
+                            }).eq("tender_number", _t).execute()
+                            st.cache_data.clear()
+                        except Exception as e:
+                            st.session_state["_score_one_err"] = str(e)
+                    st.button("🤖 Analyse Partner Opportunity", key=f"score_{_tn}",
+                              on_click=_analyse_one)
+                    if st.session_state.pop("_score_one_err", None):
+                        st.error("Scoring failed — try again.")
 
                 # Actions row — 3 columns: eTenders link | Monday push | Mark irrelevant
                 action_col1, action_col2, action_col3 = st.columns(3)
@@ -4174,16 +4179,19 @@ with tab1:
                                         st.success(f"✅ Pushed → Outstanding Tickets + Leads")
                                 except Exception as e:
                                     st.error(f"Monday push failed: {e}")
-                with action_col3:
-                    if st.button("🚫 Mark as Irrelevant", key=f"del_{_tn}",
-                                 help="Hides this tender — stays in database but won't appear again"):
+         with action_col3:
+                    def _mark_irrelevant(_t=_tn):
                         try:
-                            supabase.table("sa_tenders").update({"is_irrelevant": True})                                .eq("tender_number", _tn).execute()
+                            supabase.table("sa_tenders").update({"is_irrelevant": True})\
+                                .eq("tender_number", _t).execute()
                             st.cache_data.clear()
-                            st.rerun()
                         except Exception as e:
-                            st.error(f"Could not mark as irrelevant: {e}")
-
+                            st.session_state["_mark_err"] = str(e)
+                    st.button("🚫 Mark as Irrelevant", key=f"del_{_tn}",
+                              help="Hides this tender — stays in database but won't appear again",
+                              on_click=_mark_irrelevant)
+                    if st.session_state.pop("_mark_err", None):
+                        st.error("Could not mark as irrelevant — try again.")
 
 # ══════════════════════════════════════════════
 # TAB 2 — COMPETITIVE INTELLIGENCE
@@ -4600,25 +4608,30 @@ with tab4:
                 "portal_link":             d.get("source_url") or "",
             }
             st.divider()
-            _dp, _dn, _dx, _dinfo = st.columns([1, 1, 1.5, 3])
-            if _dp.button("⬅️ Previous", key="disc_prev", disabled=(_dcur <= 0)):
-                st.session_state["disc_card_idx"] = max(_dcur - 1, 0)
-                st.rerun()
-            if _dn.button("Next ➡️", key="disc_next", disabled=(_dcur >= len(discovered) - 1)):
-                st.session_state["disc_card_idx"] = min(_dcur + 1, len(discovered) - 1)
-                st.rerun()
-            if _dx.button("🚫 Mark Irrelevant", key="disc_irrelevant",
-                          help="Remove this candidate from the review list"):
-                discovered.pop(_dcur)
-                st.session_state["discovered"] = discovered
+       _dp, _dn, _dx, _dinfo = st.columns([1, 1, 1.5, 3])
+
+            def _disc_go(_t): st.session_state["disc_card_idx"] = _t
+
+            def _disc_drop(_i=_dcur):
+                _lst = st.session_state.get("discovered", [])
+                if 0 <= _i < len(_lst):
+                    _lst.pop(_i)
+                st.session_state["discovered"] = _lst
                 st.session_state.pop("disc_last_sel", None)
-                if discovered:
-                    st.session_state["disc_card_idx"] = min(_dcur, len(discovered) - 1)
+                if _lst:
+                    st.session_state["disc_card_idx"] = min(_i, len(_lst) - 1)
                 else:
                     st.session_state.pop("disc_card_idx", None)
-                st.rerun()
-            _dinfo.caption(f"Candidate {_dcur + 1} of {len(discovered)}")
 
+            _dp.button("⬅️ Previous", key="disc_prev", disabled=(_dcur <= 0),
+                       on_click=_disc_go, args=(max(_dcur - 1, 0),))
+            _dn.button("Next ➡️", key="disc_next", disabled=(_dcur >= len(discovered) - 1),
+                       on_click=_disc_go, args=(min(_dcur + 1, len(discovered) - 1),))
+            _dx.button("🚫 Mark Irrelevant", key="disc_irrelevant",
+                       help="Remove this candidate from the review list",
+                       on_click=_disc_drop)
+            _dinfo.caption(f"Candidate {_dcur + 1} of {len(discovered)}")
+    
             st.subheader(f"📄 {d.get('title', '(untitled)')}")
             _cpc, _ = st.columns([1, 5])
             with _cpc:
@@ -4665,10 +4678,10 @@ with tab4:
                 st.success(f"Saved {saved}/{len(st.session_state['discovered'])} tenders. They now appear in Open Opportunities.")
                 del st.session_state["discovered"]
                 st.cache_data.clear()
-        with save_col2:
-            if st.button("🗑️ Discard Results", key="btn_discard_discovered"):
-                del st.session_state["discovered"]
-                st.rerun()
+   with save_col2:
+            def _discard_discovered(): st.session_state.pop("discovered", None)
+            st.button("🗑️ Discard Results", key="btn_discard_discovered",
+                      on_click=_discard_discovered)
 
 # ══════════════════════════════════════════════
 # TAB 5 — LEAD INTELLIGENCE
@@ -6378,10 +6391,9 @@ Groq → Cerebras → OpenRouter → GitHub → **NVIDIA** → **DeepSeek** → 
     st.subheader("🩺 Provider Health")
     col_h1, col_h2 = st.columns([1, 3])
     with col_h1:
-        if st.button("🔁 Re-check Now", key="btn_recheck_health"):
-            with st.spinner("Pinging all providers…"):
-                st.session_state["provider_health"] = check_provider_health()
-            st.rerun()
+       def _recheck_health():
+            st.session_state["provider_health"] = check_provider_health()
+        st.button("🔁 Re-check Now", key="btn_recheck_health", on_click=_recheck_health)
 
     health = st.session_state.get("provider_health", {})
     if health:
