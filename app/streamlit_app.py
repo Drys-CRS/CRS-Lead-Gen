@@ -723,10 +723,14 @@ with tab_partners:
         if urgency_filter != "All" and "urgency" in df_p.columns:
             df_p = df_p[df_p["urgency"].str.lower() == urgency_filter]
 
+        # Deduplicate: keep the most recent row per company (run_at is already desc)
+        if "company" in df_p.columns:
+            df_p = df_p.drop_duplicates(subset=["company"], keep="first").reset_index(drop=True)
+
         st.markdown(f"**{len(df_p)} partner candidates**")
 
         # ── Partner cards ────────────────────────────────────────────────────
-        for _, pr in df_p.iterrows():
+        for card_idx, pr in df_p.iterrows():
             urgency = str(pr.get("urgency", "")).lower()
             badge = _badge(urgency)
             company = pr.get("company", "Unknown")
@@ -794,7 +798,7 @@ with tab_partners:
                                         ", ".join(depts))
 
                 if monday_active:
-                    if st.button("Push to Companies board", key=f"push_{company}"):
+                    if st.button("Push to Companies board", key=f"push_{card_idx}_{company[:30]}"):
                         with st.spinner("Pushing…"):
                             res_p = push_partner_to_companies(pr.to_dict())
                         st.success(f"Action: **{res_p.get('action')}** | ID: {res_p.get('item_id')}")
