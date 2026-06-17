@@ -319,15 +319,28 @@ def _get_html(url, timeout=20):
 # OCDS REGISTRY
 # ═══════════════════════════════════════════════════════════════════════════
 OCDS_REGISTRY = {
-    "South Africa": (143, "🇿🇦"),
-    "Kenya":        (147, "🇰🇪"),
-    "Nigeria":      (64,  "🇳🇬"),
-    "Ghana":        (85,  "🇬🇭"),
-    "Tanzania":     (152, "🇹🇿"),
-    "Uganda":       (130, "🇺🇬"),
-    "Zambia":       (3,   "🇿🇲"),
-    "Rwanda":       (145, "🇷🇼"),
-    "Liberia":      (79,  "🇱🇷"),
+    # National / federal publishers
+    "South Africa":           (143, "🇿🇦"),
+    "Kenya":                  (147, "🇰🇪"),
+    "Nigeria":                (64,  "🇳🇬"),  # Bureau of Public Procurement (federal)
+    "Ghana":                  (85,  "🇬🇭"),
+    "Tanzania":               (152, "🇹🇿"),
+    "Uganda":                 (130, "🇺🇬"),
+    "Zambia":                 (3,   "🇿🇲"),
+    "Rwanda":                 (145, "🇷🇼"),
+    "Liberia":                (156, "🇱🇷"),  # PPCC — was 79 (incorrect), corrected to 156
+    # Nigeria state-level publishers (all confirmed on data.open-contracting.org)
+    "Nigeria (Abia)":         (107, "🇳🇬"),
+    "Nigeria (Anambra)":      (127, "🇳🇬"),
+    "Nigeria (Cross River)":  (105, "🇳🇬"),
+    "Nigeria (Ebonyi)":       (86,  "🇳🇬"),
+    "Nigeria (Edo)":          (102, "🇳🇬"),
+    "Nigeria (Ekiti)":        (116, "🇳🇬"),
+    "Nigeria (Enugu)":        (104, "🇳🇬"),
+    "Nigeria (Gombe)":        (103, "🇳🇬"),
+    "Nigeria (Osun)":         (118, "🇳🇬"),
+    "Nigeria (Oyo)":          (106, "🇳🇬"),
+    "Nigeria (Plateau)":      (125, "🇳🇬"),
 }
 
 NON_OCDS_COUNTRIES = {

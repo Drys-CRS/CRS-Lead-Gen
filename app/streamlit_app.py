@@ -9,6 +9,7 @@ import json
 import re
 import time as _time
 import threading
+import datetime as _dt
 import urllib.request as _urlreq
 import urllib.parse as _urlparse
 import streamlit as st
@@ -434,6 +435,20 @@ def _load_pipeline_runs() -> pd.DataFrame:
          .order("run_at", desc=True).limit(10).execute())
     return pd.DataFrame(r.data or [])
 
+@st.cache_data(ttl=30)
+def _load_dork_leads_bulk(urls_tuple: tuple) -> dict:
+    if not urls_tuple:
+        return {}
+    r = supabase.table("dork_leads").select("*").in_("linkedin_url", list(urls_tuple)).execute()
+    return {row["linkedin_url"]: row for row in (r.data or [])}
+
+def _upsert_dork_lead(data: dict) -> None:
+    try:
+        clean = {k: v for k, v in data.items() if v is not None}
+        supabase.table("dork_leads").upsert(clean, on_conflict="linkedin_url").execute()
+    except Exception:
+        pass
+
 # Filters live inside each tab; sidebar is control-only.
 country_filter: list = []
 min_score: int = 0
@@ -475,6 +490,11 @@ def _badge(urgency: str) -> str:
     if u == "low":    return "🟢 Low"
     return urgency or "—"
 
+def _copy_block(text: str, label: str = "📋 Copy", key: str = "") -> None:
+    """Renders a collapsed expander with a copyable code block (native copy icon)."""
+    with st.expander(label, expanded=False):
+        st.code(text.strip(), language=None)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # DORK / ENRICHMENT HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -501,19 +521,23 @@ def _parse_li_result(raw_title: str, snippet: str = "") -> dict:
     return {"name": name, "job_title": job_title, "company": company}
 
 
-def _dork_search(query: str, num: int = 10) -> list:
+def _dork_search(query: str, num: int = 10, start: int = 0) -> list:
     g_key = st.secrets.get("GOOGLE_API_KEY", "") or os.getenv("GOOGLE_API_KEY", "")
     g_cse = st.secrets.get("GOOGLE_CSE_ID", "") or os.getenv("GOOGLE_CSE_ID", "")
     s_key = st.secrets.get("SERPAPI_API_KEY", "") or os.getenv("SERPAPI_API_KEY", "")
     raw: list = []
     if g_key and g_cse:
+        # Google CSE: 1-based start index, max 10 per page
         url = (f"https://www.googleapis.com/customsearch/v1"
-               f"?key={g_key}&cx={g_cse}&q={_urlparse.quote(query)}&num={min(num, 10)}")
+               f"?key={g_key}&cx={g_cse}&q={_urlparse.quote(query)}"
+               f"&num={min(num, 10)}&start={start + 1}")
         with _urlreq.urlopen(url, timeout=20) as r:
             raw = json.loads(r.read()).get("items", [])
     elif s_key:
+        # SerpAPI: 0-based start index
         url = (f"https://serpapi.com/search"
-               f"?engine=google&q={_urlparse.quote(query)}&num={num}&api_key={s_key}")
+               f"?engine=google&q={_urlparse.quote(query)}"
+               f"&num={num}&start={start}&api_key={s_key}")
         with _urlreq.urlopen(url, timeout=20) as r:
             data = json.loads(r.read())
         raw = [{"link": x.get("link", ""), "title": x.get("title", ""),
@@ -709,8 +733,17 @@ def _pull_worker(env_overrides: dict) -> None:
         _PULL_STATE.update({"status": "failed", "result": {"error": str(_e)}})
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SIDEBAR — Health check + action buttons only
+# SIDEBAR — Navigation + health check + action buttons
 # ─────────────────────────────────────────────────────────────────────────────
+
+_NAV_PAGES = [
+    "🏠 Overview",
+    "📢 Opportunities",
+    "🤝 Partners",
+    "✅ Lead Verification",
+    "🔍 LinkedIn Dork",
+    "🛡️ Lead Intelligence",
+]
 
 with st.sidebar:
     _logo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "crs_logo.png")
@@ -720,30 +753,40 @@ with st.sidebar:
     st.caption("v2 · scrape on-demand or via nightly schedule")
     st.divider()
 
-    # ── Health Check ──────────────────────────────────────────────────────────
-    st.markdown("**Health Check**")
+    # ── Navigation ────────────────────────────────────────────────────────────
+    _page = st.radio("Navigate", _NAV_PAGES, label_visibility="collapsed")
+    st.divider()
 
-    for part in _provider_status().split(" · "):
-        st.caption(part)
-
-    monday_active = _MONDAY_OK and bool(
-        st.secrets.get("MONDAY_API_KEY") if hasattr(st, "secrets") else "")
-    st.caption("🟢 Monday.com" if monday_active else "⚪ Monday.com (key not set)")
-
+    # ── Pipeline status ───────────────────────────────────────────────────────
+    _gh_running = False
+    _gh_started = ""
     try:
-        _lr = (supabase.table("pipeline_runs").select("run_at,status,tenders_scraped")
+        _lr = (supabase.table("pipeline_runs").select("run_at,status,tenders_scraped,trigger")
                .order("run_at", desc=True).limit(1).execute()).data
         if _lr:
             _r0 = _lr[0]
             _ts = str(_r0.get("run_at", ""))[:16]
             _st = _r0.get("status", "—")
-            _dot = "🟢" if _st == "success" else "🔴"
-            st.caption(f"{_dot} Last run: {_ts} — {_st}")
-            st.caption(f"   Scraped: {_r0.get('tenders_scraped', '—')}")
+            if _st == "running":
+                _gh_running = True
+                _gh_started = _ts
+                st.warning(f"⏳ Pipeline running since {_ts}  \n(trigger: {_r0.get('trigger','?')})\n\nDo not press Pull again — a run is already in progress.", icon="⚠️")
+            else:
+                _dot = "🟢" if _st in ("success", "complete") else "🔴"
+                st.caption(f"{_dot} Last run: {_ts} — {_st}")
+                st.caption(f"   Scraped: {_r0.get('tenders_scraped', '—')}")
         else:
             st.caption("⚪ No pipeline runs yet")
     except Exception:
         st.caption("⚪ Pipeline status unavailable")
+
+    # ── Health Check ──────────────────────────────────────────────────────────
+    with st.expander("API health", expanded=False):
+        for part in _provider_status().split(" · "):
+            st.caption(part)
+        monday_active = _MONDAY_OK and bool(
+            st.secrets.get("MONDAY_API_KEY") if hasattr(st, "secrets") else "")
+        st.caption("🟢 Monday.com" if monday_active else "⚪ Monday.com (key not set)")
 
     st.divider()
 
@@ -755,8 +798,9 @@ with st.sidebar:
         st.rerun()
 
     _ps = _PULL_STATE["status"]
+    _pull_blocked = (_ps == "running") or _gh_running
     if st.button("📥 Pull all tenders", use_container_width=True,
-                 disabled=(_ps == "running"),
+                 disabled=_pull_blocked,
                  help="Scrapes all open & awarded tenders across English-speaking Africa in the background"):
         if _ps != "running":
             _env_ov: dict = {}
@@ -856,17 +900,10 @@ with st.sidebar:
                 except Exception as _e:
                     st.error(f"Analysis failed: {_e}")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# TABS
-# ─────────────────────────────────────────────────────────────────────────────
-tab_overview, tab_opps, tab_partners, tab_leads, tab_dork = st.tabs([
-    "🏠 Overview", "📢 Opportunities", "🤝 Partners", "✅ Lead Verification", "🔍 LinkedIn Dork",
-])
-
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 1 — OVERVIEW
+# PAGE 1 — OVERVIEW
 # ══════════════════════════════════════════════════════════════════════════════
-with tab_overview:
+if _page == "🏠 Overview":
     st.subheader("CRS Tender Intelligence — Overview")
     st.caption("Africa-wide government tender intelligence — active tenders, historical awards, and AI partner intelligence.")
 
@@ -908,9 +945,9 @@ with tab_overview:
             st.text(last.get("error_log") or "—")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 2 — OPPORTUNITIES
+# PAGE 2 — OPPORTUNITIES
 # ══════════════════════════════════════════════════════════════════════════════
-with tab_opps:
+if _page == "📢 Opportunities":
     st.subheader("Open Opportunities")
 
     _df_all = _load_tenders()
@@ -962,6 +999,10 @@ with tab_opps:
     _fc1, _fc2, _fc3 = st.columns([2, 3, 1])
     with _fc1:
         _ctries = sorted(_df_all["country"].dropna().unique().tolist()) if "country" in _df_all.columns else []
+        if st.checkbox("Select all", key="opp_countries_all"):
+            st.session_state["opp_countries"] = _ctries[:]
+        elif not st.session_state.get("opp_countries_all"):
+            st.session_state.setdefault("opp_countries", [])
         _sel_ctry = st.multiselect("Country", _ctries, key="opp_countries")
     with _fc2:
         _q = st.text_input("Search title / department", key="opp_search",
@@ -1112,7 +1153,7 @@ with tab_opps:
                              use_container_width=True):
                     supabase.table("sa_tenders").update(
                         {"is_irrelevant": True}
-                    ).eq("id", int(_row["id"])).execute()
+                    ).eq("id", str(_row["id"])).execute()
                     st.cache_data.clear()
                     st.session_state["opp_card_idx"] = max(0, _idx - 1)
                     st.rerun()
@@ -1130,16 +1171,41 @@ with tab_opps:
                                     "proposed_solutions": _sc2["proposed_solutions"],
                                     "outreach_angle": _sc2["outreach_angle"],
                                 }),
-                            }).eq("id", int(_row["id"])).execute()
+                            }).eq("id", str(_row["id"])).execute()
                             st.cache_data.clear()
                             st.rerun()
                         except Exception as _se:
                             st.error(f"Scoring failed: {_se}")
 
+            # ── Copy ──────────────────────────────────────────────────────────
+            _opp_copy_lines = [
+                f"TENDER: {_row.get('title', '')}",
+                f"Department: {_row.get('department_name', '—')}",
+                f"Country: {_row.get('country', '—')}",
+                f"Closes: {str(_row.get('closing_date', '—'))[:10]}",
+                f"Ref: {_row.get('tender_number', '') or _row.get('source_url', '') or '—'}",
+                f"Score: {int(_score_num)}/10" if pd.notna(_score_num) else "Score: —",
+            ]
+            if _rat.get("rationale"):
+                _opp_copy_lines.append(f"Rationale: {_rat['rationale']}")
+            _sols_list = _rat.get("proposed_solutions", [])
+            if _sols_list:
+                _opp_copy_lines.append("Solutions: " + ", ".join(
+                    _sols_list if isinstance(_sols_list, list) else [str(_sols_list)]))
+            if _rat.get("outreach_angle"):
+                _opp_copy_lines.append(f"Outreach: {_rat['outreach_angle']}")
+            for _lbl2, _fld2 in [("Contact", "contact_person"),
+                                  ("Email",   "contact_email"),
+                                  ("Phone",   "contact_phone")]:
+                _fv = _row.get(_fld2)
+                if _fv and str(_fv) not in ("nan", "None", ""):
+                    _opp_copy_lines.append(f"{_lbl2}: {_fv}")
+            _copy_block("\n".join(_opp_copy_lines), key=f"opp_copy_{_idx}")
+
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 3 — PARTNERS
+# PAGE 3 — PARTNERS
 # ══════════════════════════════════════════════════════════════════════════════
-with tab_partners:
+if _page == "🤝 Partners":
     st.subheader("Partner Recommendations")
     st.caption("Companies CRS should approach as channel partners, derived from awarded tender data.")
 
@@ -1279,6 +1345,22 @@ with tab_partners:
                             res_p = push_partner_to_companies(pr.to_dict())
                         st.success(f"Action: **{res_p.get('action')}** | ID: {res_p.get('item_id')}")
 
+                # ── Copy ──────────────────────────────────────────────────────
+                _p_copy_lines = [
+                    f"COMPANY: {company}",
+                    f"Country: {country}",
+                    f"Type: {p_type}" if p_type else "",
+                    f"Tenders won: {wins}" if wins else "",
+                    f"Deal size: {deal}" if deal else "",
+                    f"Urgency: {urgency}" if urgency else "",
+                    f"Summary: {summary}" if summary else "",
+                    f"Why CRS: {why}" if why else "",
+                    ("Solutions: " + ", ".join(sols)) if sols else "",
+                    f"Outreach: {angle}" if angle else "",
+                ]
+                _copy_block("\n".join(l for l in _p_copy_lines if l),
+                            key=f"partner_copy_{card_idx}")
+
     st.divider()
     st.markdown("#### Awarded tender context")
     if not df_aw.empty:
@@ -1309,9 +1391,9 @@ with tab_partners:
         st.info("No awarded tenders loaded.")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 4 — LEAD VERIFICATION
+# PAGE 4 — LEAD VERIFICATION
 # ══════════════════════════════════════════════════════════════════════════════
-with tab_leads:
+if _page == "✅ Lead Verification":
     st.subheader("Lead Verification")
     st.caption("Contacts verified or quarantined by the pipeline cascade.")
 
@@ -1365,6 +1447,16 @@ with tab_leads:
                         val = row_l.get(field)
                         if val and str(val) not in ("", "nan", "None"):
                             st.markdown(f"**{field.replace('_',' ').title()}:** {val}")
+                    # Copy block
+                    _lv_copy_lines = []
+                    for _lv_f in ["contact_name","contact_title","company","email",
+                                  "phone","linkedin","authority","accuracy_score",
+                                  "provider_chain","country"]:
+                        _lv_v = row_l.get(_lv_f)
+                        if _lv_v and str(_lv_v) not in ("", "nan", "None"):
+                            _lv_copy_lines.append(
+                                f"{_lv_f.replace('_',' ').title()}: {_lv_v}")
+                    _copy_block("\n".join(_lv_copy_lines), key=f"lv_copy_{sel_lead[:30]}")
 
                 contact_payload = {
                     "name":           row_l.get("contact_name", ""),
@@ -1402,11 +1494,18 @@ with tab_leads:
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 5 — LINKEDIN DORK
 # ══════════════════════════════════════════════════════════════════════════════
-with tab_dork:
+def _as_list(v) -> list:
+    if isinstance(v, list): return v
+    if not v: return []
+    try: return json.loads(v)
+    except Exception: return []
+
+if _page == "🔍 LinkedIn Dork":
     st.subheader("LinkedIn Lead Discovery")
     st.caption(
-        "Google-dork LinkedIn profiles matching CRS solutions, "
-        "check Monday CRM, and surface reachability data via Apollo / Hunter / Lusha."
+        "Dork LinkedIn profiles, cache all enrichment in Supabase, "
+        "check Monday CRM automatically, find contact info via Apollo / Hunter / Lusha, "
+        "edit fields, then push or update the Monday Leads board."
     )
 
     _DORK_SOLUTIONS = {
@@ -1445,11 +1544,17 @@ with tab_dork:
     with _dc1:
         _d_sol_key = st.selectbox("Solution focus", list(_DORK_SOLUTIONS.keys()), key="dork_sol")
     with _dc2:
-        _d_titles = st.multiselect("Job titles (OR)", _DORK_TITLES,
-                                   default=["CISO", "IT Manager", "Head of IT"], key="dork_titles")
+        if st.checkbox("Select all", key="dork_titles_all"):
+            st.session_state["dork_titles"] = _DORK_TITLES[:]
+        elif not st.session_state.get("dork_titles_all"):
+            st.session_state.setdefault("dork_titles", ["CISO", "IT Manager", "Head of IT"])
+        _d_titles = st.multiselect("Job titles (OR)", _DORK_TITLES, key="dork_titles")
     with _dc3:
-        _d_countries = st.multiselect("Countries (OR)", _DORK_COUNTRIES,
-                                      default=["South Africa"], key="dork_countries")
+        if st.checkbox("Select all", key="dork_countries_all"):
+            st.session_state["dork_countries"] = _DORK_COUNTRIES[:]
+        elif not st.session_state.get("dork_countries_all"):
+            st.session_state.setdefault("dork_countries", ["South Africa"])
+        _d_countries = st.multiselect("Countries (OR)", _DORK_COUNTRIES, key="dork_countries")
 
     _sol_kw    = _DORK_SOLUTIONS[_d_sol_key]
     _title_kw  = " OR ".join(f'"{t}"' for t in _d_titles)  if _d_titles   else ""
@@ -1486,37 +1591,70 @@ with tab_dork:
     ]))
 
     # ── Execute search ────────────────────────────────────────────────────────
+    def _run_crm_check(profiles: list) -> None:
+        """Write CRM fields for a list of profiles to dork_leads."""
+        if not (profiles and _MONDAY_OK and monday_active):
+            return
+        _crm_bar = st.progress(0, text="Checking CRM…")
+        for _ci2, _pf2 in enumerate(profiles):
+            try:
+                _cr = lookup_monday_crm({"name": _pf2["name"], "linkedin": _pf2["url"]})
+                _crm_upd: dict = {"linkedin_url": _pf2["url"],
+                                  "on_crm": _cr.get("on_crm", False)}
+                if _cr.get("on_crm"):
+                    _crm_upd.update({
+                        "crm_board":       _cr.get("crm_board") or None,
+                        "crm_item_id":     str(_cr.get("crm_item_id") or ""),
+                        "crm_url":         _cr.get("crm_url") or None,
+                        "crm_email":       _cr.get("crm_email") or None,
+                        "crm_phone":       _cr.get("crm_phone") or None,
+                        "crm_title":       _cr.get("crm_title") or None,
+                        "crm_authority":   _cr.get("crm_authority") or None,
+                        "crm_heat":        _cr.get("crm_heat") or None,
+                        "crm_last_method": _cr.get("crm_last_method") or None,
+                        "crm_last_date":   _cr.get("crm_last_date") or None,
+                        "crm_notes":       _cr.get("crm_notes") or None,
+                        "company":         _cr.get("crm_account_type") or None,
+                    })
+                _upsert_dork_lead(_crm_upd)
+            except Exception:
+                pass
+            _crm_bar.progress((_ci2 + 1) / len(profiles),
+                              text=f"CRM check {_ci2 + 1}/{len(profiles)}…")
+        _crm_bar.empty()
+
+    _now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
+
     if _d_run:
         if not _has_google and not _has_serper:
             st.error("Add GOOGLE_API_KEY + GOOGLE_CSE_ID, or SERPAPI_API_KEY to search.")
         else:
             with st.spinner("Searching…"):
                 try:
-                    _found = _dork_search(_d_query, int(_d_num))
+                    _found = _dork_search(_d_query, int(_d_num), start=0)
+                    # Clear per-card editable field state from previous search
+                    for _k in list(st.session_state.keys()):
+                        if _k.startswith("dl_"):
+                            del st.session_state[_k]
                     st.session_state["dork_results"] = _found
-                    st.session_state.pop("dork_enrich", None)
+                    st.session_state["dork_search_start"] = int(_d_num)
+                    # Upsert new profiles (preserves existing enrichment)
+                    for _pf in _found:
+                        _upsert_dork_lead({
+                            "linkedin_url":     _pf["url"],
+                            "name":             _pf["name"],
+                            "job_title":        _pf.get("job_title") or None,
+                            "company":          _pf.get("company") or None,
+                            "snippet":          _pf.get("snippet") or None,
+                            "last_searched_at": _now_iso,
+                        })
                     if not _found:
-                        st.warning("No LinkedIn profiles in results — try broadening the query.")
+                        st.warning("No LinkedIn profiles found — try broadening the query.")
                 except Exception as _de:
                     st.error(f"Search error: {_de}")
                     _found = []
-            # Auto CRM check for every found profile
-            _found = st.session_state.get("dork_results", [])
-            if _found and _MONDAY_OK and monday_active:
-                _auto_crm: dict = {}
-                _crm_bar = st.progress(0, text="Checking CRM…")
-                for _ci, _pf in enumerate(_found):
-                    try:
-                        _auto_crm[_pf["url"]] = lookup_monday_crm(
-                            {"name": _pf["name"], "linkedin": _pf["url"]})
-                    except Exception:
-                        _auto_crm[_pf["url"]] = {"on_crm": False}
-                    _crm_bar.progress((_ci + 1) / len(_found),
-                                      text=f"CRM check {_ci + 1}/{len(_found)}…")
-                _crm_bar.empty()
-                st.session_state["dork_crm"] = _auto_crm
-            elif _found:
-                st.session_state["dork_crm"] = {}
+            _run_crm_check(st.session_state.get("dork_results", []))
+            st.cache_data.clear()
 
     # ── Results ───────────────────────────────────────────────────────────────
     _d_profiles = st.session_state.get("dork_results", [])
@@ -1525,135 +1663,760 @@ with tab_dork:
         if not _d_run:
             st.info("Configure a search above and click **🔍 Search LinkedIn**.")
     else:
-        st.markdown(f"**{len(_d_profiles)} profiles found**")
+        # Bulk-load all DB rows for this result set
+        _db_cache = _load_dork_leads_bulk(tuple(p["url"] for p in _d_profiles))
+
+        st.markdown(f"**{len(_d_profiles)} profiles**  ·  "
+                    f"{sum(1 for p in _d_profiles if (_db_cache.get(p['url']) or {}).get('on_crm'))} on CRM  ·  "
+                    f"{sum(1 for p in _d_profiles if (_db_cache.get(p['url']) or {}).get('email'))} with email")
         st.divider()
 
         for _pi, _prof in enumerate(_d_profiles):
-            _pkey    = _prof["url"]
-            _crm_res = st.session_state.get("dork_crm",    {}).get(_pkey)
-            _enr_res = st.session_state.get("dork_enrich", {}).get(_pkey, {})
+            _pkey   = _prof["url"]
+            _db_row = _db_cache.get(_pkey) or {}
+            _sk     = f"dl_{_pi}"
+            _on_crm = _db_row.get("on_crm")
 
             with st.container(border=True):
+                # ── Header ────────────────────────────────────────────────────
                 _ph1, _ph2 = st.columns([5, 2])
                 with _ph1:
                     st.markdown(f"### 👤 {_prof['name']}")
-                    _role_parts = [x for x in [_prof.get("job_title", ""),
-                                               _prof.get("company", "")] if x]
-                    if _role_parts:
-                        st.caption("💼 " + "  ·  ".join(_role_parts))
-                    st.markdown(f"[{_prof['url']}]({_prof['url']})")
+                    _rl = [x for x in [
+                        _db_row.get("crm_title") or _db_row.get("job_title") or _prof.get("job_title", ""),
+                        _db_row.get("company") or _prof.get("company", ""),
+                    ] if x]
+                    if _rl:
+                        st.caption("💼 " + "  ·  ".join(_rl))
+                    st.markdown(f"[{_pkey}]({_pkey})")
                     if _prof.get("snippet"):
-                        st.caption(_prof["snippet"][:250])
+                        st.caption(_prof["snippet"][:220])
                 with _ph2:
-                    if _crm_res is None:
+                    if _on_crm is None:
                         st.caption("⚪ CRM not checked")
-                    elif _crm_res.get("on_crm"):
+                    elif _on_crm:
                         st.success("✅ On CRM")
+                        if _db_row.get("crm_board"):
+                            st.caption(_db_row["crm_board"])
                     else:
                         st.warning("❌ Not in CRM")
+                    if _db_row.get("monday_leads_item_id"):
+                        st.caption(f"📋 Lead #{_db_row['monday_leads_item_id']}")
 
-                # ── CRM contact info ───────────────────────────────────────────
-                if _crm_res and _crm_res.get("on_crm"):
-                    st.divider()
-                    _cc1, _cc2 = st.columns(2)
-                    with _cc1:
-                        for _cf, _icon in [("email", "📧"), ("phone", "📞"),
-                                           ("contact_title", "💼"), ("company", "🏢")]:
-                            _cv = _crm_res.get(_cf)
-                            if _cv and str(_cv) not in ("", "nan", "None"):
-                                st.markdown(f"{_icon} **{_cv}**")
-                    with _cc2:
-                        if _crm_res.get("crm_board"):
-                            st.caption(f"Board: {_crm_res['crm_board']}")
-                        if _crm_res.get("status") and str(_crm_res["status"]) not in ("", "nan", "None"):
-                            st.caption(f"Status: {_crm_res['status']}")
-                        if _crm_res.get("crm_url"):
-                            st.markdown(f"[Open in Monday →]({_crm_res['crm_url']})")
+                st.divider()
 
-                # ── Reachability cascade (not on CRM) ─────────────────────────
-                elif _crm_res is not None:
-                    st.divider()
-                    _cascade = _enr_res.get("cascade")
+                # ── CRM contact panel (if on CRM) ─────────────────────────────
+                if _on_crm:
+                    def _val(f: str) -> str:
+                        v = _db_row.get(f, "")
+                        return str(v) if v and str(v) not in ("", "nan", "None") else ""
 
-                    if _cascade is None:
-                        _df1, _df2 = st.columns([3, 2])
-                        with _df1:
-                            _dom_hint = st.text_input(
-                                "Company domain (helps Hunter, optional)",
-                                key=f"ddom_{_pi}",
+                    _ci1, _ci2 = st.columns(2)
+                    with _ci1:
+                        if _val("crm_email"):
+                            st.markdown(f"📧 **{_val('crm_email')}**")
+                        else:
+                            st.caption("📧 Email: not in CRM")
+                        if _val("crm_phone"):
+                            st.markdown(f"📞 **{_val('crm_phone')}**")
+                        else:
+                            st.caption("📞 Phone: not in CRM")
+                        if _val("crm_title"):
+                            st.markdown(f"💼 **{_val('crm_title')}**")
+                        # Company — populated from crm_account_type (lookup board)
+                        # or the company field stored on the profile
+                        _co = _val("company") or _prof.get("company", "")
+                        if _co:
+                            st.markdown(f"🏢 **{_co}**")
+                        if _val("crm_authority"):
+                            st.caption(f"Authority: {_val('crm_authority')}")
+                    with _ci2:
+                        if _val("crm_heat"):
+                            st.caption(f"🔥 Heat: {_val('crm_heat')}")
+                        _lm = _val("crm_last_method")
+                        _ld = _val("crm_last_date")
+                        if _lm or _ld:
+                            st.caption(f"Last contact: {(_lm + ' ' + _ld).strip()}")
+                        if _val("crm_notes"):
+                            st.caption(f"📝 {_val('crm_notes')[:130]}")
+                        if _db_row.get("crm_url"):
+                            st.markdown(f"[Open in Monday →]({_db_row['crm_url']})")
+                        # Per-card refresh button
+                        if st.button("↻ Refresh from Monday", key=f"{_sk}_crm_refresh",
+                                     use_container_width=True):
+                            with st.spinner("Checking Monday…"):
+                                try:
+                                    _rfr = lookup_monday_crm(
+                                        {"name": _prof["name"], "linkedin": _pkey})
+                                    _rfr_upd: dict = {"linkedin_url": _pkey,
+                                                      "on_crm": _rfr.get("on_crm", False)}
+                                    if _rfr.get("on_crm"):
+                                        _rfr_upd.update({
+                                            "crm_board":       _rfr.get("crm_board") or None,
+                                            "crm_item_id":     str(_rfr.get("crm_item_id") or ""),
+                                            "crm_url":         _rfr.get("crm_url") or None,
+                                            "crm_email":       _rfr.get("crm_email") or None,
+                                            "crm_phone":       _rfr.get("crm_phone") or None,
+                                            "crm_title":       _rfr.get("crm_title") or None,
+                                            "crm_authority":   _rfr.get("crm_authority") or None,
+                                            "crm_heat":        _rfr.get("crm_heat") or None,
+                                            "crm_last_method": _rfr.get("crm_last_method") or None,
+                                            "crm_last_date":   _rfr.get("crm_last_date") or None,
+                                            "crm_notes":       _rfr.get("crm_notes") or None,
+                                            "company": _rfr.get("crm_account_type") or None,
+                                        })
+                                    _upsert_dork_lead(_rfr_upd)
+                                    st.cache_data.clear()
+                                    st.rerun()
+                                except Exception as _rfe:
+                                    st.error(f"Refresh failed: {_rfe}")
+
+                # ── Editable contact fields + enrichment (not on CRM) ─────────
+                else:
+                    _ef1, _ef2 = st.columns(2)
+
+                    # Init session_state from DB on first render of this card
+                    if f"{_sk}_email" not in st.session_state:
+                        st.session_state[f"{_sk}_email"]   = _db_row.get("email") or ""
+                        st.session_state[f"{_sk}_phone"]   = _db_row.get("phone") or ""
+                        st.session_state[f"{_sk}_title"]   = (_db_row.get("job_title") or
+                                                               _prof.get("job_title") or "")
+                        st.session_state[f"{_sk}_company"] = (_db_row.get("company") or
+                                                               _prof.get("company") or "")
+
+                    with _ef1:
+                        _edit_email   = st.text_input("📧 Email",     key=f"{_sk}_email")
+                        _edit_phone   = st.text_input("📞 Phone",     key=f"{_sk}_phone")
+                        _edit_title   = st.text_input("💼 Job Title", key=f"{_sk}_title")
+                        _edit_company = st.text_input("🏢 Company",   key=f"{_sk}_company")
+
+                    with _ef2:
+                        _conf = int(_db_row.get("confidence") or 0)
+                        if _conf > 0:
+                            # Show enrichment summary
+                            _bar2 = "█" * (_conf // 10) + "░" * (10 - _conf // 10)
+                            st.markdown(f"**Confidence: `{_bar2}` {_conf}%**")
+                            _esrcs2 = _as_list(_db_row.get("email_sources"))
+                            if _esrcs2:
+                                st.caption("📧 ↳ " + ", ".join(_esrcs2))
+                            _psrcs2 = _as_list(_db_row.get("phone_sources"))
+                            if _psrcs2:
+                                st.caption("📞 ↳ " + ", ".join(_psrcs2))
+                            if _db_row.get("domain"):
+                                st.caption(f"Domain: {_db_row['domain']}")
+                            _ecands2 = _as_list(_db_row.get("email_candidates"))
+                            if _ecands2 and not _db_row.get("email"):
+                                st.caption("Pattern guesses:")
+                                for _ec2 in _ecands2[:2]:
+                                    st.code(_ec2, language=None)
+                        else:
+                            # No enrichment yet — domain + cascade button
+                            _dom_hint2 = st.text_input(
+                                "Company domain (helps Hunter)",
+                                key=f"{_sk}_dom",
                                 placeholder="e.g. nedbank.co.za",
                             )
-                        with _df2:
-                            st.write("")
-                            st.write("")
-                            if st.button("🔍 Find contact info", key=f"dcasc_{_pi}",
+                            if st.button("🔍 Find contact info", key=f"{_sk}_casc",
                                          use_container_width=True, type="primary"):
                                 with st.spinner("Searching across sources…"):
                                     try:
-                                        _casc = _cascade_find_contact(
-                                            _prof["name"], _prof["url"],
+                                        _casc2 = _cascade_find_contact(
+                                            _prof["name"], _pkey,
                                             company=_prof.get("company", ""),
-                                            domain_hint=_dom_hint.strip(),
+                                            domain_hint=_dom_hint2.strip(),
                                         )
-                                        st.session_state.setdefault("dork_enrich", {}).setdefault(_pkey, {})["cascade"] = _casc
-                                    except Exception as _ce2:
-                                        st.session_state.setdefault("dork_enrich", {}).setdefault(_pkey, {})["cascade"] = {"error": str(_ce2)}
+                                        _upsert_dork_lead({
+                                            "linkedin_url":     _pkey,
+                                            "email":            _casc2.get("email"),
+                                            "phone":            _casc2.get("phone"),
+                                            "job_title":        _casc2.get("title") or _prof.get("job_title"),
+                                            "company":          _casc2.get("company") or _prof.get("company"),
+                                            "domain":           _casc2.get("domain"),
+                                            "email_sources":    json.dumps(_casc2.get("email_sources", [])),
+                                            "phone_sources":    json.dumps(_casc2.get("phone_sources", [])),
+                                            "confidence":       _casc2.get("confidence", 0),
+                                            "email_candidates": json.dumps(_casc2.get("email_candidates", [])),
+                                            "last_enriched_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+                                        })
+                                        # Reset editable field state so they re-init from DB
+                                        for _sf2 in ["email", "phone", "title", "company"]:
+                                            st.session_state.pop(f"{_sk}_{_sf2}", None)
+                                    except Exception as _ce3:
+                                        st.error(f"Cascade failed: {_ce3}")
+                                st.cache_data.clear()
                                 st.rerun()
 
-                    elif _cascade.get("error"):
-                        st.error(f"Contact search failed: {_cascade['error'][:150]}")
-
-                    else:
-                        _conf = _cascade.get("confidence", 0)
-                        _bar  = "█" * (_conf // 10) + "░" * (10 - _conf // 10)
-                        st.markdown(f"**Confidence: `{_bar}` {_conf}%**")
-                        st.divider()
-
-                        _cr1, _cr2 = st.columns(2)
-                        with _cr1:
-                            if _cascade.get("email"):
-                                st.markdown(f"📧 **{_cascade['email']}**")
-                                _esrc = ", ".join(_cascade.get("email_sources", []))
-                                if _esrc:
-                                    st.caption(f"  ↳ {_esrc}")
-                            elif _cascade.get("email_candidates"):
-                                st.markdown("📧 Unverified patterns:")
-                                for _ec in _cascade["email_candidates"][:3]:
-                                    st.code(_ec, language=None)
-                            if _cascade.get("phone"):
-                                st.markdown(f"📞 **{_cascade['phone']}**")
-                                _psrc = ", ".join(_cascade.get("phone_sources", []))
-                                if _psrc:
-                                    st.caption(f"  ↳ {_psrc}")
-                        with _cr2:
-                            if _cascade.get("title"):
-                                st.markdown(f"💼 **{_cascade['title']}**")
-                            if _cascade.get("company"):
-                                st.markdown(f"🏢 **{_cascade['company']}**")
-                            if _cascade.get("domain"):
-                                st.caption(f"Domain: {_cascade['domain']}")
-
+                    # ── Save + Push actions ────────────────────────────────────
+                    _ba1, _ba2 = st.columns(2)
+                    with _ba1:
+                        if st.button("💾 Save changes", key=f"{_sk}_save",
+                                     use_container_width=True):
+                            _upsert_dork_lead({
+                                "linkedin_url": _pkey,
+                                "email":        _edit_email.strip() or None,
+                                "phone":        _edit_phone.strip() or None,
+                                "job_title":    _edit_title.strip() or None,
+                                "company":      _edit_company.strip() or None,
+                            })
+                            st.cache_data.clear()
+                            st.toast("Saved.")
+                    with _ba2:
                         if monday_active:
-                            _push2 = {
-                                "name":           _prof["name"],
-                                "title":          _cascade.get("title") or _prof.get("job_title", ""),
-                                "company":        _cascade.get("company") or _prof.get("company", ""),
-                                "email":          _cascade.get("email", ""),
-                                "phone":          _cascade.get("phone", ""),
-                                "linkedin":       _prof["url"],
-                                "authority":      "",
-                                "accuracy_score": str(_conf),
-                                "provider_chain": " → ".join(
-                                    _cascade.get("email_sources", []) +
-                                    _cascade.get("phone_sources", [])
-                                ) or "LinkedIn Dork",
-                                "country":        "",
-                            }
-                            if st.button("📋 Add to Monday Leads", key=f"dpush_{_pi}",
+                            _btn_lbl = ("📋 Update Monday" if _db_row.get("monday_leads_item_id")
+                                        else "📋 Add to Monday Leads")
+                            if st.button(_btn_lbl, key=f"{_sk}_push",
                                          use_container_width=True, type="primary"):
-                                with st.spinner("Pushing…"):
+                                _esrc_str = " → ".join(
+                                    _as_list(_db_row.get("email_sources")) +
+                                    _as_list(_db_row.get("phone_sources"))
+                                ) or "LinkedIn Dork"
+                                _push3 = {
+                                    "name":           _prof["name"],
+                                    "title":          _edit_title,
+                                    "company":        _edit_company,
+                                    "email":          _edit_email,
+                                    "phone":          _edit_phone,
+                                    "linkedin":       _pkey,
+                                    "accuracy_score": str(int(_db_row.get("confidence") or 0)),
+                                    "provider_chain": _esrc_str,
+                                }
+                                with st.spinner("Syncing to Monday…"):
                                     try:
-                                        _pr2 = sync_lead_to_monday(_push2)
-                                        st.success(f"Action: {_pr2.get('action')} · ID: {_pr2.get('item_id')}")
-                                    except Exception as _pe2:
-                                        st.error(f"Push failed: {_pe2}")
+                                        _mres = sync_lead_to_monday(_push3)
+                                        _upsert_dork_lead({
+                                            "linkedin_url":         _pkey,
+                                            "monday_leads_item_id": str(_mres.get("item_id") or ""),
+                                            "email":   _edit_email or None,
+                                            "phone":   _edit_phone or None,
+                                            "job_title": _edit_title or None,
+                                            "company": _edit_company or None,
+                                        })
+                                        st.cache_data.clear()
+                                        st.success(f"{_mres.get('action', 'done').title()} · "
+                                                   f"ID: {_mres.get('item_id')}")
+                                    except Exception as _pe3:
+                                        st.error(f"Push failed: {_pe3}")
+                        else:
+                            st.caption("Add MONDAY_API_KEY to push")
+
+                # ── Copy ──────────────────────────────────────────────────────
+                _dk_email = _db_row.get("crm_email") or _db_row.get("email") or ""
+                _dk_phone = _db_row.get("crm_phone") or _db_row.get("phone") or ""
+                _dk_title = (_db_row.get("crm_title") or _db_row.get("job_title")
+                             or _prof.get("job_title", ""))
+                _dk_co    = _db_row.get("company") or _prof.get("company", "")
+                _dk_conf  = int(_db_row.get("confidence") or 0)
+                _dk_lines = [
+                    f"CONTACT: {_prof['name']}",
+                    f"Title: {_dk_title}" if _dk_title else "",
+                    f"Company: {_dk_co}" if _dk_co else "",
+                    f"Email: {_dk_email}" if _dk_email else "",
+                    f"Phone: {_dk_phone}" if _dk_phone else "",
+                    f"LinkedIn: {_pkey}",
+                    f"Confidence: {_dk_conf}%" if _dk_conf else "",
+                    (f"CRM: Yes — {_db_row.get('crm_board', '')}") if _on_crm else "CRM: Not found",
+                ]
+                _copy_block("\n".join(l for l in _dk_lines if l),
+                            key=f"dork_copy_{_pi}")
+
+        # ── Next page ─────────────────────────────────────────────────────────
+        st.divider()
+        _next_start = st.session_state.get("dork_search_start", int(_d_num))
+        if st.button(f"➡ Next {int(_d_num)} results  (offset {_next_start})",
+                     key="dork_next", use_container_width=True):
+            with st.spinner(f"Fetching results {_next_start + 1}–{_next_start + int(_d_num)}…"):
+                try:
+                    _more = _dork_search(_d_query, int(_d_num), start=_next_start)
+                    _existing_urls = {p["url"] for p in st.session_state.get("dork_results", [])}
+                    _new_profs = [p for p in _more if p["url"] not in _existing_urls]
+                    for _pf3 in _new_profs:
+                        _upsert_dork_lead({
+                            "linkedin_url":     _pf3["url"],
+                            "name":             _pf3["name"],
+                            "job_title":        _pf3.get("job_title") or None,
+                            "company":          _pf3.get("company") or None,
+                            "snippet":          _pf3.get("snippet") or None,
+                            "last_searched_at": _now_iso,
+                        })
+                    st.session_state["dork_results"] = (
+                        st.session_state.get("dork_results", []) + _new_profs
+                    )
+                    st.session_state["dork_search_start"] = _next_start + int(_d_num)
+                    _run_crm_check(_new_profs)
+                    st.cache_data.clear()
+                    if not _new_profs:
+                        st.warning("No new profiles found at this offset.")
+                except Exception as _ne:
+                    st.error(f"Next page error: {_ne}")
+            st.rerun()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 6 — LEAD INTELLIGENCE
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Flare.io helpers ──────────────────────────────────────────────────────────
+@st.cache_data(ttl=3300)
+def _flare_token() -> str | None:
+    api_key   = st.secrets.get("FLARE_API_KEY",   "") or os.getenv("FLARE_API_KEY",   "")
+    tenant_id = st.secrets.get("FLARE_TENANT_ID", "") or os.getenv("FLARE_TENANT_ID", "")
+    if not api_key:
+        return None
+    try:
+        body = json.dumps({"tenant_id": int(tenant_id)}).encode() if tenant_id else b"{}"
+        req  = _urlreq.Request(
+            "https://api.flare.io/tokens/generate",
+            data=body,
+            headers={"Authorization": api_key, "Content-Type": "application/json"},
+            method="POST",
+        )
+        with _urlreq.urlopen(req, timeout=15) as r:
+            return json.loads(r.read()).get("token")
+    except Exception:
+        return None
+
+
+def _flare_search(query: str, event_types: list, days_back: int = 30,
+                  size: int = 20) -> list:
+    token = _flare_token()
+    if not token:
+        return []
+    from_ts = (_dt.datetime.now(_dt.timezone.utc)
+               - _dt.timedelta(days=days_back)).isoformat()
+    body = json.dumps({
+        "query": {"query_string": query, "type": "query_string"},
+        "filter": {
+            "types": event_types,
+            "estimated_created_at": {"gte": from_ts},
+        },
+        "size": size,
+        "order": "desc",
+    }).encode()
+    req = _urlreq.Request(
+        "https://api.flare.io/global/_search",
+        data=body,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    with _urlreq.urlopen(req, timeout=25) as r:
+        return json.loads(r.read()).get("items", [])
+
+
+def _news_search(query: str, num: int = 10) -> list:
+    """Google/SerpAPI news search. Returns [{title, url, snippet}]."""
+    s_key = st.secrets.get("SERPAPI_API_KEY", "") or os.getenv("SERPAPI_API_KEY", "")
+    g_key = st.secrets.get("GOOGLE_API_KEY",  "") or os.getenv("GOOGLE_API_KEY",  "")
+    g_cse = st.secrets.get("GOOGLE_CSE_ID",   "") or os.getenv("GOOGLE_CSE_ID",   "")
+    if s_key:
+        url = (f"https://serpapi.com/search?engine=google_news"
+               f"&q={_urlparse.quote(query)}&num={num}&api_key={s_key}")
+        with _urlreq.urlopen(url, timeout=20) as r:
+            data = json.loads(r.read())
+        items = data.get("news_results") or data.get("organic_results", [])
+        return [{"title": x.get("title",""), "url": x.get("link",""),
+                 "snippet": x.get("snippet",""), "date": x.get("date","")}
+                for x in items[:num]]
+    if g_key and g_cse:
+        url = (f"https://www.googleapis.com/customsearch/v1"
+               f"?key={g_key}&cx={g_cse}&q={_urlparse.quote(query)}&num={min(num,10)}")
+        with _urlreq.urlopen(url, timeout=20) as r:
+            items = json.loads(r.read()).get("items", [])
+        return [{"title": x.get("title",""), "url": x.get("link",""),
+                 "snippet": x.get("snippet",""), "date": ""}
+                for x in items]
+    return []
+
+
+def _intel_ai_rate(company: str, country: str, event_type: str,
+                   description: str) -> dict:
+    prompt = f"""You are a sales intelligence AI for CRS (Cyber Retaliator Solutions),
+an African IBM Security / Red Hat / SUSE / CompTIA training & distribution partner.
+
+Rate this company as a CRS lead based on the cyber event below.
+
+Company: {company}
+Country: {country}
+Event type: {event_type}
+Details: {description[:600]}
+
+Reply ONLY with valid JSON (no markdown fences):
+{{
+  "score": <integer 0-100>,
+  "sector": "<detected sector, e.g. Banking, Government, Healthcare>",
+  "urgency": "<high|medium|low>",
+  "crs_solutions": ["solution1", "solution2"],
+  "outreach_angle": "<1-2 sentence personalised cold-outreach hook>",
+  "rationale": "<2-3 sentences why this is a strong/weak lead for CRS>"
+}}"""
+    try:
+        raw = _call_ai(prompt)
+        raw = re.sub(r"```[a-z]*\n?", "", raw).strip().rstrip("`")
+        return json.loads(raw)
+    except Exception:
+        return {"score": 0, "sector": "", "urgency": "low",
+                "crs_solutions": [], "outreach_angle": "", "rationale": "AI rating unavailable."}
+
+
+def _extract_company_from_news(title: str, snippet: str, country: str) -> str:
+    """Best-effort company name extraction from a news headline or snippet."""
+    for src in (title, snippet):
+        for pat in [
+            r"^([A-Z][A-Za-z0-9 &',.-]{2,50}?)\s+(?:suffer|hit|target|report|disclose|confirm|face)",
+            r"^([A-Z][A-Za-z0-9 &',.-]{2,50}?)\s+data breach",
+            r"^([A-Z][A-Za-z0-9 &',.-]{2,50}?)\s+ransomware",
+        ]:
+            m = re.search(pat, src, re.IGNORECASE)
+            if m:
+                return m.group(1).strip()
+    # Fall back to first capitalised phrase from title (skip the country name itself)
+    words = title.split()
+    caps = []
+    for w in words:
+        if w[0].isupper() if w else False:
+            if w.lower() not in country.lower().split():
+                caps.append(w.rstrip(",:;"))
+        elif caps:
+            break
+    return " ".join(caps[:5]) if caps else title[:60]
+
+
+_INTEL_COUNTRIES = [
+    "South Africa", "Kenya", "Nigeria", "Ghana", "Tanzania", "Uganda",
+    "Zambia", "Rwanda", "Botswana", "Namibia", "Zimbabwe", "Malawi",
+    "Ethiopia", "Egypt", "Mozambique", "Mauritius", "Lesotho", "Eswatini",
+    "Sierra Leone", "The Gambia", "Liberia", "Cameroon", "Senegal",
+]
+
+_INTEL_EVENT_TYPES = {
+    "Ransomware":         "ransomleak",
+    "Credential Leak":    "credential",
+    "Dark Web Mention":   "chat_message",
+    "Paste / Dump":       "paste",
+    "Stealer Log":        "stealer_log",
+}
+
+_INTEL_GOOGLE_TERMS = (
+    '"data breach" OR "ransomware" OR "cyber attack" OR "hacked" OR '
+    '"credential leak" OR "data leak" OR "security incident"'
+)
+
+if _page == "🛡️ Lead Intelligence":
+    st.subheader("Cyber Event Lead Intelligence")
+    st.caption(
+        "Surface African companies hit by ransomware, breaches, or dark-web exposure. "
+        "AI-rates each as a CRS lead, then lets you find the right contacts."
+    )
+
+    _ii1, _ii2, _ii3, _ii4 = st.columns([3, 2, 1, 1])
+    with _ii1:
+        if st.checkbox("Select all", key="intel_ctry_all"):
+            st.session_state["intel_countries"] = _INTEL_COUNTRIES[:]
+        elif not st.session_state.get("intel_ctry_all"):
+            st.session_state.setdefault("intel_countries",
+                                        ["South Africa", "Kenya", "Nigeria", "Ghana"])
+        _i_countries = st.multiselect("Countries", _INTEL_COUNTRIES, key="intel_countries")
+
+    with _ii2:
+        if st.checkbox("Select all", key="intel_evt_all"):
+            st.session_state["intel_evt_types"] = list(_INTEL_EVENT_TYPES.keys())
+        elif not st.session_state.get("intel_evt_all"):
+            st.session_state.setdefault("intel_evt_types",
+                                        ["Ransomware", "Credential Leak", "Dark Web Mention"])
+        _i_evt_labels = st.multiselect("Event types", list(_INTEL_EVENT_TYPES.keys()),
+                                       key="intel_evt_types")
+
+    with _ii3:
+        _i_days = st.selectbox("Days back", [7, 14, 30, 60, 90], index=2, key="intel_days")
+
+    with _ii4:
+        _i_per_ctry = st.number_input("Results / country", 3, 20, 5, step=1,
+                                      key="intel_per_ctry")
+
+    _i_src_flare  = bool(st.secrets.get("FLARE_API_KEY","")  or os.getenv("FLARE_API_KEY",""))
+    _i_src_google = bool(
+        (st.secrets.get("SERPAPI_API_KEY","") or os.getenv("SERPAPI_API_KEY","")) or
+        (st.secrets.get("GOOGLE_API_KEY","")  and st.secrets.get("GOOGLE_CSE_ID",""))
+    )
+    st.caption("Sources: " + "  ·  ".join([
+        "🟢 Flare.io"    if _i_src_flare  else "⚪ Flare.io (add FLARE_API_KEY)",
+        "🟢 Google News" if _i_src_google else "⚪ Google News (add SERPAPI_API_KEY)",
+    ]))
+
+    _i_run = st.button("🔍 Find cyber-event leads", type="primary",
+                       use_container_width=True, key="intel_run")
+
+    if _i_run:
+        if not _i_countries:
+            st.warning("Select at least one country.")
+        elif not (_i_src_flare or _i_src_google):
+            st.error("Add FLARE_API_KEY or SERPAPI_API_KEY to search.")
+        else:
+            _flare_types = [_INTEL_EVENT_TYPES[l] for l in _i_evt_labels
+                            if l in _INTEL_EVENT_TYPES]
+            _intel_raw: list = []
+
+            _ipb = st.progress(0, text="Searching…")
+            for _ic_idx, _ic in enumerate(_i_countries):
+                _ipb.progress((_ic_idx + 1) / len(_i_countries), text=f"Searching {_ic}…")
+
+                # Flare.io
+                if _i_src_flare and _flare_types:
+                    try:
+                        _fevts = _flare_search(
+                            f'"{_ic}"', _flare_types,
+                            days_back=int(_i_days), size=int(_i_per_ctry)
+                        )
+                        for _fe in _fevts:
+                            _meta = _fe.get("metadata") or _fe
+                            _body = _fe.get("body") or _fe
+                            _desc = (str(_body.get("content") or _body.get("text") or
+                                        _body.get("description") or _meta.get("title") or "")[:600])
+                            _co   = (str(_meta.get("source_name") or _meta.get("domain") or
+                                        _meta.get("company") or "Unknown")[:120])
+                            _etype = str(_meta.get("type") or _meta.get("event_type") or
+                                         (_flare_types[0] if _flare_types else "unknown"))
+                            _date  = str(_meta.get("estimated_created_at") or
+                                         _meta.get("created_at") or "")[:10]
+                            _url   = str(_meta.get("url") or _meta.get("source_url") or "")
+                            _intel_raw.append({
+                                "company": _co, "country": _ic,
+                                "event_type": _etype, "date": _date,
+                                "description": _desc, "url": _url,
+                                "source": "Flare.io",
+                            })
+                    except Exception as _fe2:
+                        st.toast(f"Flare error for {_ic}: {str(_fe2)[:80]}")
+
+                # Google News
+                if _i_src_google:
+                    try:
+                        _gq = f'"{_ic}" {_INTEL_GOOGLE_TERMS}'
+                        _gnews = _news_search(_gq, num=int(_i_per_ctry))
+                        for _gn in _gnews:
+                            _co2 = _extract_company_from_news(
+                                _gn["title"], _gn["snippet"], _ic)
+                            _intel_raw.append({
+                                "company":     _co2,
+                                "country":     _ic,
+                                "event_type":  "news",
+                                "date":        _gn.get("date",""),
+                                "description": f"{_gn['title']} — {_gn['snippet']}",
+                                "url":         _gn["url"],
+                                "source":      "Google News",
+                            })
+                    except Exception as _ge:
+                        st.toast(f"Google error for {_ic}: {str(_ge)[:80]}")
+
+            _ipb.empty()
+            # Deduplicate by company+country
+            _seen_co: set = set()
+            _intel_dedup: list = []
+            for _ev in _intel_raw:
+                _ck = (_ev["company"].lower()[:30], _ev["country"])
+                if _ck not in _seen_co and _ev["company"] not in ("Unknown", ""):
+                    _seen_co.add(_ck)
+                    _intel_dedup.append(_ev)
+            st.session_state["intel_results"] = _intel_dedup
+            if not _intel_dedup:
+                st.warning("No events found — try more countries, a longer date range, or check API keys.")
+
+    # ── Results ───────────────────────────────────────────────────────────────
+    _intel_results = st.session_state.get("intel_results", [])
+
+    if not _intel_results:
+        if not _i_run:
+            st.info("Select countries and event types above, then click **Find cyber-event leads**.")
+    else:
+        st.markdown(f"**{len(_intel_results)} companies** with recent cyber events")
+        st.divider()
+
+        for _ir_idx, _ir in enumerate(_intel_results):
+            _ir_key = f"ir_{_ir_idx}"
+            _urgency_icon = {"high": "🔴", "medium": "🟡", "low": "🟢"}.get(
+                st.session_state.get(f"{_ir_key}_urgency", "low"), "⚪")
+
+            with st.container(border=True):
+                _ch1, _ch2 = st.columns([5, 2])
+                with _ch1:
+                    st.markdown(f"### {_urgency_icon} {_ir['company']}")
+                    _tags = "  ·  ".join(filter(None, [
+                        _ir.get("country",""),
+                        _ir.get("event_type","").replace("_"," ").title(),
+                        _ir.get("date","")[:10],
+                        f"via {_ir.get('source','')}",
+                    ]))
+                    st.caption(_tags)
+                    if _ir.get("description"):
+                        st.caption(_ir["description"][:280])
+                    if _ir.get("url"):
+                        st.markdown(f"[Source →]({_ir['url']})")
+                with _ch2:
+                    _rated = st.session_state.get(f"{_ir_key}_rated")
+                    if _rated:
+                        _sc = int(_rated.get("score") or 0)
+                        _bar3 = "█" * (_sc // 10) + "░" * (10 - _sc // 10)
+                        st.markdown(f"**AI Score: `{_bar3}` {_sc}%**")
+                        _urg = _rated.get("urgency","low")
+                        st.session_state[f"{_ir_key}_urgency"] = _urg
+                        _urg_lbl = {"high":"🔴 High","medium":"🟡 Medium","low":"🟢 Low"}.get(_urg, _urg)
+                        st.caption(f"Urgency: {_urg_lbl}")
+                        if _rated.get("sector"):
+                            st.caption(f"Sector: {_rated['sector']}")
+                    else:
+                        st.caption("⚪ Not yet rated")
+                        if st.button("🤖 Rate lead", key=f"{_ir_key}_rate",
+                                     use_container_width=True):
+                            with st.spinner("AI rating…"):
+                                try:
+                                    _r2 = _intel_ai_rate(
+                                        _ir["company"], _ir["country"],
+                                        _ir["event_type"], _ir["description"])
+                                    st.session_state[f"{_ir_key}_rated"] = _r2
+                                    st.rerun()
+                                except Exception as _ae:
+                                    st.error(f"AI error: {_ae}")
+
+                # ── AI detail (if rated) ───────────────────────────────────
+                _rated2 = st.session_state.get(f"{_ir_key}_rated")
+                if _rated2:
+                    st.divider()
+                    _rd1, _rd2 = st.columns(2)
+                    with _rd1:
+                        if _rated2.get("crs_solutions"):
+                            st.markdown("**CRS solutions:**  " +
+                                        "  ".join(f"`{s}`" for s in _rated2["crs_solutions"]))
+                        if _rated2.get("outreach_angle"):
+                            st.info(_rated2["outreach_angle"])
+                    with _rd2:
+                        if _rated2.get("rationale"):
+                            st.caption(_rated2["rationale"])
+
+                st.divider()
+
+                # ── Contact discovery ──────────────────────────────────────
+                _contacts_found = st.session_state.get(f"{_ir_key}_contacts", [])
+                if _contacts_found:
+                    st.markdown(f"**{len(_contacts_found)} contacts found:**")
+                    for _cf_idx, _cf in enumerate(_contacts_found):
+                        _cfk = f"{_ir_key}_cf_{_cf_idx}"
+                        with st.expander(f"👤 {_cf.get('name','')}  ·  {_cf.get('job_title','')}",
+                                         expanded=False):
+                            _cx1, _cx2 = st.columns(2)
+                            with _cx1:
+                                st.markdown(f"[LinkedIn]({_cf['url']})")
+                                if _cf.get("company"):
+                                    st.caption(f"🏢 {_cf['company']}")
+                            with _cx2:
+                                _cf_enr = st.session_state.get(f"{_cfk}_enr", {})
+                                if _cf_enr.get("email"):
+                                    st.markdown(f"📧 **{_cf_enr['email']}**")
+                                if _cf_enr.get("phone"):
+                                    st.markdown(f"📞 **{_cf_enr['phone']}**")
+                                _cf_conf = int(_cf_enr.get("confidence") or 0)
+                                if _cf_conf:
+                                    st.caption(f"Confidence: {_cf_conf}%")
+                            if not _cf_enr:
+                                if st.button("🔍 Find contact info",
+                                             key=f"{_cfk}_casc", use_container_width=True):
+                                    with st.spinner("Enriching…"):
+                                        try:
+                                            _enr2 = _cascade_find_contact(
+                                                _cf["name"], _cf["url"],
+                                                company=_cf.get("company",""))
+                                            st.session_state[f"{_cfk}_enr"] = _enr2
+                                            # Persist to dork_leads
+                                            _upsert_dork_lead({
+                                                "linkedin_url": _cf["url"],
+                                                "name":         _cf["name"],
+                                                "job_title":    _cf.get("job_title"),
+                                                "company":      _cf.get("company"),
+                                                "email":        _enr2.get("email"),
+                                                "phone":        _enr2.get("phone"),
+                                                "confidence":   _enr2.get("confidence",0),
+                                                "email_sources": json.dumps(_enr2.get("email_sources",[])),
+                                                "phone_sources": json.dumps(_enr2.get("phone_sources",[])),
+                                                "last_searched_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+                                            })
+                                            st.rerun()
+                                        except Exception as _ee:
+                                            st.error(f"Enrichment failed: {_ee}")
+                            if monday_active and (_cf_enr.get("email") or _cf.get("url")):
+                                if st.button("📋 Push to Monday Leads",
+                                             key=f"{_cfk}_push", use_container_width=True,
+                                             type="primary"):
+                                    _intel_push = {
+                                        "name":     _cf["name"],
+                                        "title":    _cf.get("job_title",""),
+                                        "company":  _cf.get("company",""),
+                                        "email":    _cf_enr.get("email",""),
+                                        "phone":    _cf_enr.get("phone",""),
+                                        "linkedin": _cf["url"],
+                                        "accuracy_score": str(_cf_conf),
+                                        "provider_chain": "Lead Intelligence",
+                                    }
+                                    with st.spinner("Pushing…"):
+                                        try:
+                                            _mr3 = sync_lead_to_monday(_intel_push)
+                                            st.success(f"{_mr3.get('action','done').title()} · "
+                                                       f"ID: {_mr3.get('item_id')}")
+                                        except Exception as _pe4:
+                                            st.error(f"Push failed: {_pe4}")
+
+                else:
+                    # Find contacts button
+                    _fc1b, _fc2b = st.columns(2)
+                    with _fc1b:
+                        _i_title_hint = st.text_input(
+                            "Job title to search", value="CISO IT Manager",
+                            key=f"{_ir_key}_title_hint",
+                            placeholder="CISO, IT Director…")
+                    with _fc2b:
+                        st.write("")
+                        st.write("")
+                        if st.button("🔍 Find contacts at this company",
+                                     key=f"{_ir_key}_find_contacts",
+                                     use_container_width=True, type="primary"):
+                            _dork_q2 = (
+                                f'site:linkedin.com/in "{_ir["company"]}" '
+                                f'({_i_title_hint}) "{_ir["country"]}"'
+                            )
+                            with st.spinner("Dorking LinkedIn…"):
+                                try:
+                                    _cprofs = _dork_search(_dork_q2, num=5)
+                                    st.session_state[f"{_ir_key}_contacts"] = _cprofs
+                                    for _cp2 in _cprofs:
+                                        _upsert_dork_lead({
+                                            "linkedin_url":     _cp2["url"],
+                                            "name":             _cp2["name"],
+                                            "job_title":        _cp2.get("job_title"),
+                                            "company":          _cp2.get("company") or _ir["company"],
+                                            "last_searched_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+                                        })
+                                    if not _cprofs:
+                                        st.warning("No LinkedIn profiles found — try a different title.")
+                                    else:
+                                        st.rerun()
+                                except Exception as _dce:
+                                    st.error(f"Contact search failed: {_dce}")
+
+                # ── Copy ──────────────────────────────────────────────────────
+                _ir_rated3 = st.session_state.get(f"{_ir_key}_rated") or {}
+                _ir_lines = [
+                    f"COMPANY: {_ir['company']}",
+                    f"Country: {_ir.get('country', '')}",
+                    f"Event: {_ir.get('event_type', '').replace('_', ' ').title()}",
+                    f"Date: {_ir.get('date', '')[:10]}" if _ir.get("date") else "",
+                    f"Source: {_ir.get('source', '')}",
+                    f"Description: {_ir.get('description', '')[:300]}" if _ir.get("description") else "",
+                    f"URL: {_ir.get('url', '')}" if _ir.get("url") else "",
+                ]
+                if _ir_rated3:
+                    _ir_lines += [
+                        f"AI Score: {_ir_rated3.get('score', '—')}%",
+                        f"Urgency: {_ir_rated3.get('urgency', '—')}",
+                        f"Sector: {_ir_rated3.get('sector', '—')}",
+                        ("Solutions: " + ", ".join(_ir_rated3["crs_solutions"])
+                         ) if _ir_rated3.get("crs_solutions") else "",
+                        f"Outreach: {_ir_rated3.get('outreach_angle', '')}" if _ir_rated3.get("outreach_angle") else "",
+                    ]
+                _copy_block("\n".join(l for l in _ir_lines if l),
+                            key=f"intel_copy_{_ir_idx}")
