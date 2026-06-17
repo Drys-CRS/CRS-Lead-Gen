@@ -482,7 +482,7 @@ def _badge(urgency: str) -> str:
 def _dork_search(query: str, num: int = 10) -> list:
     g_key = st.secrets.get("GOOGLE_API_KEY", "") or os.getenv("GOOGLE_API_KEY", "")
     g_cse = st.secrets.get("GOOGLE_CSE_ID", "") or os.getenv("GOOGLE_CSE_ID", "")
-    s_key = st.secrets.get("SERPER_API_KEY", "") or os.getenv("SERPER_API_KEY", "")
+    s_key = st.secrets.get("SERPAPI_API_KEY", "") or os.getenv("SERPAPI_API_KEY", "")
     raw: list = []
     if g_key and g_cse:
         url = (f"https://www.googleapis.com/customsearch/v1"
@@ -490,18 +490,14 @@ def _dork_search(query: str, num: int = 10) -> list:
         with _urlreq.urlopen(url, timeout=20) as r:
             raw = json.loads(r.read()).get("items", [])
     elif s_key:
-        req = _urlreq.Request(
-            "https://google.serper.dev/search",
-            data=json.dumps({"q": query, "num": num}).encode(),
-            headers={"X-API-KEY": s_key, "Content-Type": "application/json"},
-            method="POST",
-        )
-        with _urlreq.urlopen(req, timeout=20) as r:
+        url = (f"https://serpapi.com/search"
+               f"?engine=google&q={_urlparse.quote(query)}&num={num}&api_key={s_key}")
+        with _urlreq.urlopen(url, timeout=20) as r:
             data = json.loads(r.read())
         raw = [{"link": x.get("link", ""), "title": x.get("title", ""),
-                "snippet": x.get("snippet", "")} for x in data.get("organic", [])]
+                "snippet": x.get("snippet", "")} for x in data.get("organic_results", [])]
     else:
-        raise RuntimeError("Set GOOGLE_API_KEY+GOOGLE_CSE_ID or SERPER_API_KEY in secrets")
+        raise RuntimeError("Set GOOGLE_API_KEY+GOOGLE_CSE_ID or SERPAPI_API_KEY in secrets")
     profiles = []
     for item in raw:
         u = item.get("link", "")
@@ -1340,14 +1336,14 @@ with tab_dork:
         (st.secrets.get("GOOGLE_API_KEY", "") or os.getenv("GOOGLE_API_KEY", "")) and
         (st.secrets.get("GOOGLE_CSE_ID",  "") or os.getenv("GOOGLE_CSE_ID",  ""))
     )
-    _has_serper = bool(st.secrets.get("SERPER_API_KEY", "") or os.getenv("SERPER_API_KEY", ""))
+    _has_serper = bool(st.secrets.get("SERPAPI_API_KEY", "") or os.getenv("SERPAPI_API_KEY", ""))
     _has_apollo = bool(st.secrets.get("APOLLO_API_KEY", "") or os.getenv("APOLLO_API_KEY", ""))
     _has_hunter = bool(st.secrets.get("HUNTER_API_KEY", "") or os.getenv("HUNTER_API_KEY", ""))
     _has_lusha  = bool(st.secrets.get("LUSHA_API_KEY",  "") or os.getenv("LUSHA_API_KEY",  ""))
 
     st.caption(" · ".join([
         "🟢 Google CSE" if _has_google else "⚪ Google CSE (need GOOGLE_API_KEY+GOOGLE_CSE_ID)",
-        "🟢 Serper"     if _has_serper else "⚪ Serper",
+        "🟢 SerpAPI"    if _has_serper else "⚪ SerpAPI",
         "🟢 Apollo"     if _has_apollo else "⚪ Apollo",
         "🟢 Hunter"     if _has_hunter else "⚪ Hunter",
         "🟢 Lusha"      if _has_lusha  else "⚪ Lusha",
@@ -1356,7 +1352,7 @@ with tab_dork:
     # ── Execute search ────────────────────────────────────────────────────────
     if _d_run:
         if not _has_google and not _has_serper:
-            st.error("Add GOOGLE_API_KEY + GOOGLE_CSE_ID, or SERPER_API_KEY to search.")
+            st.error("Add GOOGLE_API_KEY + GOOGLE_CSE_ID, or SERPAPI_API_KEY to search.")
         else:
             with st.spinner("Searching…"):
                 try:
