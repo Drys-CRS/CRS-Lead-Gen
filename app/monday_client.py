@@ -18,8 +18,8 @@ TICKETS_NEW_REQ_GRP = "topics"     # "New Requests" group
 LEADS_BOARD_ID      = 7677528134   # "1.0 - Leads - 2.0"
 LEADS_NEW_GRP       = "group_mm471gfq"  # "NEW Leads" group
 
-# Tag IDs on Leads board
-TAG_TENDER          = 27382437     # "Tender"
+# Tag IDs on Leads board (verified against board schema 2026-06-17)
+TAG_TENDER          = 27382436     # "Tender"   (27382437 = "Redhat" — don't use that)
 TAG_CYBERSECURITY   = 29105714     # "cybersec"
 TAG_IBM_TRAINING    = 29105702     # "IBMTraining"
 
@@ -288,12 +288,12 @@ def push_tender_to_monday(tender: dict) -> dict:
         except Exception:
             pass
     else:
-        # Determine lead interest tag — use existing tag IDs
+        # Determine lead interest tag
         lead_interest_tag = TAG_IBM_TRAINING if div == "Training" else TAG_CYBERSECURITY
 
         lead_cols = {
-            "tags":               [TAG_TENDER, lead_interest_tag],
-            "dup__of_lead_origin":[TAG_TENDER],
+            "tags":               {"tag_ids": [TAG_TENDER]},            # Lead Origin
+            "dup__of_lead_origin":{"tag_ids": [lead_interest_tag]},     # Lead Interest
             "text1__1":           f"{div} — {country}",
             "text__1":            str(ai_score) if ai_score else "",
             "long_text_mks8gmfw": (
