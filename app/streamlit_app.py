@@ -597,10 +597,12 @@ def _apollo_post(endpoint: str, payload: dict) -> dict:
         raise RuntimeError(f"Apollo {e.code}: {body or e.reason}") from e
 
 
-def _apollo_match(name: str, linkedin_url: str,
-                  company: str = "", email: str = "") -> dict:
+def _apollo_match(name: str = "", linkedin_url: str = "",
+                  company: str = "", email: str = "",
+                  apollo_id: str = "") -> dict:
     """People enrichment — 1 credit per matched person."""
     payload: dict = {"reveal_personal_emails": True}
+    if apollo_id:    payload["id"]               = apollo_id
     if name:         payload["name"]              = name
     if linkedin_url: payload["linkedin_url"]      = linkedin_url
     if company:      payload["organization_name"] = company
@@ -643,7 +645,9 @@ def _apollo_search_people(name: str = "", company: str = "",
 
 
 def _norm_apollo(p: dict) -> dict:
-    """Flatten an Apollo search or enrichment result into a standard contact dict."""
+    """Flatten an Apollo search or enrichment result into a standard contact dict.
+    Search results return first_name + last_name_obfuscated (no combined name field).
+    Enrichment results return name + email + phone_numbers."""
     org    = p.get("organization") or {}
     phones = p.get("phone_numbers") or []
     phone  = ""
@@ -651,18 +655,27 @@ def _norm_apollo(p: dict) -> dict:
         ph0   = phones[0]
         phone = ((ph0.get("sanitized_number") or ph0.get("raw_number"))
                  if isinstance(ph0, dict) else str(ph0))
-    # Enrichment returns personal_emails as a list; prefer over masked work email
     personal_emails = p.get("personal_emails") or []
-    email = (personal_emails[0] if personal_emails
-             else p.get("email", ""))
-    email_status = ("verified" if personal_emails
-                    else p.get("email_status", ""))
+    email = (personal_emails[0] if personal_emails else p.get("email", ""))
+    email_status = ("verified" if personal_emails else p.get("email_status", ""))
+    name = p.get("name") or ""
+    if not name:
+        fn = p.get("first_name", "")
+        ln = p.get("last_name") or p.get("last_name_obfuscated", "")
+        name = f"{fn} {ln}".strip()
+    has_phone_raw = p.get("has_direct_phone", "")
+    has_phone = ("yes" if str(has_phone_raw).lower().startswith("yes")
+                 else "maybe" if str(has_phone_raw).lower().startswith("maybe")
+                 else "")
     return {
-        "name":          p.get("name", ""),
+        "id":            p.get("id", ""),
+        "name":          name,
         "title":         p.get("title", ""),
         "email":         email,
         "email_status":  email_status,
+        "has_email":     bool(p.get("has_email")),
         "phone":         phone or "",
+        "has_phone":     has_phone,
         "linkedin":      p.get("linkedin_url", ""),
         "company":       org.get("name") or p.get("organization_name", ""),
         "company_phone": org.get("phone", ""),
@@ -1652,16 +1665,17 @@ if _page == "✅ Lead Verification":
 
         def _render_lk_cards(cards: list, key_prefix: str) -> None:
             for _ci, _cc in enumerate(cards):
-                if not _cc.get("name"): continue
+                _apo_id  = _cc.get("id", "")
                 _crm_sk  = f"lk_crm_{key_prefix}_{_ci}"
                 _ph_sk   = f"lk_phone_{key_prefix}_{_ci}"
                 _em_sk   = f"lk_email_{key_prefix}_{_ci}"
                 _xref_sk = f"lk_xref_{key_prefix}_{_ci}"
+                _disp_name = _cc.get("name") or f"Contact {_ci+1}"
 
                 with st.container(border=True):
                     _hA, _hB = st.columns([4, 2])
                     with _hA:
-                        st.markdown(f"### 👤 {_cc['name']}")
+                        st.markdown(f"### 👤 {_disp_name}")
                         _rp = [x for x in [_cc.get("title"), _cc.get("company")] if x]
                         if _rp: st.caption("💼 " + "  ·  ".join(_rp))
                         if _cc.get("domain"):   st.caption(f"🌐 {_cc['domain']}")
@@ -1669,7 +1683,7 @@ if _page == "✅ Lead Verification":
                         if _cc.get("twitter"):  st.caption(f"Twitter: {_cc['twitter']}")
                     with _hB:
                         st.caption(f"🔵 {_cc.get('source','Apollo')}")
-                        # Monday tag
+                        # Monday CRM tag
                         _crm_r = st.session_state.get(_crm_sk)
                         if monday_active:
                             if _crm_r is None:
@@ -1698,19 +1712,22 @@ if _page == "✅ Lead Verification":
                         _em_val = (_cc.get("email")
                                    or st.session_state.get(_em_sk, {}).get("email",""))
                         if _em_val:
-                            _ev = " ✓" if _cc.get("email_status") in ("verified","lusha") else ""
+                            _ev = " ✓" if _cc.get("email_status") == "verified" else ""
                             st.markdown(f"📧 **{_em_val}**{_ev}")
                             if st.session_state.get(_em_sk, {}).get("source"):
                                 st.caption(f"via {st.session_state[_em_sk]['source']}")
                         else:
-                            if _has_apo: st.caption("⚡ 1 credit")
+                            if _cc.get("has_email"):
+                                st.caption("📧 Available · ⚡ 1 credit")
                             if _has_apo and st.button("📧 Get Email",
                                     key=f"lk_em_btn_{key_prefix}_{_ci}",
                                     use_container_width=True):
                                 with st.spinner("Apollo enrichment…"):
                                     try:
                                         _em_raw = _apollo_match(
-                                            _cc.get("name",""), _cc.get("linkedin",""),
+                                            apollo_id=_apo_id,
+                                            name=_cc.get("name",""),
+                                            linkedin_url=_cc.get("linkedin",""),
                                             company=_cc.get("company",""),
                                         )
                                         _em_e = (_em_raw.get("email") or
@@ -1719,9 +1736,9 @@ if _page == "✅ Lead Verification":
                                             st.session_state[_em_sk] = {"email": _em_e, "source": "Apollo"}
                                             st.session_state["lk_results" if key_prefix == "main" else "lk_dm"][_ci]["email"] = _em_e
                                         else:
-                                            st.caption("No email found")
+                                            st.toast("No email found via Apollo")
                                     except Exception as _ee:
-                                        st.caption(f"Apollo: {str(_ee)[:60]}")
+                                        st.toast(f"Apollo: {str(_ee)[:80]}")
                                 st.rerun()
                     with _fB:
                         _ph_val = (_cc.get("phone")
@@ -1731,7 +1748,11 @@ if _page == "✅ Lead Verification":
                             if st.session_state.get(_ph_sk, {}).get("source"):
                                 st.caption(f"via {st.session_state[_ph_sk]['source']}")
                         else:
-                            if _has_apo: st.caption("⚡ 1 credit")
+                            _hp = _cc.get("has_phone","")
+                            if _hp == "yes":
+                                st.caption("📞 Direct dial · ⚡ 1 credit")
+                            elif _hp == "maybe":
+                                st.caption("📞 May be available · ⚡ 1 credit")
                             if _has_apo and st.button("📞 Get Phone",
                                     key=f"lk_ph_btn_{key_prefix}_{_ci}",
                                     use_container_width=True):
@@ -1739,7 +1760,9 @@ if _page == "✅ Lead Verification":
                                 with st.spinner("Apollo…"):
                                     try:
                                         _fp_r = _apollo_match(
-                                            _cc.get("name",""), _cc.get("linkedin",""),
+                                            apollo_id=_apo_id,
+                                            name=_cc.get("name",""),
+                                            linkedin_url=_cc.get("linkedin",""),
                                             company=_cc.get("company",""),
                                             email=_cc.get("email",""),
                                         )
@@ -1756,7 +1779,7 @@ if _page == "✅ Lead Verification":
                                     st.session_state[_ph_sk] = _fp
                                     st.rerun()
                                 else:
-                                    st.caption("No phone found")
+                                    st.toast("No phone found via Apollo")
                         if _cc.get("company_phone"):
                             st.markdown(f"🏢 **{_cc['company_phone']}** (company)")
 
@@ -1788,8 +1811,9 @@ if _page == "✅ Lead Verification":
                                     with st.spinner("Apollo enrichment…"):
                                         try:
                                             _xr = _apollo_match(
-                                                _crm_r2.get("crm_name", _cc.get("name","")),
-                                                _crm_r2.get("crm_linkedin",""),
+                                                apollo_id=_apo_id,
+                                                name=_crm_r2.get("crm_name", _cc.get("name","")),
+                                                linkedin_url=_crm_r2.get("crm_linkedin",""),
                                                 email=_crm_r2.get("crm_email",""),
                                             )
                                             if _xr:
