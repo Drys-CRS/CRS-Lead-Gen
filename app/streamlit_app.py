@@ -612,17 +612,21 @@ def _apollo_search_people(name: str = "", company: str = "",
     key = st.secrets.get("APOLLO_API_KEY", "") or os.getenv("APOLLO_API_KEY", "")
     if not key:
         return []
-    payload: dict = {"api_key": key, "per_page": num, "page": 1}
+    payload: dict = {"per_page": num, "page": 1}
     if name:
         payload["q_keywords"] = name
     if company:
-        payload["q_organization_name"] = company
+        payload["organization_names"] = [company]   # must be an array
     if titles:
         payload["person_titles"] = titles
     req = _urlreq.Request(
         "https://api.apollo.io/api/v1/mixed_people/search",
         data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json", "Cache-Control": "no-cache"},
+        headers={
+            "Content-Type":  "application/json",
+            "Cache-Control": "no-cache",
+            "X-Api-Key":     key,
+        },
         method="POST",
     )
     with _urlreq.urlopen(req, timeout=20) as r:
