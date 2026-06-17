@@ -2462,16 +2462,17 @@ def _flare_search(query: str, event_types: list, days_back: int = 30,
     from_ts = (_dt.datetime.now(_dt.timezone.utc)
                - _dt.timedelta(days=days_back)).isoformat()
     body = json.dumps({
-        "query": {"query_string": query, "type": "query_string"},
-        "filter": {
-            "types": event_types,
+        "query": {"type": "query_string", "query_string": query},
+        "filters": {
+            "type": event_types,
             "estimated_created_at": {"gte": from_ts},
         },
         "size": size,
         "order": "desc",
+        "from": None,
     }).encode()
     req = _urlreq.Request(
-        "https://api.flare.io/global/_search",
+        "https://api.flare.io/firework/v4/events/global/_search",
         data=body,
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
         method="POST",
