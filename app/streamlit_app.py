@@ -31,6 +31,8 @@ try:
         push_partner_to_companies,
         sync_lead_to_monday,
         lookup_monday_crm,
+        push_to_contacts_board,
+        lookup_monday_company,
     )
     _MONDAY_OK = True
 except ImportError:
@@ -600,6 +602,103 @@ def _lusha_lookup(linkedin_url: str) -> dict:
     req = _urlreq.Request(url, headers={"Api-Key": key})
     with _urlreq.urlopen(req, timeout=15) as r:
         return json.loads(r.read()) or {}
+
+
+# ── Contact lookup helpers (Apollo search + Lusha prospecting) ────────────────
+
+def _apollo_search_people(name: str = "", company: str = "",
+                           num: int = 5, titles: list = None) -> list:
+    """POST to Apollo mixed_people/search. Returns list of raw people dicts."""
+    key = st.secrets.get("APOLLO_API_KEY", "") or os.getenv("APOLLO_API_KEY", "")
+    if not key:
+        return []
+    payload: dict = {"api_key": key, "per_page": num, "page": 1}
+    if name:
+        payload["q_keywords"] = name
+    if company:
+        payload["q_organization_name"] = company
+    if titles:
+        payload["person_titles"] = titles
+    req = _urlreq.Request(
+        "https://api.apollo.io/api/v1/mixed_people/search",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json", "Cache-Control": "no-cache"},
+        method="POST",
+    )
+    with _urlreq.urlopen(req, timeout=20) as r:
+        return json.loads(r.read()).get("people") or []
+
+
+def _lusha_search_contacts(first_name: str = "", last_name: str = "",
+                            company: str = "") -> list:
+    """GET Lusha prospecting/contacts/search. Returns list of raw contact dicts."""
+    key = st.secrets.get("LUSHA_API_KEY", "") or os.getenv("LUSHA_API_KEY", "")
+    if not key:
+        return []
+    params: dict = {}
+    if first_name:
+        params["firstName"] = first_name
+    if last_name:
+        params["lastName"] = last_name
+    if company:
+        params["company"] = company
+    if not params:
+        return []
+    qs = "&".join(f"{k}={_urlparse.quote(str(v))}" for k, v in params.items())
+    req = _urlreq.Request(
+        f"https://api.lusha.com/v2/prospecting/contacts/search?{qs}",
+        headers={"Api-Key": key},
+    )
+    with _urlreq.urlopen(req, timeout=15) as r:
+        data = json.loads(r.read())
+    return data.get("data") or data.get("contacts") or []
+
+
+def _norm_apollo(p: dict) -> dict:
+    """Flatten an Apollo people-search result into a standard contact dict."""
+    org    = p.get("organization") or {}
+    phones = p.get("phone_numbers") or []
+    phone  = ""
+    if phones:
+        ph0   = phones[0]
+        phone = ((ph0.get("sanitized_number") or ph0.get("raw_number"))
+                 if isinstance(ph0, dict) else str(ph0))
+    return {
+        "name":          p.get("name", ""),
+        "title":         p.get("title", ""),
+        "email":         p.get("email", ""),
+        "email_status":  p.get("email_status", ""),
+        "phone":         phone or "",
+        "linkedin":      p.get("linkedin_url", ""),
+        "company":       org.get("name") or p.get("organization_name", ""),
+        "company_phone": org.get("phone", ""),
+        "domain":        org.get("primary_domain", ""),
+        "twitter":       p.get("twitter_url", ""),
+        "source":        "Apollo",
+    }
+
+
+def _norm_lusha(c: dict) -> dict:
+    """Flatten a Lusha prospecting result into a standard contact dict."""
+    def _first(lst):
+        if not lst: return ""
+        h = lst[0]
+        if isinstance(h, str): return h
+        return h.get("validatedEmail") or h.get("internationalNumber") or ""
+    co = c.get("company") or {}
+    return {
+        "name":          f"{c.get('firstName','')} {c.get('lastName','')}".strip(),
+        "title":         c.get("jobTitle") or c.get("title", ""),
+        "email":         _first(c.get("emailAddresses") or []),
+        "email_status":  "lusha",
+        "phone":         _first(c.get("phoneNumbers") or []),
+        "linkedin":      c.get("linkedInUrl", ""),
+        "company":       (co.get("name", "") if isinstance(co, dict) else str(co or "")),
+        "company_phone": (co.get("phone", "") if isinstance(co, dict) else ""),
+        "domain":        (co.get("domain", "") if isinstance(co, dict) else ""),
+        "twitter":       c.get("twitterUrl", ""),
+        "source":        "Lusha",
+    }
 
 
 def _calc_contact_confidence(email: str, email_sources: list, phone: str) -> int:
@@ -1487,6 +1586,290 @@ if _page == "🤝 Partners":
 # ══════════════════════════════════════════════════════════════════════════════
 if _page == "✅ Lead Verification":
     st.subheader("Lead Verification")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # CONTACT LOOKUP — name + company → Monday CRM → Apollo + Lusha enrichment
+    # ══════════════════════════════════════════════════════════════════════════
+    st.markdown("### 🔍 Contact Lookup")
+    st.caption(
+        "Search by name and/or company. "
+        "Checks Monday CRM first; if not found, enrich via Apollo + Lusha. "
+        "Company-only search surfaces key decision makers."
+    )
+
+    _lk1, _lk2, _lk3 = st.columns([3, 3, 1])
+    with _lk1:
+        _lk_name = st.text_input("👤 Person name (optional)",
+                                  key="lk_name", placeholder="e.g. John Smith")
+    with _lk2:
+        _lk_company = st.text_input("🏢 Company (optional)",
+                                     key="lk_company", placeholder="e.g. Absa Bank")
+    with _lk3:
+        st.write(""); st.write("")
+        _lk_run = st.button("🔍 Search", key="lk_run",
+                             type="primary", use_container_width=True)
+
+    if _lk_run:
+        _n = st.session_state.get("lk_name", "").strip()
+        _c = st.session_state.get("lk_company", "").strip()
+        if not _n and not _c:
+            st.warning("Enter a name, company, or both.")
+        else:
+            for _k0 in ("lk_crm", "lk_co", "lk_enrich", "lk_dm"):
+                st.session_state.pop(_k0, None)
+            if monday_active and _n:
+                with st.spinner("Checking Monday CRM…"):
+                    try:
+                        st.session_state["lk_crm"] = lookup_monday_crm(
+                            {"name": _n, "email": "", "linkedin": ""})
+                    except Exception:
+                        st.session_state["lk_crm"] = {"on_crm": False}
+            if monday_active and _c:
+                with st.spinner("Checking Monday Companies board…"):
+                    try:
+                        st.session_state["lk_co"] = lookup_monday_company(_c)
+                    except Exception:
+                        st.session_state["lk_co"] = {"found": False}
+
+    # ── CRM person result ─────────────────────────────────────────────────────
+    _lk_crm_r = st.session_state.get("lk_crm")
+    if _lk_crm_r is not None:
+        _lk_n_disp = st.session_state.get("lk_name", "")
+        if _lk_crm_r.get("on_crm"):
+            with st.container(border=True):
+                _lk_ra, _lk_rb = st.columns([4, 2])
+                with _lk_ra:
+                    st.success(f"✅ **{_lk_n_disp}** found on **{_lk_crm_r['crm_board']}** board")
+                    for _lk_fld, _lk_ico in [
+                        ("crm_title",       "💼"),
+                        ("crm_email",       "📧"),
+                        ("crm_phone",       "📞"),
+                        ("crm_linkedin",    "🔗"),
+                        ("crm_authority",   "🎯"),
+                        ("crm_heat",        "🔥"),
+                    ]:
+                        _v0 = _lk_crm_r.get(_lk_fld, "")
+                        if _v0 and str(_v0) not in ("", "nan", "None"):
+                            st.markdown(f"{_lk_ico} {_v0}")
+                    _lm = _lk_crm_r.get("crm_last_method", "")
+                    _ld = _lk_crm_r.get("crm_last_date", "")
+                    if _lm or _ld:
+                        st.caption(f"Last contact: {(_lm + ' ' + _ld).strip()}")
+                    if _lk_crm_r.get("crm_notes"):
+                        st.caption(f"📝 {_lk_crm_r['crm_notes'][:150]}")
+                with _lk_rb:
+                    if _lk_crm_r.get("crm_url"):
+                        st.markdown(f"[Open in Monday →]({_lk_crm_r['crm_url']})")
+        else:
+            st.warning(f"❌ **{_lk_n_disp}** not found in Monday CRM")
+            _has_apo = bool(st.secrets.get("APOLLO_API_KEY", "") or os.getenv("APOLLO_API_KEY", ""))
+            _has_lsh = bool(st.secrets.get("LUSHA_API_KEY",  "") or os.getenv("LUSHA_API_KEY",  ""))
+            if _has_apo or _has_lsh:
+                if st.button("🔍 Enrich via Apollo + Lusha", key="lk_enrich_btn",
+                             type="primary"):
+                    _enr: list = []
+                    _en  = st.session_state.get("lk_name", "").strip()
+                    _ec  = st.session_state.get("lk_company", "").strip()
+                    if _has_apo:
+                        with st.spinner("Searching Apollo…"):
+                            try:
+                                _enr += [_norm_apollo(p)
+                                         for p in _apollo_search_people(
+                                             name=_en, company=_ec, num=5)]
+                            except Exception as _ae:
+                                st.toast(f"Apollo: {str(_ae)[:80]}")
+                    if _has_lsh:
+                        with st.spinner("Enriching via Lusha…"):
+                            _np0 = _en.split()
+                            try:
+                                _l_raw = _lusha_search_contacts(
+                                    first_name=_np0[0] if _np0 else "",
+                                    last_name=_np0[-1] if len(_np0) > 1 else "",
+                                    company=_ec,
+                                )
+                                _apo_names = {x["name"].lower() for x in _enr}
+                                for _lc in _l_raw:
+                                    _ln = _norm_lusha(_lc)
+                                    if _ln["name"].lower() in _apo_names:
+                                        for _ex in _enr:
+                                            if _ex["name"].lower() == _ln["name"].lower():
+                                                if not _ex["email"] and _ln["email"]:
+                                                    _ex["email"] = _ln["email"]
+                                                    _ex["email_status"] = "lusha"
+                                                if not _ex["phone"] and _ln["phone"]:
+                                                    _ex["phone"] = _ln["phone"]
+                                                if not _ex["company_phone"] and _ln["company_phone"]:
+                                                    _ex["company_phone"] = _ln["company_phone"]
+                                                if "Lusha" not in _ex["source"]:
+                                                    _ex["source"] += " + Lusha"
+                                    else:
+                                        _enr.append(_ln)
+                            except Exception as _le:
+                                st.toast(f"Lusha: {str(_le)[:80]}")
+                    st.session_state["lk_enrich"] = _enr
+                    if not _enr:
+                        st.info("No results found. Try the LinkedIn Dork tab for manual search.")
+            else:
+                st.info("Add APOLLO_API_KEY or LUSHA_API_KEY to enable enrichment.")
+
+    # ── Companies board result ────────────────────────────────────────────────
+    _lk_co_r = st.session_state.get("lk_co")
+    if _lk_co_r is not None:
+        _lk_c_disp = st.session_state.get("lk_company", "")
+        if _lk_co_r.get("found"):
+            with st.container(border=True):
+                _co_a, _co_b = st.columns([4, 2])
+                with _co_a:
+                    st.success(f"✅ **{_lk_c_disp}** on Monday Companies board")
+                    if _lk_co_r.get("office_number"):
+                        st.markdown(f"📞 {_lk_co_r['office_number']}")
+                    if _lk_co_r.get("website"):
+                        st.markdown(f"🌐 {_lk_co_r['website']}")
+                    if _lk_co_r.get("linkedin"):
+                        st.markdown(f"🔗 {_lk_co_r['linkedin']}")
+                with _co_b:
+                    if _lk_co_r.get("company_url"):
+                        st.markdown(f"[Open in Monday →]({_lk_co_r['company_url']})")
+        else:
+            st.info(f"ℹ️ **{_lk_c_disp}** not on Monday Companies board")
+
+        if bool(st.secrets.get("APOLLO_API_KEY", "") or os.getenv("APOLLO_API_KEY", "")):
+            if st.button("👥 Find key decision makers at this company",
+                         key="lk_dm_btn", use_container_width=True):
+                with st.spinner(f"Searching Apollo for decision makers at {_lk_c_disp}…"):
+                    try:
+                        _dm_raw = _apollo_search_people(
+                            company=_lk_c_disp, num=8,
+                            titles=["CISO", "CTO", "CIO", "CEO", "IT Director",
+                                    "Head of IT", "IT Manager", "ICT Manager",
+                                    "Security Manager", "Head of Cybersecurity",
+                                    "VP Technology", "Group IT Manager"],
+                        )
+                        _dm_list = [_norm_apollo(p) for p in _dm_raw]
+                        st.session_state["lk_dm"] = _dm_list
+                        if not _dm_list:
+                            st.warning("No decision makers found via Apollo — "
+                                       "try the LinkedIn Dork tab for manual search.")
+                    except Exception as _dme:
+                        st.error(f"Apollo error: {_dme}")
+
+    # ── Contact cards (enrichment + decision makers) ──────────────────────────
+    def _render_contact_cards(cards: list, card_set_key: str) -> None:
+        if not cards:
+            return
+        for _ci, _cc in enumerate(cards):
+            if not _cc.get("name"):
+                continue
+            with st.container(border=True):
+                _cc_a, _cc_b = st.columns([3, 2])
+                with _cc_a:
+                    st.markdown(f"### 👤 {_cc['name']}")
+                    _role_parts = [x for x in [_cc.get("title"), _cc.get("company")] if x]
+                    if _role_parts:
+                        st.caption("💼 " + "  ·  ".join(_role_parts))
+                    if _cc.get("email"):
+                        _ev = " ✓" if _cc.get("email_status") in ("verified",) else ""
+                        st.markdown(f"📧 **{_cc['email']}**{_ev}")
+                    if _cc.get("phone"):
+                        st.markdown(f"📞 **{_cc['phone']}**")
+                    if _cc.get("company_phone"):
+                        st.markdown(f"🏢 **{_cc['company_phone']}** (company)")
+                    if _cc.get("linkedin"):
+                        st.markdown(f"[LinkedIn →]({_cc['linkedin']})")
+                    if _cc.get("twitter"):
+                        st.caption(f"Twitter: {_cc['twitter']}")
+                with _cc_b:
+                    st.caption(f"Source: {_cc.get('source', '—')}")
+                    if _cc.get("domain"):
+                        st.caption(f"Domain: {_cc['domain']}")
+                    if monday_active:
+                        _crm_sk = f"lk_cc_crm_{card_set_key}_{_ci}"
+                        if st.button("🔍 Check CRM",
+                                     key=f"lk_crm_btn_{card_set_key}_{_ci}",
+                                     use_container_width=True):
+                            with st.spinner("Checking Monday…"):
+                                try:
+                                    _cc_crm = lookup_monday_crm({
+                                        "name":    _cc.get("name", ""),
+                                        "email":   _cc.get("email", ""),
+                                        "linkedin":_cc.get("linkedin", ""),
+                                    })
+                                    st.session_state[_crm_sk] = _cc_crm
+                                except Exception:
+                                    st.session_state[_crm_sk] = {"on_crm": False}
+                        _cc_crm_r = st.session_state.get(_crm_sk)
+                        if _cc_crm_r is not None:
+                            if _cc_crm_r.get("on_crm"):
+                                st.success(f"✅ {_cc_crm_r['crm_board']}")
+                                if _cc_crm_r.get("crm_url"):
+                                    st.markdown(f"[Open →]({_cc_crm_r['crm_url']})")
+                            else:
+                                st.warning("❌ Not in CRM")
+
+                if monday_active:
+                    _pb1, _pb2 = st.columns(2)
+                    _push_pl = {
+                        "name":           _cc.get("name", ""),
+                        "title":          _cc.get("title", ""),
+                        "company":        _cc.get("company", ""),
+                        "email":          _cc.get("email", ""),
+                        "phone":          _cc.get("phone", ""),
+                        "linkedin":       _cc.get("linkedin", ""),
+                        "company_phone":  _cc.get("company_phone", ""),
+                        "twitter":        _cc.get("twitter", ""),
+                        "provider_chain": _cc.get("source", "Apollo/Lusha"),
+                    }
+                    with _pb1:
+                        if st.button("📋 Push to Leads",
+                                     key=f"lk_push_lead_{card_set_key}_{_ci}",
+                                     use_container_width=True):
+                            with st.spinner("Pushing to Leads board…"):
+                                try:
+                                    _res_l = sync_lead_to_monday(_push_pl)
+                                    st.success(f"{_res_l.get('action','done').title()} · "
+                                               f"ID {_res_l.get('item_id')}")
+                                except Exception as _ple:
+                                    st.error(f"Push failed: {_ple}")
+                    with _pb2:
+                        if st.button("🏢 Push to Contacts",
+                                     key=f"lk_push_contact_{card_set_key}_{_ci}",
+                                     use_container_width=True, type="primary"):
+                            with st.spinner("Pushing to Contacts board…"):
+                                try:
+                                    _res_c = push_to_contacts_board(_push_pl)
+                                    st.success(f"{_res_c.get('action','done').title()} · "
+                                               f"ID {_res_c.get('item_id')}")
+                                except Exception as _pce:
+                                    st.error(f"Push failed: {_pce}")
+
+                _lk_copy = [
+                    f"CONTACT: {_cc.get('name','')}",
+                    f"Title: {_cc.get('title','')}"         if _cc.get("title")         else "",
+                    f"Company: {_cc.get('company','')}"     if _cc.get("company")       else "",
+                    f"Email: {_cc.get('email','')}"         if _cc.get("email")         else "",
+                    f"Phone: {_cc.get('phone','')}"         if _cc.get("phone")         else "",
+                    f"Company Ph: {_cc.get('company_phone','')}" if _cc.get("company_phone") else "",
+                    f"LinkedIn: {_cc.get('linkedin','')}"   if _cc.get("linkedin")      else "",
+                    f"Twitter: {_cc.get('twitter','')}"     if _cc.get("twitter")       else "",
+                    f"Domain: {_cc.get('domain','')}"       if _cc.get("domain")        else "",
+                    f"Source: {_cc.get('source','')}",
+                ]
+                _copy_block("\n".join(l for l in _lk_copy if l),
+                            key=f"lk_copy_{card_set_key}_{_ci}")
+
+    for _set_key, _set_label in [("lk_enrich", "Enrichment results"),
+                                  ("lk_dm",     "Decision makers found")]:
+        _cards = st.session_state.get(_set_key)
+        if _cards:
+            st.divider()
+            st.markdown(f"**{len(_cards)} {_set_label}**")
+            _render_contact_cards(_cards, _set_key)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # PIPELINE VERIFICATION LOG
+    # ══════════════════════════════════════════════════════════════════════════
+    st.divider()
+    st.markdown("### 📋 Pipeline Verification Log")
     st.caption("Contacts verified or quarantined by the pipeline cascade.")
 
     df_lv = _load_lead_verifications()

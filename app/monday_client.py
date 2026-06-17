@@ -846,6 +846,97 @@ def lookup_monday_crm(contact: dict) -> dict:
     return {"on_crm": False}
 
 
+# ── Contacts board (2.0 - Contacts, id 3664655500) ───────────────────────────
+CONTACTS_BOARD_ID   = 3664655500
+CONTACTS_ACTIVE_GRP = "new_group49844"   # "Active Contact" (top group)
+
+_CONTACTS_AUTHORITY_MAP = {
+    "the one":        "The One",
+    "vito":           "VITO",
+    "decision maker": "Decision Maker",
+    "decision-maker": "Decision Maker",
+    "influencer":     "Influencer",
+    "advocate":       "Advocate",
+    "procurement":    "Procurement",
+}
+
+
+def lookup_monday_company(company_name: str) -> dict:
+    """Check the Companies board for a company by name.
+    Returns {'found': True, item_id, company_url, office_number, website, linkedin}
+    or {'found': False}."""
+    item_id = _find_company_by_name(company_name)
+    if not item_id:
+        return {"found": False}
+    cols = _get_item_column_texts(item_id, [
+        _CO_COL_OFFICE_NUMBER, _CO_COL_WEBSITE, _CO_COL_LINKEDIN,
+    ])
+    return {
+        "found":         True,
+        "item_id":       item_id,
+        "company_url":   f"https://{_MONDAY_SUBDOMAIN}.monday.com/boards/{COMPANIES_BOARD_ID}/pulses/{item_id}",
+        "office_number": cols.get(_CO_COL_OFFICE_NUMBER, ""),
+        "website":       cols.get(_CO_COL_WEBSITE, ""),
+        "linkedin":      cols.get(_CO_COL_LINKEDIN, ""),
+    }
+
+
+def push_to_contacts_board(contact: dict) -> dict:
+    """Push a contact to the Contacts board, group 'Active Contact'.
+    Dedupes by name → email → LinkedIn. Only fills empty columns on existing contacts.
+    Returns {'action': 'created'|'updated', 'item_id': ..., 'name': ...}."""
+    name      = str(contact.get("name") or "").strip()
+    if not name:
+        raise ValueError("contact must have a name")
+    email     = str(contact.get("email") or "").strip()
+    linkedin  = str(contact.get("linkedin") or "").strip()
+    phone     = str(contact.get("phone") or "").strip()
+    title     = str(contact.get("title") or "").strip()
+    authority = str(contact.get("authority") or "").strip().lower()
+
+    item_id = find_item_by_column(CONTACTS_BOARD_ID, "name", name)
+    if not item_id and email:
+        item_id = find_item_by_column(CONTACTS_BOARD_ID, "email", email)
+    if not item_id and linkedin:
+        item_id = find_item_by_column(CONTACTS_BOARD_ID, "link", linkedin)
+
+    cv: dict = {}
+    if title:
+        cv["title"] = title
+    if email:
+        cv["email"] = {"email": email, "text": email}
+    if phone:
+        cv["phone"] = phone
+    if linkedin:
+        cv["link"] = {"url": linkedin, "text": "LinkedIn"}
+    auth_label = _CONTACTS_AUTHORITY_MAP.get(authority)
+    if auth_label:
+        cv["priority"] = {"label": auth_label}
+
+    nl = "\n"
+    _body = (
+        f"**CRS Contact Lookup** | {_sched_dt_str()}{nl}"
+        f"Company: {contact.get('company', '')}{nl}"
+        f"Email: {email}{nl}"
+        f"Phone: {phone}"
+        + (f"{nl}Company Phone: {contact['company_phone']}" if contact.get("company_phone") else "")
+        + (f"{nl}Twitter: {contact['twitter']}"              if contact.get("twitter")        else "")
+        + f"{nl}Source: {contact.get('provider_chain', 'Apollo/Lusha')}"
+    )
+
+    if item_id:
+        existing = _get_item_column_texts(item_id, list(cv.keys()))
+        fill_cv  = {k: v for k, v in cv.items() if not existing.get(k)}
+        if fill_cv:
+            _update_item(CONTACTS_BOARD_ID, item_id, fill_cv)
+        _add_monday_update(item_id, CONTACTS_BOARD_ID, _body)
+        return {"action": "updated", "item_id": item_id, "name": name}
+
+    new_id = _create_item(CONTACTS_BOARD_ID, CONTACTS_ACTIVE_GRP, name, cv)
+    _add_monday_update(new_id, CONTACTS_BOARD_ID, _body)
+    return {"action": "created", "item_id": new_id, "name": name}
+
+
 def _sched_dt_str() -> str:
     """Return current datetime as a readable string."""
     import datetime
