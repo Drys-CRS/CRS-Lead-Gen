@@ -2031,12 +2031,13 @@ def _intel_ai_rate(company: str, country: str, event_type: str,
     prompt = f"""You are a sales intelligence AI for CRS (Cyber Retaliator Solutions),
 an African IBM Security / Red Hat / SUSE / CompTIA training & distribution partner.
 
-Rate this company as a CRS lead based on the cyber event below.
+Rate this African company as a CRS lead based on the cyber event below.
+Also extract any named individuals (executives, IT staff, spokespersons) mentioned.
 
 Company: {company}
 Country: {country}
 Event type: {event_type}
-Details: {description[:600]}
+Details: {description[:800]}
 
 Reply ONLY with valid JSON (no markdown fences):
 {{
@@ -2045,38 +2046,119 @@ Reply ONLY with valid JSON (no markdown fences):
   "urgency": "<high|medium|low>",
   "crs_solutions": ["solution1", "solution2"],
   "outreach_angle": "<1-2 sentence personalised cold-outreach hook>",
-  "rationale": "<2-3 sentences why this is a strong/weak lead for CRS>"
+  "rationale": "<2-3 sentences why this is a strong/weak lead for CRS>",
+  "persons_mentioned": [{{"name": "Full Name", "title": "Job Title or role"}}]
 }}"""
     try:
         raw = _call_ai(prompt)
         raw = re.sub(r"```[a-z]*\n?", "", raw).strip().rstrip("`")
         return json.loads(raw)
     except Exception:
-        return {"score": 0, "sector": "", "urgency": "low",
-                "crs_solutions": [], "outreach_angle": "", "rationale": "AI rating unavailable."}
+        return {"score": 0, "sector": "", "urgency": "low", "crs_solutions": [],
+                "outreach_angle": "", "rationale": "AI rating unavailable.",
+                "persons_mentioned": []}
+
+
+@st.cache_data(ttl=3600)
+def _intel_enrich_card(company: str, country: str, description: str) -> dict:
+    """Follow-up targeted searches for a specific company to get more context + named people."""
+    out: dict = {"snippets": [], "persons": [], "extra_urls": []}
+    all_text = description
+
+    # Two passes: incident context + leadership/security contacts
+    queries = [
+        f'"{company}" ({country} OR Africa) "cyber" OR "breach" OR "ransomware" OR "attack"',
+        f'"{company}" {country} CISO OR "IT Director" OR "Head of IT" OR "Chief Security" OR "IT Manager"',
+    ]
+    seen_urls: set = set()
+    for q in queries:
+        try:
+            for h in _news_search(q, num=5):
+                combined = f"{h.get('title','')} {h.get('snippet','')}".strip()
+                all_text += "\n" + combined
+                u = h.get("url", "")
+                if u and u not in seen_urls:
+                    seen_urls.add(u)
+                    out["snippets"].append({
+                        "title":   h.get("title", ""),
+                        "url":     u,
+                        "snippet": h.get("snippet", ""),
+                        "date":    h.get("date", ""),
+                    })
+                    out["extra_urls"].append(u)
+        except Exception:
+            pass
+
+    # Extract names from all collected text (regex) then deduplicate with AI-found names
+    out["persons"] = _extract_names(all_text)
+    out["snippets"] = out["snippets"][:8]
+    return out
 
 
 def _extract_company_from_news(title: str, snippet: str, country: str) -> str:
     """Best-effort company name extraction from a news headline or snippet."""
+    _stop = {w.lower() for w in country.split()} | {
+        "south", "north", "east", "west", "african", "africa", "the", "a", "an",
+        "data", "breach", "cyber", "attack", "hack", "ransomware", "leaked",
+    }
     for src in (title, snippet):
         for pat in [
-            r"^([A-Z][A-Za-z0-9 &',.-]{2,50}?)\s+(?:suffer|hit|target|report|disclose|confirm|face)",
-            r"^([A-Z][A-Za-z0-9 &',.-]{2,50}?)\s+data breach",
-            r"^([A-Z][A-Za-z0-9 &',.-]{2,50}?)\s+ransomware",
+            r"^([A-Z][A-Za-z0-9 &',./-]{2,60}?)\s+(?:suffer|hit|target|report|disclose|confirm|face|warn)",
+            r"^([A-Z][A-Za-z0-9 &',./-]{2,60}?)\s+(?:data breach|ransomware|cyber attack|hacked|leaked)",
+            r"([A-Z][A-Za-z0-9 &',./-]{2,60}?)\s+(?:data breach|ransomware|cyber attack|hacked|leaked)",
+            r"(?:breach|attack|hack)\s+at\s+([A-Z][A-Za-z0-9 &',./-]{2,60}?)(?:\s*[,:]|\s*$)",
+            r"([A-Z][A-Za-z0-9 &',./-]{2,60}?)\s+(?:customers?|clients?|employees?)\s+(?:data|records?)",
         ]:
             m = re.search(pat, src, re.IGNORECASE)
             if m:
-                return m.group(1).strip()
-    # Fall back to first capitalised phrase from title (skip the country name itself)
-    words = title.split()
+                name = m.group(1).strip().rstrip(" ,-")
+                # Strip trailing country-name words
+                name_words = [w for w in name.split()
+                              if w.lower().rstrip(",:;") not in _stop]
+                if name_words:
+                    return " ".join(name_words[:6])
+    # Fall back to first capitalised run (skip stop words)
     caps = []
-    for w in words:
-        if w[0].isupper() if w else False:
-            if w.lower() not in country.lower().split():
-                caps.append(w.rstrip(",:;"))
+    for w in title.split():
+        wc = w.rstrip(",:;")
+        if wc and wc[0].isupper() and wc.lower() not in _stop:
+            caps.append(wc)
         elif caps:
             break
     return " ".join(caps[:5]) if caps else title[:60]
+
+
+def _extract_names(text: str) -> list:
+    """Extract named individuals with titles from incident/news text."""
+    _title_words = (
+        r"CEO|CTO|CFO|CIO|CISO|COO|MD|Director|Head|Manager|Spokesperson|"
+        r"President|Chairman|Secretary|Minister|VP|Executive|Officer|spokesperson"
+    )
+    seen: set = set()
+    results: list = []
+    for pat in [
+        # "CISO John Smith" / "Director Jane Doe"
+        rf'\b({_title_words})\s+([A-Z][a-z]{{2,}}(?:\s+[A-Z][a-z]{{2,}}){{1,2}})',
+        # "John Smith, CISO" / "Jane Doe, Director"
+        rf'\b([A-Z][a-z]{{2,}}(?:\s+[A-Z][a-z]{{2,}}){{1,2}}),?\s+({_title_words})',
+        # "said John Smith" / "told John Smith"
+        r'\b(?:said|told|according to|confirmed by)\s+([A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,}){1,2})',
+    ]:
+        for m in re.finditer(pat, text):
+            groups = m.groups()
+            # Determine which group is the name
+            name = groups[1] if len(groups) > 1 and groups[1][0].isupper() else groups[0]
+            title_str = groups[0] if name == groups[-1] else (groups[-1] if len(groups) > 1 else "")
+            name = name.strip()
+            if len(name) < 5 or name.lower() in seen:
+                continue
+            seen.add(name.lower())
+            results.append({"name": name, "title": title_str.strip()})
+            if len(results) >= 8:
+                break
+        if len(results) >= 8:
+            break
+    return results
 
 
 _INTEL_COUNTRIES = [
@@ -2186,22 +2268,25 @@ if _page == "🛡️ Lead Intelligence":
                     except Exception as _fe2:
                         st.toast(f"Flare error for {_ic}: {str(_fe2)[:80]}")
 
-                # Google News
+                # Google News — restrict to African context
                 if _i_src_google:
                     try:
-                        _gq = f'"{_ic}" {_INTEL_GOOGLE_TERMS}'
+                        _gq = f'"{_ic}" Africa {_INTEL_GOOGLE_TERMS}'
                         _gnews = _news_search(_gq, num=int(_i_per_ctry))
                         for _gn in _gnews:
                             _co2 = _extract_company_from_news(
                                 _gn["title"], _gn["snippet"], _ic)
+                            _full_desc = f"{_gn['title']} — {_gn['snippet']}"
+                            _names_in_item = _extract_names(_full_desc)
                             _intel_raw.append({
-                                "company":     _co2,
-                                "country":     _ic,
-                                "event_type":  "news",
-                                "date":        _gn.get("date",""),
-                                "description": f"{_gn['title']} — {_gn['snippet']}",
-                                "url":         _gn["url"],
-                                "source":      "Google News",
+                                "company":          _co2,
+                                "country":          _ic,
+                                "event_type":       "news",
+                                "date":             _gn.get("date", ""),
+                                "description":      _full_desc,
+                                "url":              _gn["url"],
+                                "source":           "Google News",
+                                "persons_found":    _names_in_item,
                             })
                     except Exception as _ge:
                         st.toast(f"Google error for {_ic}: {str(_ge)[:80]}")
@@ -2255,9 +2340,10 @@ if _page == "🛡️ Lead Intelligence":
                         _sc = int(_rated.get("score") or 0)
                         _bar3 = "█" * (_sc // 10) + "░" * (10 - _sc // 10)
                         st.markdown(f"**AI Score: `{_bar3}` {_sc}%**")
-                        _urg = _rated.get("urgency","low")
+                        _urg = _rated.get("urgency", "low")
                         st.session_state[f"{_ir_key}_urgency"] = _urg
-                        _urg_lbl = {"high":"🔴 High","medium":"🟡 Medium","low":"🟢 Low"}.get(_urg, _urg)
+                        _urg_lbl = {"high": "🔴 High", "medium": "🟡 Medium",
+                                    "low": "🟢 Low"}.get(_urg, _urg)
                         st.caption(f"Urgency: {_urg_lbl}")
                         if _rated.get("sector"):
                             st.caption(f"Sector: {_rated['sector']}")
@@ -2274,6 +2360,20 @@ if _page == "🛡️ Lead Intelligence":
                                     st.rerun()
                                 except Exception as _ae:
                                     st.error(f"AI error: {_ae}")
+                    # Enrich button always visible
+                    if not st.session_state.get(f"{_ir_key}_enriched"):
+                        if st.button("🔎 Enrich card", key=f"{_ir_key}_enrich",
+                                     use_container_width=True,
+                                     help="Search web for more context, news, and named contacts"):
+                            with st.spinner("Searching for more context…"):
+                                try:
+                                    _enr_data = _intel_enrich_card(
+                                        _ir["company"], _ir["country"],
+                                        _ir.get("description", ""))
+                                    st.session_state[f"{_ir_key}_enriched"] = _enr_data
+                                    st.rerun()
+                                except Exception as _ene:
+                                    st.error(f"Enrichment error: {_ene}")
 
                 # ── AI detail (if rated) ───────────────────────────────────
                 _rated2 = st.session_state.get(f"{_ir_key}_rated")
@@ -2290,12 +2390,119 @@ if _page == "🛡️ Lead Intelligence":
                         if _rated2.get("rationale"):
                             st.caption(_rated2["rationale"])
 
+                # ── Named persons (from initial search + AI rating) ────────
+                _init_persons = _ir.get("persons_found") or []
+                _ai_persons   = (_rated2 or {}).get("persons_mentioned") or []
+                # Merge, deduplicate by name
+                _all_persons: list = []
+                _seen_pnames: set  = set()
+                for _p in _init_persons + _ai_persons:
+                    _pn = (_p.get("name") or "").strip()
+                    if _pn and _pn.lower() not in _seen_pnames:
+                        _seen_pnames.add(_pn.lower())
+                        _all_persons.append(_p)
+                if _all_persons:
+                    st.divider()
+                    st.markdown("**Named individuals mentioned:**")
+                    for _np in _all_persons:
+                        _np_name  = _np.get("name", "")
+                        _np_title = _np.get("title", "")
+                        _np_lbl   = f"👤 **{_np_name}**" + (f"  ·  {_np_title}" if _np_title else "")
+                        _npc1, _npc2 = st.columns([3, 2])
+                        with _npc1:
+                            st.markdown(_np_lbl)
+                        with _npc2:
+                            _np_q = (f'site:linkedin.com/in "{_np_name}" '
+                                     f'"{_ir["company"]}" "{_ir["country"]}"')
+                            if st.button("🔍 Find on LinkedIn",
+                                         key=f"{_ir_key}_np_{_np_name[:20]}",
+                                         use_container_width=True):
+                                with st.spinner(f"Searching LinkedIn for {_np_name}…"):
+                                    try:
+                                        _np_profs = _dork_search(_np_q, num=3)
+                                        if _np_profs:
+                                            # Prepend to contacts list
+                                            _existing = st.session_state.get(
+                                                f"{_ir_key}_contacts", [])
+                                            _new_urls = {p["url"] for p in _existing}
+                                            for _np2 in _np_profs:
+                                                if _np2["url"] not in _new_urls:
+                                                    _existing.append(_np2)
+                                                    _upsert_dork_lead({
+                                                        "linkedin_url":     _np2["url"],
+                                                        "name":             _np2["name"],
+                                                        "job_title":        _np_title or _np2.get("job_title"),
+                                                        "company":          _ir["company"],
+                                                        "last_searched_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+                                                    })
+                                            st.session_state[f"{_ir_key}_contacts"] = _existing
+                                            st.rerun()
+                                        else:
+                                            st.toast(f"No LinkedIn profiles found for {_np_name}")
+                                    except Exception as _npe:
+                                        st.error(f"Search failed: {_npe}")
+
+                # ── Enrichment panel ───────────────────────────────────────
+                _enriched = st.session_state.get(f"{_ir_key}_enriched")
+                if _enriched:
+                    st.divider()
+                    # Extra persons from enrichment (merge with already-shown)
+                    _enr_persons = [p for p in (_enriched.get("persons") or [])
+                                    if p.get("name","").lower() not in _seen_pnames]
+                    if _enr_persons:
+                        st.markdown("**Additional named individuals (enrichment):**")
+                        for _ep in _enr_persons:
+                            _ep_name  = _ep.get("name", "")
+                            _ep_title = _ep.get("title", "")
+                            _epc1, _epc2 = st.columns([3, 2])
+                            with _epc1:
+                                st.markdown(f"👤 **{_ep_name}**" +
+                                            (f"  ·  {_ep_title}" if _ep_title else ""))
+                            with _epc2:
+                                _ep_q = (f'site:linkedin.com/in "{_ep_name}" '
+                                         f'"{_ir["company"]}" "{_ir["country"]}"')
+                                if st.button("🔍 Find on LinkedIn",
+                                             key=f"{_ir_key}_ep_{_ep_name[:20]}",
+                                             use_container_width=True):
+                                    with st.spinner(f"Searching for {_ep_name}…"):
+                                        try:
+                                            _ep_profs = _dork_search(_ep_q, num=3)
+                                            if _ep_profs:
+                                                _existing2 = st.session_state.get(
+                                                    f"{_ir_key}_contacts", [])
+                                                _ex_urls2 = {p["url"] for p in _existing2}
+                                                for _ep2 in _ep_profs:
+                                                    if _ep2["url"] not in _ex_urls2:
+                                                        _existing2.append(_ep2)
+                                                        _upsert_dork_lead({
+                                                            "linkedin_url":     _ep2["url"],
+                                                            "name":             _ep2["name"],
+                                                            "job_title":        _ep_title or _ep2.get("job_title"),
+                                                            "company":          _ir["company"],
+                                                            "last_searched_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+                                                        })
+                                                st.session_state[f"{_ir_key}_contacts"] = _existing2
+                                                st.rerun()
+                                        except Exception as _epe:
+                                            st.error(f"Search failed: {_epe}")
+                    # Extra news snippets
+                    _enr_snips = _enriched.get("snippets") or []
+                    if _enr_snips:
+                        with st.expander(f"📰 {len(_enr_snips)} additional sources", expanded=False):
+                            for _es in _enr_snips:
+                                st.markdown(f"**[{_es.get('title','—')}]({_es.get('url','#')})**")
+                                if _es.get("snippet"):
+                                    st.caption(_es["snippet"][:200])
+                                if _es.get("date"):
+                                    st.caption(_es["date"])
+                                st.write("")
+
                 st.divider()
 
-                # ── Contact discovery ──────────────────────────────────────
+                # ── Contact discovery (LinkedIn dork) ──────────────────────
                 _contacts_found = st.session_state.get(f"{_ir_key}_contacts", [])
                 if _contacts_found:
-                    st.markdown(f"**{len(_contacts_found)} contacts found:**")
+                    st.markdown(f"**{len(_contacts_found)} LinkedIn contacts found:**")
                     for _cf_idx, _cf in enumerate(_contacts_found):
                         _cfk = f"{_ir_key}_cf_{_cf_idx}"
                         with st.expander(f"👤 {_cf.get('name','')}  ·  {_cf.get('job_title','')}",
@@ -2321,19 +2528,18 @@ if _page == "🛡️ Lead Intelligence":
                                         try:
                                             _enr2 = _cascade_find_contact(
                                                 _cf["name"], _cf["url"],
-                                                company=_cf.get("company",""))
+                                                company=_cf.get("company", ""))
                                             st.session_state[f"{_cfk}_enr"] = _enr2
-                                            # Persist to dork_leads
                                             _upsert_dork_lead({
-                                                "linkedin_url": _cf["url"],
-                                                "name":         _cf["name"],
-                                                "job_title":    _cf.get("job_title"),
-                                                "company":      _cf.get("company"),
-                                                "email":        _enr2.get("email"),
-                                                "phone":        _enr2.get("phone"),
-                                                "confidence":   _enr2.get("confidence",0),
-                                                "email_sources": json.dumps(_enr2.get("email_sources",[])),
-                                                "phone_sources": json.dumps(_enr2.get("phone_sources",[])),
+                                                "linkedin_url":    _cf["url"],
+                                                "name":            _cf["name"],
+                                                "job_title":       _cf.get("job_title"),
+                                                "company":         _cf.get("company"),
+                                                "email":           _enr2.get("email"),
+                                                "phone":           _enr2.get("phone"),
+                                                "confidence":      _enr2.get("confidence", 0),
+                                                "email_sources":   json.dumps(_enr2.get("email_sources", [])),
+                                                "phone_sources":   json.dumps(_enr2.get("phone_sources", [])),
                                                 "last_searched_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
                                             })
                                             st.rerun()
@@ -2344,13 +2550,13 @@ if _page == "🛡️ Lead Intelligence":
                                              key=f"{_cfk}_push", use_container_width=True,
                                              type="primary"):
                                     _intel_push = {
-                                        "name":     _cf["name"],
-                                        "title":    _cf.get("job_title",""),
-                                        "company":  _cf.get("company",""),
-                                        "email":    _cf_enr.get("email",""),
-                                        "phone":    _cf_enr.get("phone",""),
-                                        "linkedin": _cf["url"],
-                                        "accuracy_score": str(_cf_conf),
+                                        "name":           _cf["name"],
+                                        "title":          _cf.get("job_title", ""),
+                                        "company":        _cf.get("company", ""),
+                                        "email":          _cf_enr.get("email", ""),
+                                        "phone":          _cf_enr.get("phone", ""),
+                                        "linkedin":       _cf["url"],
+                                        "accuracy_score": str(int(_cf_enr.get("confidence") or 0)),
                                         "provider_chain": "Lead Intelligence",
                                     }
                                     with st.spinner("Pushing…"):
@@ -2362,7 +2568,7 @@ if _page == "🛡️ Lead Intelligence":
                                             st.error(f"Push failed: {_pe4}")
 
                 else:
-                    # Find contacts button
+                    # Find contacts button (no contacts yet)
                     _fc1b, _fc2b = st.columns(2)
                     with _fc1b:
                         _i_title_hint = st.text_input(
