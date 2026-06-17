@@ -639,7 +639,7 @@ def _apollo_search_people(name: str = "", company: str = "",
     payload: dict = {"per_page": num, "page": 1}
     if kw:     payload["q_keywords"]    = kw
     if titles: payload["person_titles"] = titles
-    return _apollo_post("mixed_people/search", payload).get("people") or []
+    return _apollo_post("people/search", payload).get("people") or []
 
 
 def _norm_apollo(p: dict) -> dict:
