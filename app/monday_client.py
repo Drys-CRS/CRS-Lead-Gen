@@ -738,9 +738,8 @@ def sync_lead_to_monday(contact: dict) -> dict:
     if not item_id and linkedin:
         item_id = find_item_by_column(LEADS_BOARD_ID, _LEAD_COL_LINKEDIN, linkedin)
 
-    note_line = (f"[{_sched_dt_str()}] CRS outreach: {opener}" if opener
-                 else f"[{_sched_dt_str()}] Verified via CRS Lead Gen "
-                      f"({contact.get('provider_chain','')})")
+    note_line = _contact_note_line({**contact, "source_context":
+                    contact.get("source_context") or (f"CRS outreach: {opener}" if opener else "")})
 
     def _fill(existing: dict) -> dict:
         """Build column values; on existing items only set columns that are empty."""
@@ -847,8 +846,9 @@ def lookup_monday_crm(contact: dict) -> dict:
 
 
 # ── Contacts board (2.0 - Contacts, id 3664655500) ───────────────────────────
-CONTACTS_BOARD_ID   = 3664655500
-CONTACTS_ACTIVE_GRP = "new_group49844"   # "Active Contact" (top group)
+CONTACTS_BOARD_ID    = 3664655500
+CONTACTS_ACTIVE_GRP  = "new_group49844"   # "Active Contact" (top group)
+_CONTACTS_NOTES_COL  = "text0"            # Contact Notes text column
 
 _CONTACTS_AUTHORITY_MAP = {
     "the one":        "The One",
@@ -881,9 +881,24 @@ def lookup_monday_company(company_name: str) -> dict:
     }
 
 
+def _contact_note_line(contact: dict) -> str:
+    """One-line note entry written to the Notes column on any board."""
+    ts       = _sched_dt_str()
+    provider = contact.get("provider_chain") or contact.get("source") or "Apollo"
+    ctx      = contact.get("source_context", "")
+    company  = contact.get("company", "")
+    parts = [f"[{ts}]", f"via {provider}"]
+    if ctx:
+        parts.append(ctx)
+    if company:
+        parts.append(f"Company: {company}")
+    return " | ".join(parts)
+
+
 def push_to_contacts_board(contact: dict) -> dict:
     """Push a contact to the Contacts board, group 'Active Contact'.
     Dedupes by name → email → LinkedIn. Only fills empty columns on existing contacts.
+    Appends a sourced note to the Contact Notes column on every push.
     Returns {'action': 'created'|'updated', 'item_id': ..., 'name': ...}."""
     name      = str(contact.get("name") or "").strip()
     if not name:
@@ -914,6 +929,8 @@ def push_to_contacts_board(contact: dict) -> dict:
         cv["priority"] = {"label": auth_label}
 
     nl = "\n"
+    provider = contact.get("provider_chain") or "Apollo"
+    ctx      = contact.get("source_context", "")
     _body = (
         f"**CRS Contact Lookup** | {_sched_dt_str()}{nl}"
         f"Company: {contact.get('company', '')}{nl}"
@@ -921,17 +938,25 @@ def push_to_contacts_board(contact: dict) -> dict:
         f"Phone: {phone}"
         + (f"{nl}Company Phone: {contact['company_phone']}" if contact.get("company_phone") else "")
         + (f"{nl}Twitter: {contact['twitter']}"              if contact.get("twitter")        else "")
-        + f"{nl}Source: {contact.get('provider_chain', 'Apollo/Lusha')}"
+        + f"{nl}Source: {provider}"
+        + (f"{nl}Context: {ctx}" if ctx else "")
     )
 
+    note_line = _contact_note_line(contact)
+
     if item_id:
-        existing = _get_item_column_texts(item_id, list(cv.keys()))
-        fill_cv  = {k: v for k, v in cv.items() if not existing.get(k)}
-        if fill_cv:
-            _update_item(CONTACTS_BOARD_ID, item_id, fill_cv)
+        read_cols = list(cv.keys()) + [_CONTACTS_NOTES_COL]
+        existing  = _get_item_column_texts(item_id, read_cols)
+        fill_cv   = {k: v for k, v in cv.items() if not existing.get(k)}
+        cur_notes = existing.get(_CONTACTS_NOTES_COL, "")
+        fill_cv[_CONTACTS_NOTES_COL] = (
+            (cur_notes + "\n" if cur_notes else "") + note_line
+        )[:2000]
+        _update_item(CONTACTS_BOARD_ID, item_id, fill_cv)
         _add_monday_update(item_id, CONTACTS_BOARD_ID, _body)
         return {"action": "updated", "item_id": item_id, "name": name}
 
+    cv[_CONTACTS_NOTES_COL] = note_line[:2000]
     new_id = _create_item(CONTACTS_BOARD_ID, CONTACTS_ACTIVE_GRP, name, cv)
     _add_monday_update(new_id, CONTACTS_BOARD_ID, _body)
     return {"action": "created", "item_id": new_id, "name": name}

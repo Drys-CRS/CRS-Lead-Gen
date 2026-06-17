@@ -1840,16 +1840,23 @@ if _page == "✅ Lead Verification":
 
                     # ── Actions ───────────────────────────────────────────
                     if monday_active:
+                        _src_n = st.session_state.get("lk_name","").strip()
+                        _src_c = st.session_state.get("lk_company","").strip()
+                        _src_ctx = "Lead Verification tab"
+                        if _src_n: _src_ctx += f" | search: \"{_src_n}\""
+                        if _src_c: _src_ctx += f" | company: \"{_src_c}\""
+                        if key_prefix == "dm": _src_ctx += " | decision maker search"
                         _push_pl = {
-                            "name":          _cc.get("name",""),
-                            "title":         _cc.get("title",""),
-                            "company":       _cc.get("company",""),
-                            "email":         _cc.get("email","") or st.session_state.get(_em_sk,{}).get("email",""),
-                            "phone":         _cc.get("phone","") or st.session_state.get(_ph_sk,{}).get("phone",""),
-                            "linkedin":      _cc.get("linkedin",""),
-                            "company_phone": _cc.get("company_phone",""),
-                            "twitter":       _cc.get("twitter",""),
-                            "provider_chain":_cc.get("source","Apollo/Lusha"),
+                            "name":           _cc.get("name",""),
+                            "title":          _cc.get("title",""),
+                            "company":        _cc.get("company",""),
+                            "email":          _cc.get("email","") or st.session_state.get(_em_sk,{}).get("email",""),
+                            "phone":          _cc.get("phone","") or st.session_state.get(_ph_sk,{}).get("phone",""),
+                            "linkedin":       _cc.get("linkedin",""),
+                            "company_phone":  _cc.get("company_phone",""),
+                            "twitter":        _cc.get("twitter",""),
+                            "provider_chain": _cc.get("source","Apollo"),
+                            "source_context": _src_ctx,
                         }
                         _pa, _pb, _pc = st.columns(3)
                         with _pa:
