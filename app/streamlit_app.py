@@ -2928,12 +2928,16 @@ _INTEL_COUNTRIES = [
     "Sierra Leone", "The Gambia", "Liberia", "Cameroon", "Senegal",
 ]
 
+# Flare v4 enum values — confirmed valid from API validation errors:
+# 'attachment', 'listing', 'ransomleak' and likely: 'chat', 'credential', 'paste', 'stealer_log'
 _INTEL_EVENT_TYPES = {
-    "Ransomware":         "ransomleak",
-    "Credential Leak":    "leaked-credential",
-    "Dark Web Mention":   "chat-message",
+    "Ransomware":         "ransomleak",    # ✓ confirmed
+    "Credential Leak":    "credential",    # was "leaked-credential" — invalid
+    "Dark Web Chat":      "chat",          # was "chat-message" — invalid
     "Paste / Dump":       "paste",
-    "Stealer Log":        "stealer-log",
+    "Stealer Log":        "stealer_log",   # was "stealer-log" (hyphen invalid)
+    "Market Listing":     "listing",       # ✓ confirmed
+    "Forum Attachment":   "attachment",    # ✓ confirmed
 }
 
 _INTEL_GOOGLE_TERMS = (
@@ -2968,7 +2972,7 @@ if _page == "🛡️ Lead Intelligence":
             st.session_state["intel_evt_types"] = list(_INTEL_EVENT_TYPES.keys())
         elif not st.session_state.get("intel_evt_all"):
             st.session_state.setdefault("intel_evt_types",
-                                        ["Ransomware", "Credential Leak", "Dark Web Mention"])
+                                        ["Ransomware", "Credential Leak", "Dark Web Chat"])
         _i_evt_labels = st.multiselect("Event types", list(_INTEL_EVENT_TYPES.keys()),
                                        key="intel_evt_types")
 
