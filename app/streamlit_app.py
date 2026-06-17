@@ -433,12 +433,6 @@ def _load_lead_verifications() -> pd.DataFrame:
          .order("run_at", desc=True).limit(500).execute())
     return pd.DataFrame(r.data or [])
 
-@st.cache_data(ttl=120)
-def _load_pipeline_runs() -> pd.DataFrame:
-    r = (supabase.table("pipeline_runs").select("*")
-         .order("run_at", desc=True).limit(10).execute())
-    return pd.DataFrame(r.data or [])
-
 @st.cache_data(ttl=30)
 def _load_dork_leads_bulk(urls_tuple: tuple) -> dict:
     if not urls_tuple:
@@ -704,6 +698,23 @@ def _calc_contact_confidence(email: str, email_sources: list, phone: str) -> int
     return min(score, 100)
 
 
+def _auto_crm_check(name: str, email: str, linkedin: str, state_key: str) -> dict | None:
+    """Check Monday CRM once per contact; result cached in session state.
+    Returns the CRM dict (with on_crm flag) or None if Monday not active."""
+    if not monday_active:
+        return None
+    if state_key in st.session_state:
+        return st.session_state[state_key]
+    if not (name or email or linkedin):
+        return None
+    try:
+        result = lookup_monday_crm({"name": name, "email": email, "linkedin": linkedin})
+    except Exception:
+        result = {"on_crm": False}
+    st.session_state[state_key] = result
+    return result
+
+
 def _cascade_find_contact(name: str, linkedin_url: str,
                            company: str = "", domain_hint: str = "") -> dict:
     """Apollo → Hunter → Lusha → pattern-guess. Returns aggregated contact data + confidence."""
@@ -850,10 +861,9 @@ def _pull_worker(env_overrides: dict, countries_sel: list | None = None) -> None
 # ─────────────────────────────────────────────────────────────────────────────
 
 _NAV_PAGES = [
-    "🏠 Overview",
+    "✅ Lead Verification",
     "📢 Opportunities",
     "🤝 Partners",
-    "✅ Lead Verification",
     "🔍 LinkedIn Dork",
     "🛡️ Lead Intelligence",
 ]
@@ -864,6 +874,16 @@ with st.sidebar:
         st.image(_logo, width=160)
     st.title("CRS Intelligence")
     st.caption("v2 · scrape on-demand or via nightly schedule")
+    st.divider()
+
+    # ── Region toggle ─────────────────────────────────────────────────────────
+    _region_na = st.toggle(
+        "🇺🇸 North America mode",
+        key="region_na",
+        help="Switch Lead Intelligence data feeds and country lists between Africa and North America",
+    )
+    if _region_na:
+        st.caption("🗺️ North America feeds active")
     st.divider()
 
     # ── Navigation (menu-style buttons) ──────────────────────────────────────
@@ -1076,51 +1096,7 @@ with st.sidebar:
                     st.error(f"Analysis failed: {_e}")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PAGE 1 — OVERVIEW
-# ══════════════════════════════════════════════════════════════════════════════
-if _page == "🏠 Overview":
-    st.subheader("CRS Tender Intelligence — Overview")
-    st.caption("Africa-wide government tender intelligence — active tenders, historical awards, and AI partner intelligence.")
-
-    df_t   = _load_tenders()
-    df_aw  = _load_awarded()
-    df_run = _load_pipeline_runs()
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Open tenders",     len(df_t))
-    c2.metric("Awarded tenders",  len(df_aw))
-    c3.metric("Countries (open)", df_t["country"].nunique() if "country" in df_t.columns else 0)
-    last = df_run.iloc[0].to_dict() if not df_run.empty else {}
-    c4.metric("Last pipeline", last.get("status", "—"))
-
-    st.divider()
-    st.markdown("#### Top-scored open tenders")
-    if df_t.empty:
-        st.info("No open tenders found. The nightly pipeline populates this.")
-    else:
-        score_col = "ai_score" if "ai_score" in df_t.columns else None
-        if score_col:
-            top = (df_t.assign(_s=pd.to_numeric(df_t[score_col], errors="coerce"))
-                   .sort_values("_s", ascending=False).drop(columns="_s").head(15))
-        else:
-            top = df_t.head(15)
-        show = [c for c in ["tender_number", "department_name", "title",
-                             "country", "closing_date", "ai_score"] if c in top.columns]
-        st.dataframe(top[show], use_container_width=True, hide_index=True)
-
-    if not df_run.empty:
-        st.divider()
-        st.markdown("#### Recent pipeline runs")
-        show_r = [c for c in ["run_at", "trigger", "status",
-                               "tenders_scraped", "tenders_scored", "duration_secs"]
-                  if c in df_run.columns]
-        st.dataframe(df_run[show_r] if show_r else df_run,
-                     use_container_width=True, hide_index=True)
-        with st.expander("Last run error log"):
-            st.text(last.get("error_log") or "—")
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PAGE 2 — OPPORTUNITIES
+# PAGE — OPPORTUNITIES
 # ══════════════════════════════════════════════════════════════════════════════
 if _page == "📢 Opportunities":
     st.subheader("Open Opportunities")
@@ -1672,6 +1648,15 @@ if _page == "✅ Lead Verification":
                 _xref_sk = f"lk_xref_{key_prefix}_{_ci}"
                 _disp_name = _cc.get("name") or f"Contact {_ci+1}"
 
+                # ── Auto CRM check (fires once, cached in session state) ──
+                _crm_r = _auto_crm_check(
+                    _cc.get("name",""), _cc.get("email",""),
+                    _cc.get("linkedin",""), _crm_sk,
+                )
+                # Pull any free contact data from Monday
+                _mon_email = (_crm_r.get("crm_email","") if _crm_r and _crm_r.get("on_crm") else "")
+                _mon_phone = (_crm_r.get("crm_phone","") if _crm_r and _crm_r.get("on_crm") else "")
+
                 with st.container(border=True):
                     _hA, _hB = st.columns([4, 2])
                     with _hA:
@@ -1683,23 +1668,9 @@ if _page == "✅ Lead Verification":
                         if _cc.get("twitter"):  st.caption(f"Twitter: {_cc['twitter']}")
                     with _hB:
                         st.caption(f"🔵 {_cc.get('source','Apollo')}")
-                        # Monday CRM tag
-                        _crm_r = st.session_state.get(_crm_sk)
-                        if monday_active:
-                            if _crm_r is None:
-                                if st.button("📋 Check CRM", key=f"lk_crm_btn_{key_prefix}_{_ci}",
-                                             use_container_width=True):
-                                    with st.spinner("Checking Monday…"):
-                                        try:
-                                            st.session_state[_crm_sk] = lookup_monday_crm({
-                                                "name":     _cc.get("name",""),
-                                                "email":    _cc.get("email",""),
-                                                "linkedin": _cc.get("linkedin",""),
-                                            })
-                                        except Exception:
-                                            st.session_state[_crm_sk] = {"on_crm": False}
-                                    st.rerun()
-                            elif _crm_r.get("on_crm"):
+                        # Monday CRM badge — auto-populated
+                        if _crm_r:
+                            if _crm_r.get("on_crm"):
                                 st.success(f"📋 {_crm_r['crm_board']}")
                                 if _crm_r.get("crm_url"):
                                     st.markdown(f"[Open →]({_crm_r['crm_url']})")
@@ -1709,13 +1680,18 @@ if _page == "✅ Lead Verification":
                     # ── Email + Phone row ─────────────────────────────────
                     _fA, _fB = st.columns(2)
                     with _fA:
-                        _em_val = (_cc.get("email")
+                        # Monday free → Apollo search result → Apollo enrichment
+                        _em_val = (_cc.get("email") or _mon_email
                                    or st.session_state.get(_em_sk, {}).get("email",""))
+                        _em_src = ("Apollo" if _cc.get("email")
+                                   else "Monday" if _mon_email
+                                   else st.session_state.get(_em_sk, {}).get("source",""))
                         if _em_val:
-                            _ev = " ✓" if _cc.get("email_status") == "verified" else ""
+                            _ev = " ✓" if (_cc.get("email_status") == "verified"
+                                           or _em_src == "Monday") else ""
                             st.markdown(f"📧 **{_em_val}**{_ev}")
-                            if st.session_state.get(_em_sk, {}).get("source"):
-                                st.caption(f"via {st.session_state[_em_sk]['source']}")
+                            if _em_src:
+                                st.caption(f"via {_em_src}")
                         else:
                             if _cc.get("has_email"):
                                 st.caption("📧 Available · ⚡ 1 credit")
@@ -1741,12 +1717,16 @@ if _page == "✅ Lead Verification":
                                         st.toast(f"Apollo: {str(_ee)[:80]}")
                                 st.rerun()
                     with _fB:
-                        _ph_val = (_cc.get("phone")
+                        # Monday free → Apollo search result → Apollo enrichment
+                        _ph_val = (_cc.get("phone") or _mon_phone
                                    or st.session_state.get(_ph_sk, {}).get("phone",""))
+                        _ph_src = ("Apollo" if _cc.get("phone")
+                                   else "Monday" if _mon_phone
+                                   else st.session_state.get(_ph_sk, {}).get("source",""))
                         if _ph_val:
                             st.markdown(f"📞 **{_ph_val}**")
-                            if st.session_state.get(_ph_sk, {}).get("source"):
-                                st.caption(f"via {st.session_state[_ph_sk]['source']}")
+                            if _ph_src:
+                                st.caption(f"via {_ph_src}")
                         else:
                             _hp = _cc.get("has_phone","")
                             if _hp == "yes":
@@ -1764,7 +1744,7 @@ if _page == "✅ Lead Verification":
                                             name=_cc.get("name",""),
                                             linkedin_url=_cc.get("linkedin",""),
                                             company=_cc.get("company",""),
-                                            email=_cc.get("email",""),
+                                            email=_cc.get("email","") or _mon_email,
                                         )
                                         _fp_phs = _fp_r.get("phone_numbers") or []
                                         if _fp_phs:
@@ -1784,8 +1764,7 @@ if _page == "✅ Lead Verification":
                             st.markdown(f"🏢 **{_cc['company_phone']}** (company)")
 
                     # ── Monday CRM expanded data ───────────────────────────
-                    _crm_r2 = st.session_state.get(_crm_sk)
-                    if _crm_r2 and _crm_r2.get("on_crm"):
+                    if _crm_r and _crm_r.get("on_crm"):
                         with st.expander("📋 All Monday CRM data"):
                             _md1, _md2 = st.columns(2)
                             for _mfi, (_mfk, _mfl) in enumerate([
@@ -1793,18 +1772,18 @@ if _page == "✅ Lead Verification":
                                 ("crm_phone","Phone"),("crm_linkedin","LinkedIn"),
                                 ("crm_authority","Authority"),("crm_heat","Heat"),
                             ]):
-                                _mfv = _crm_r2.get(_mfk,"")
+                                _mfv = _crm_r.get(_mfk,"")
                                 if _mfv and str(_mfv) not in ("","nan","None"):
                                     (_md1 if _mfi % 2 == 0 else _md2).markdown(
                                         f"**{_mfl}:** {_mfv}")
-                            _lm2 = _crm_r2.get("crm_last_method","")
-                            _ld2 = _crm_r2.get("crm_last_date","")
+                            _lm2 = _crm_r.get("crm_last_method","")
+                            _ld2 = _crm_r.get("crm_last_date","")
                             if _lm2 or _ld2:
                                 st.caption(f"Last contact: {(_lm2+' '+_ld2).strip()}")
-                            if _crm_r2.get("crm_notes"):
-                                st.caption(f"📝 {_crm_r2['crm_notes'][:200]}")
+                            if _crm_r.get("crm_notes"):
+                                st.caption(f"📝 {_crm_r['crm_notes'][:200]}")
 
-                            # Cross-reference
+                            # Cross-reference with Apollo
                             if _has_apo:
                                 if st.button("↔ Cross-reference with Apollo",
                                              key=f"lk_xref_btn_{key_prefix}_{_ci}"):
@@ -1812,9 +1791,9 @@ if _page == "✅ Lead Verification":
                                         try:
                                             _xr = _apollo_match(
                                                 apollo_id=_apo_id,
-                                                name=_crm_r2.get("crm_name", _cc.get("name","")),
-                                                linkedin_url=_crm_r2.get("crm_linkedin",""),
-                                                email=_crm_r2.get("crm_email",""),
+                                                name=_crm_r.get("crm_name", _cc.get("name","")),
+                                                linkedin_url=_crm_r.get("crm_linkedin",""),
+                                                email=_crm_r.get("crm_email",""),
                                             )
                                             if _xr:
                                                 st.session_state[_xref_sk] = _norm_apollo(_xr)
@@ -1823,13 +1802,13 @@ if _page == "✅ Lead Verification":
                             _xref_r = st.session_state.get(_xref_sk)
                             if _xref_r:
                                 st.markdown("**Apollo vs Monday:**")
-                                _diffs = [(lbl, _xref_r.get(ak,""), _crm_r2.get(ck,""))
+                                _diffs = [(lbl, _xref_r.get(ak,""), _crm_r.get(ck,""))
                                           for lbl,ak,ck in [
                                               ("Email","email","crm_email"),
                                               ("Phone","phone","crm_phone"),
                                               ("Title","title","crm_title"),
                                               ("LinkedIn","linkedin","crm_linkedin"),
-                                          ] if _xref_r.get(ak) and _xref_r.get(ak) != _crm_r2.get(ck)]
+                                          ] if _xref_r.get(ak) and _xref_r.get(ak) != _crm_r.get(ck)]
                                 if _diffs:
                                     for _dl, _dav, _dcv in _diffs:
                                         _da, _db = st.columns(2)
@@ -1850,8 +1829,8 @@ if _page == "✅ Lead Verification":
                             "name":           _cc.get("name",""),
                             "title":          _cc.get("title",""),
                             "company":        _cc.get("company",""),
-                            "email":          _cc.get("email","") or st.session_state.get(_em_sk,{}).get("email",""),
-                            "phone":          _cc.get("phone","") or st.session_state.get(_ph_sk,{}).get("phone",""),
+                            "email":          _cc.get("email","") or _mon_email or st.session_state.get(_em_sk,{}).get("email",""),
+                            "phone":          _cc.get("phone","") or _mon_phone or st.session_state.get(_ph_sk,{}).get("phone",""),
                             "linkedin":       _cc.get("linkedin",""),
                             "company_phone":  _cc.get("company_phone",""),
                             "twitter":        _cc.get("twitter",""),
@@ -2634,6 +2613,52 @@ def _intel_enrich_card(company: str, country: str, description: str) -> dict:
     return out
 
 
+def _intel_pre_score(event_type: str, source_count: int, description: str) -> tuple:
+    """Quick deterministic CRS Applicability score before AI rating.
+    Returns (score 0-100, urgency 'high'|'medium'|'low', breakdown dict)."""
+    score = 0
+    bd: dict = {}
+
+    # Event severity (0-30)
+    _sev = {
+        "ransomleak": 30, "ransomware": 30,
+        "leaked-credential": 25, "stealer-log": 22,
+        "paste": 18, "chat-message": 14, "news": 8,
+    }
+    sev = _sev.get(event_type.lower().replace(" ","_"), 8)
+    score += sev
+    bd["event_severity"] = sev
+
+    # Source confidence (0-24)
+    src_pts = min(source_count * 8, 24)
+    score  += src_pts
+    bd["source_confidence"] = src_pts
+
+    # Sector / keyword fit (0-30)
+    desc_lc = description.lower()
+    strong  = ["bank","financial","government","health","telco","insurance",
+                "mining","energy","defence","defense","university","pension",
+                "municipality","municipality","water","electricity","port"]
+    weak    = ["construction","catering","cleaning","stationery","vehicle",
+                "furniture","linen","laundry","food","fleet","grass"]
+    sect_pts = sum(5 for kw in strong if kw in desc_lc)
+    sect_pts -= sum(15 for kw in weak if kw in desc_lc)
+    sect_pts = max(-20, min(30, sect_pts))
+    score   += sect_pts
+    bd["sector_fit"] = max(0, sect_pts)
+
+    # Urgency signals (0-20)
+    urg_kw  = ["ransomware","encrypted","ransom","extortion","exfiltrat",
+               "breach","stolen","leaked","exposed","compromised"]
+    urg_pts = min(sum(5 for kw in urg_kw if kw in desc_lc), 20)
+    score  += urg_pts
+    bd["urgency_signals"] = urg_pts
+
+    score   = max(0, min(100, score))
+    urgency = "high" if score >= 65 else "medium" if score >= 40 else "low"
+    return score, urgency, bd
+
+
 def _dedupe_persons(persons: list) -> list:
     """Deduplicate a list of {name, title} dicts by name."""
     seen: set = set()
@@ -2839,6 +2864,45 @@ _AFRICAN_SITES_GOOGLE = (
     "OR site:techpoint.africa OR site:dailymaverick.co.za"
 )
 
+# North-America feeds and countries (used when region_na toggle is on)
+_NA_FEEDS: dict = {
+    "BleepingComputer":     "https://www.bleepingcomputer.com/feed/",
+    "SecurityWeek":         "https://feeds.feedburner.com/Securityweek",
+    "Dark Reading":         "https://www.darkreading.com/rss/all.xml",
+    "CyberScoop":           "https://cyberscoop.com/feed/",
+    "KrebsOnSecurity":      "https://krebsonsecurity.com/feed/",
+    "Threatpost":           "https://threatpost.com/feed/",
+    "SC Magazine":          "https://www.scmagazine.com/rss.xml",
+    "Ars Technica Security":"https://feeds.arstechnica.com/arstechnica/security",
+}
+
+_NA_SITES_GOOGLE = (
+    "site:bleepingcomputer.com OR site:securityweek.com OR site:darkreading.com "
+    "OR site:cyberscoop.com OR site:krebsonsecurity.com OR site:threatpost.com "
+    "OR site:scmagazine.com OR site:arstechnica.com"
+)
+
+_NA_COUNTRIES = [
+    "United States", "Canada", "Mexico",
+]
+
+_NA_DEFAULT_COUNTRIES = ["United States", "Canada"]
+
+
+def _get_region_config() -> dict:
+    """Return feed/country/search config based on the sidebar region toggle."""
+    na = st.session_state.get("region_na", False)
+    return {
+        "na":               na,
+        "label":            "North America" if na else "Africa",
+        "countries":        _NA_COUNTRIES if na else _INTEL_COUNTRIES,
+        "default_countries":_NA_DEFAULT_COUNTRIES if na else ["South Africa","Kenya","Nigeria","Ghana"],
+        "feeds":            _NA_FEEDS if na else _AFRICAN_FEEDS,
+        "sites_google":     _NA_SITES_GOOGLE if na else _AFRICAN_SITES_GOOGLE,
+        "geo_qualifier":    "" if na else "Africa",
+    }
+
+
 _INTEL_COUNTRIES = [
     "South Africa", "Kenya", "Nigeria", "Ghana", "Tanzania", "Uganda",
     "Zambia", "Rwanda", "Botswana", "Namibia", "Zimbabwe", "Malawi",
@@ -2860,20 +2924,26 @@ _INTEL_GOOGLE_TERMS = (
 )
 
 if _page == "🛡️ Lead Intelligence":
-    st.subheader("Cyber Event Lead Intelligence")
+    _rc = _get_region_config()
+    _region_label = _rc["label"]
+    st.subheader(f"Cyber Event Lead Intelligence — {_region_label}")
     st.caption(
-        "Surface African companies hit by ransomware, breaches, or dark-web exposure. "
+        f"Surface {_region_label} companies hit by ransomware, breaches, or dark-web exposure. "
         "AI-rates each as a CRS lead, then lets you find the right contacts."
     )
 
     _ii1, _ii2, _ii3, _ii4 = st.columns([3, 2, 1, 1])
     with _ii1:
+        _avail_countries = _rc["countries"]
         if st.checkbox("Select all", key="intel_ctry_all"):
-            st.session_state["intel_countries"] = _INTEL_COUNTRIES[:]
+            st.session_state["intel_countries"] = _avail_countries[:]
         elif not st.session_state.get("intel_ctry_all"):
-            st.session_state.setdefault("intel_countries",
-                                        ["South Africa", "Kenya", "Nigeria", "Ghana"])
-        _i_countries = st.multiselect("Countries", _INTEL_COUNTRIES, key="intel_countries")
+            st.session_state.setdefault("intel_countries", _rc["default_countries"])
+        # Reset if saved countries no longer match region
+        _saved_ctry = st.session_state.get("intel_countries", [])
+        if _saved_ctry and all(c not in _avail_countries for c in _saved_ctry):
+            st.session_state["intel_countries"] = _rc["default_countries"]
+        _i_countries = st.multiselect("Countries", _avail_countries, key="intel_countries")
 
     with _ii2:
         if st.checkbox("Select all", key="intel_evt_all"):
@@ -2896,9 +2966,12 @@ if _page == "🛡️ Lead Intelligence":
         (st.secrets.get("SERPAPI_API_KEY","") or os.getenv("SERPAPI_API_KEY","")) or
         (st.secrets.get("GOOGLE_API_KEY","")  and st.secrets.get("GOOGLE_CSE_ID",""))
     )
+    _i_src_apollo = bool(st.secrets.get("APOLLO_API_KEY","") or os.getenv("APOLLO_API_KEY",""))
     st.caption("Sources: " + "  ·  ".join([
         "🟢 Flare.io"    if _i_src_flare  else "⚪ Flare.io (add FLARE_API_KEY)",
         "🟢 Google News" if _i_src_google else "⚪ Google News (add SERPAPI_API_KEY)",
+        f"🟢 RSS ({_region_label})",
+        "🟢 Apollo contacts" if _i_src_apollo else "⚪ Apollo (add APOLLO_API_KEY)",
     ]))
 
     _i_run = st.button("🔍 Find cyber-event leads", type="primary",
@@ -2959,10 +3032,12 @@ if _page == "🛡️ Lead Intelligence":
                     except Exception as _fe2:
                         st.toast(f"Flare error for {_ic}: {str(_fe2)[:80]}")
 
-                # ── Google News (broad African context) ─────────────────────
+                # ── Google News (broad regional context) ────────────────────
                 if _i_src_google:
                     try:
-                        _gq = f'"{_ic}" Africa {_INTEL_GOOGLE_TERMS}'
+                        _geo_q = _rc["geo_qualifier"]
+                        _gq = (f'"{_ic}" {_geo_q} {_INTEL_GOOGLE_TERMS}'
+                               if _geo_q else f'"{_ic}" {_INTEL_GOOGLE_TERMS}')
                         for _gn in _news_search(_gq, num=int(_i_per_ctry)):
                             _co2      = _extract_company_from_news(
                                 _gn["title"], _gn["snippet"], _ic)
@@ -2980,18 +3055,20 @@ if _page == "🛡️ Lead Intelligence":
                     except Exception as _ge:
                         st.toast(f"Google error for {_ic}: {str(_ge)[:80]}")
 
-                # ── Google — African publications only ──────────────────────
+                # ── Google — region-specific publications only ──────────────
                 if _i_src_google:
                     try:
-                        _gq2 = f'({_AFRICAN_SITES_GOOGLE}) "{_ic}" {_INTEL_GOOGLE_TERMS}'
+                        _sites = _rc["sites_google"]
+                        _feeds = _rc["feeds"]
+                        _gq2 = f'({_sites}) "{_ic}" {_INTEL_GOOGLE_TERMS}'
                         for _gn2 in _news_search(_gq2, num=int(_i_per_ctry)):
                             _co3      = _extract_company_from_news(
                                 _gn2["title"], _gn2["snippet"], _ic)
                             _fd2      = f"{_gn2['title']} — {_gn2['snippet']}"
                             _src_name = (next(
-                                (s for s in _AFRICAN_FEEDS
+                                (s for s in _feeds
                                  if s.split()[0].lower() in _gn2["url"].lower()),
-                                "African Press",
+                                f"{_region_label} Press",
                             ))
                             _intel_raw.append({
                                 "company":       _co3,
@@ -3006,24 +3083,31 @@ if _page == "🛡️ Lead Intelligence":
                     except Exception:
                         pass
 
-                # ── African RSS feeds ────────────────────────────────────────
+                # ── RSS feeds (region-aware) ─────────────────────────────────
                 try:
-                    for _rss_item in _search_african_feeds(
-                        _ic, days_back=int(_i_days), max_per_feed=int(_i_per_ctry)
-                    ):
-                        _rfd = f"{_rss_item['title']} — {_rss_item['snippet']}"
-                        _rco = _extract_company_from_news(
-                            _rss_item["title"], _rss_item["snippet"], _ic)
-                        _intel_raw.append({
-                            "company":       _rco,
-                            "country":       _ic,
-                            "event_type":    "news",
-                            "date":          _rss_item.get("date", ""),
-                            "description":   _rfd,
-                            "url":           _rss_item["url"],
-                            "source":        _rss_item.get("source", "RSS"),
-                            "persons_found": _extract_names(_rfd),
-                        })
+                    _cyber_kw2 = (
+                        "breach","ransomware","hack","cyber","attack","leak",
+                        "credential","malware","phishing","data",
+                    )
+                    for _fn2, _fu2 in _rc["feeds"].items():
+                        for _rss_item in _fetch_rss_feed(
+                            _fn2, _fu2,
+                            keywords=_cyber_kw2 + (_ic.lower(),),
+                            days_back=int(_i_days),
+                        )[:int(_i_per_ctry)]:
+                            _rfd = f"{_rss_item['title']} — {_rss_item['snippet']}"
+                            _rco = _extract_company_from_news(
+                                _rss_item["title"], _rss_item["snippet"], _ic)
+                            _intel_raw.append({
+                                "company":       _rco,
+                                "country":       _ic,
+                                "event_type":    "news",
+                                "date":          _rss_item.get("date", ""),
+                                "description":   _rfd,
+                                "url":           _rss_item["url"],
+                                "source":        _rss_item.get("source", _fn2),
+                                "persons_found": _extract_names(_rfd),
+                            })
                 except Exception:
                     pass
 
@@ -3050,7 +3134,7 @@ if _page == "🛡️ Lead Intelligence":
                 if len(_ev.get("description", "")) > len(g["best"].get("description", "")):
                     g["best"] = _ev
 
-            # Flatten groups → merged result list, sorted by source count
+            # Flatten groups → merged result list with pre-scores
             _intel_dedup: list = []
             for _ck2, g2 in _groups.items():
                 _merged = dict(g2["best"])
@@ -3058,9 +3142,19 @@ if _page == "🛡️ Lead Intelligence":
                 _merged["all_sources"]           = sorted(g2["sources"])
                 _merged["combined_description"]  = "\n".join(g2["descriptions"])[:1500]
                 _merged["persons_found"]         = _dedupe_persons(g2["persons"])
+                # Pre-score for CRS Applicability ranking (before AI rating)
+                _ps, _pu, _pbd = _intel_pre_score(
+                    _merged.get("event_type", "news"),
+                    _merged["source_count"],
+                    _merged.get("combined_description", _merged.get("description", "")),
+                )
+                _merged["pre_score"]    = _ps
+                _merged["pre_urgency"]  = _pu
+                _merged["pre_breakdown"] = _pbd
                 _intel_dedup.append(_merged)
 
-            _intel_dedup.sort(key=lambda x: -x["source_count"])
+            # Sort by composite: pre_score DESC, then source_count DESC
+            _intel_dedup.sort(key=lambda x: (-x["pre_score"], -x["source_count"]))
 
             st.session_state["intel_results"] = _intel_dedup
             if not _intel_dedup:
