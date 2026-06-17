@@ -12,6 +12,7 @@ EXTRA_SECRET_KEYS="FOO,BAR" in the Space to pass extras without editing this fil
 """
 
 import os
+import json
 import pathlib
 
 # Every key the CRS app reads via st.secrets, across all tabs/modules.
@@ -37,8 +38,10 @@ keys = list(dict.fromkeys(ALLOWED_KEYS + [k.strip() for k in extra.split(",") if
 
 
 def _toml_escape(value: str) -> str:
-    # TOML basic-string escaping (backslash + double-quote are the ones that bite)
-    return value.replace("\\", "\\\\").replace('"', '\\"')
+    # json.dumps uses the same escape sequences as TOML basic strings
+    # (handles \n, \r, \t, \b, \f, \\, \" and all control chars correctly).
+    # Strip the surrounding double-quotes that json.dumps adds.
+    return json.dumps(value)[1:-1]
 
 
 def main():
