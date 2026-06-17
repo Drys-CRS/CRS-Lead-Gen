@@ -481,7 +481,7 @@ with st.sidebar:
     if os.path.exists(_logo):
         st.image(_logo, width=160)
     st.title("CRS Intelligence")
-    st.caption("v2 · pipeline owned by GitHub Actions")
+    st.caption("v2 · scrape on-demand or via nightly schedule")
     st.divider()
 
     # ── Health Check ──────────────────────────────────────────────────────────
@@ -519,26 +519,52 @@ with st.sidebar:
         st.rerun()
 
     if st.button("📥 Pull all tenders", use_container_width=True,
-                 help="Triggers the nightly GitHub Actions pipeline immediately"):
-        _gh = (st.secrets.get("GH_PAT", "") or st.secrets.get("GITHUB_TOKEN", ""))
-        if not _gh:
-            st.error("Set GH_PAT in secrets to trigger the pipeline.")
-        else:
-            import requests as _req
+                 help="Scrapes all open & awarded tenders across English-speaking Africa, then scores and runs partner analysis"):
+        # Bridge st.secrets → os.environ so ingest_core can find keys
+        for _k in ("SUPABASE_URL", "SUPABASE_KEY", "GROQ_API_KEY", "CEREBRAS_API_KEY",
+                   "OPENROUTER_API_KEY", "GH_PAT", "GITHUB_TOKEN", "NVIDIA_API_KEY",
+                   "DEEPSEEK_API_KEY", "GEMINI_API_KEY"):
+            if not os.environ.get(_k):
+                _v = st.secrets.get(_k, "")
+                if _v:
+                    os.environ[_k] = _v
+
+        try:
+            import ingest_core as _ic  # type: ignore[import-not-found]
+        except ImportError:
+            st.error("ingest_core not found — ensure app/ingest_core.py is present.")
+            st.stop()
+
+        with st.status("🌍 Pulling tenders across Africa…", expanded=True) as _pull_status:
             try:
-                _resp = _req.post(
-                    "https://api.github.com/repos/Drys-CRS/CRS-Lead-Gen/actions/workflows/daily-ingest.yml/dispatches",
-                    headers={"Authorization": f"token {_gh}",
-                             "Accept": "application/vnd.github.v3+json"},
-                    json={"ref": "main"},
-                    timeout=15,
+                st.write("🔌 Connecting to Supabase…")
+                _ic.init_supabase()
+                st.write("🤖 Initialising AI providers…")
+                _avail = _ic.init_ai(log=lambda _: None)
+                st.write(f"   Providers: {', '.join(_avail) if _avail else 'none (scrape only)'}")
+
+                _pull_result = _ic.run_all(
+                    years_back=3,
+                    max_score=300,
+                    do_partner=True,
+                    score_time_budget_s=3000,
+                    trigger="manual_app",
+                    log=lambda m: st.write(str(m)),
                 )
-                if _resp.status_code == 204:
-                    st.success("Pipeline triggered — check GitHub Actions for progress.")
+                if _pull_result.get("status") == "success":
+                    _pull_status.update(
+                        label=(f"✅ Done — {_pull_result.get('tenders_scraped', 0):,} scraped, "
+                               f"{_pull_result.get('tenders_scored', 0)} scored"),
+                        state="complete",
+                    )
                 else:
-                    st.error(f"Trigger failed ({_resp.status_code}): {_resp.text[:200]}")
-            except Exception as _e:
-                st.error(f"Request error: {_e}")
+                    _pull_status.update(label="⚠️ Pipeline completed with errors — see log above",
+                                        state="error")
+            except Exception as _pull_exc:
+                _pull_status.update(label=f"❌ Failed: {str(_pull_exc)[:120]}", state="error")
+                st.exception(_pull_exc)
+
+        st.cache_data.clear()
 
     if st.button("🤖 Score unscored tenders", use_container_width=True,
                  help="AI-scores up to 30 unscored open tenders now"):
