@@ -570,11 +570,11 @@ def _dork_search(query: str, num: int = 10, start: int = 0) -> list:
 
 def _apollo_match(name: str, linkedin_url: str,
                   company: str = "", email: str = "") -> dict:
-    """People Enrichment — costs 1 Apollo credit per matched person."""
+    """People Enrichment — costs 1 Apollo export credit per matched person."""
     key = st.secrets.get("APOLLO_API_KEY", "") or os.getenv("APOLLO_API_KEY", "")
     if not key:
         return {}
-    payload: dict = {"reveal_personal_emails": True}
+    payload: dict = {"api_key": key, "reveal_personal_emails": True}
     if name:         payload["name"]              = name
     if linkedin_url: payload["linkedin_url"]      = linkedin_url
     if company:      payload["organization_name"] = company
@@ -585,8 +585,16 @@ def _apollo_match(name: str, linkedin_url: str,
         headers={"Content-Type": "application/json", "X-Api-Key": key},
         method="POST",
     )
-    with _urlreq.urlopen(req, timeout=20) as r:
-        return json.loads(r.read()).get("person") or {}
+    try:
+        with _urlreq.urlopen(req, timeout=20) as r:
+            return json.loads(r.read()).get("person") or {}
+    except _urlreq.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="ignore")[:300]
+        except Exception:
+            pass
+        raise RuntimeError(f"Apollo {e.code}: {body or e.reason}") from e
 
 
 def _hunter_find(first: str, last: str, domain: str) -> dict:
