@@ -2442,33 +2442,46 @@ if _page == "🔍 LinkedIn Dork":
 # ══════════════════════════════════════════════════════════════════════════════
 
 # ── Flare.io helpers ──────────────────────────────────────────────────────────
-@st.cache_data(ttl=3300)
-def _flare_token() -> str | None:
+@st.cache_data(ttl=1800)
+def _flare_token() -> str:
+    """Obtain a short-lived Flare JWT. Raises RuntimeError on any failure so the
+    caller can surface a real error message instead of silently returning []."""
     api_key   = st.secrets.get("FLARE_API_KEY",   "") or os.getenv("FLARE_API_KEY",   "")
     tenant_id = st.secrets.get("FLARE_TENANT_ID", "") or os.getenv("FLARE_TENANT_ID", "")
     if not api_key:
-        return None
+        raise RuntimeError("FLARE_API_KEY not configured")
+    payload: dict = {}
+    if tenant_id:
+        try:
+            payload["tenant_id"] = int(tenant_id)
+        except ValueError:
+            payload["tenant_id"] = tenant_id
+    req = _urlreq.Request(
+        "https://api.flare.io/tokens/generate",
+        data=json.dumps(payload).encode(),
+        headers={"Authorization": api_key, "Content-Type": "application/json"},
+        method="POST",
+    )
     try:
-        body = json.dumps({"tenant_id": int(tenant_id)}).encode() if tenant_id else b"{}"
-        req  = _urlreq.Request(
-            "https://api.flare.io/tokens/generate",
-            data=body,
-            headers={"Authorization": api_key, "Content-Type": "application/json"},
-            method="POST",
-        )
         with _urlreq.urlopen(req, timeout=15) as r:
-            return json.loads(r.read()).get("token")
-    except Exception:
-        return None
+            data = json.loads(r.read())
+    except _urlerr.HTTPError as e:
+        body = ""
+        try: body = e.read().decode("utf-8", errors="ignore")[:300]
+        except Exception: pass
+        raise RuntimeError(f"Flare token HTTP {e.code}: {body or e.reason}") from e
+    token = data.get("token") or data.get("jwt") or data.get("access_token")
+    if not token:
+        raise RuntimeError(f"Flare token response had no token field: {str(data)[:200]}")
+    return token
 
 
 def _flare_search(query: str, event_types: list, days_back: int = 30,
                   size: int = 20) -> list:
-    token = _flare_token()
-    if not token:
-        return []
+    token   = _flare_token()          # raises on failure — caller handles it
     from_ts = (_dt.datetime.now(_dt.timezone.utc)
                - _dt.timedelta(days=days_back)).isoformat()
+    # Omit "from" entirely rather than sending null, which some API versions reject
     body = json.dumps({
         "query": {"type": "query_string", "query_string": query},
         "filters": {
@@ -2477,7 +2490,6 @@ def _flare_search(query: str, event_types: list, days_back: int = 30,
         },
         "size": size,
         "order": "desc",
-        "from": None,
     }).encode()
     req = _urlreq.Request(
         "https://api.flare.io/firework/v4/events/global/_search",
@@ -2485,8 +2497,14 @@ def _flare_search(query: str, event_types: list, days_back: int = 30,
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
         method="POST",
     )
-    with _urlreq.urlopen(req, timeout=25) as r:
-        return json.loads(r.read()).get("items", [])
+    try:
+        with _urlreq.urlopen(req, timeout=25) as r:
+            return json.loads(r.read()).get("items", [])
+    except _urlerr.HTTPError as e:
+        body_txt = ""
+        try: body_txt = e.read().decode("utf-8", errors="ignore")[:300]
+        except Exception: pass
+        raise RuntimeError(f"Flare search HTTP {e.code}: {body_txt or e.reason}") from e
 
 
 def _news_search(query: str, num: int = 10) -> list:
@@ -2967,12 +2985,24 @@ if _page == "🛡️ Lead Intelligence":
         (st.secrets.get("GOOGLE_API_KEY","")  and st.secrets.get("GOOGLE_CSE_ID",""))
     )
     _i_src_apollo = bool(st.secrets.get("APOLLO_API_KEY","") or os.getenv("APOLLO_API_KEY",""))
-    st.caption("Sources: " + "  ·  ".join([
-        "🟢 Flare.io"    if _i_src_flare  else "⚪ Flare.io (add FLARE_API_KEY)",
-        "🟢 Google News" if _i_src_google else "⚪ Google News (add SERPAPI_API_KEY)",
-        f"🟢 RSS ({_region_label})",
-        "🟢 Apollo contacts" if _i_src_apollo else "⚪ Apollo (add APOLLO_API_KEY)",
-    ]))
+    _src_col1, _src_col2 = st.columns([4, 1])
+    with _src_col1:
+        st.caption("Sources: " + "  ·  ".join([
+            "🟢 Flare.io"    if _i_src_flare  else "⚪ Flare.io (add FLARE_API_KEY)",
+            "🟢 Google News" if _i_src_google else "⚪ Google News (add SERPAPI_API_KEY)",
+            f"🟢 RSS ({_region_label})",
+            "🟢 Apollo contacts" if _i_src_apollo else "⚪ Apollo (add APOLLO_API_KEY)",
+        ]))
+    with _src_col2:
+        if _i_src_flare and st.button("🔧 Test Flare", key="flare_test",
+                                       use_container_width=True):
+            with st.spinner("Testing Flare connection…"):
+                _flare_token.clear()   # bust cache so we get a live result
+                try:
+                    _ft = _flare_token()
+                    st.success(f"✅ Flare token OK ({len(_ft)} chars)")
+                except Exception as _fte:
+                    st.error(f"Flare error: {_fte}")
 
     _i_run = st.button("🔍 Find cyber-event leads", type="primary",
                        use_container_width=True, key="intel_run")
@@ -3002,7 +3032,7 @@ if _page == "🛡️ Lead Intelligence":
                             f'"{_ic}"', _flare_types,
                             days_back=int(_i_days), size=int(_i_per_ctry),
                         )
-                        for _fe in _fevts:
+                        for _fe in _fevts:  # noqa: E501
                             _meta  = _fe.get("metadata") or _fe
                             _body  = _fe.get("body") or _fe
                             _desc  = str(
@@ -3030,7 +3060,9 @@ if _page == "🛡️ Lead Intelligence":
                                 "persons_found": _extract_names(_desc),
                             })
                     except Exception as _fe2:
-                        st.toast(f"Flare error for {_ic}: {str(_fe2)[:80]}")
+                        _ferr_msg = str(_fe2)
+                        st.warning(f"⚠️ Flare error ({_ic}): {_ferr_msg[:200]}")
+                        _i_src_flare = False  # stop retrying for subsequent countries
 
                 # ── Google News (broad regional context) ────────────────────
                 if _i_src_google:
