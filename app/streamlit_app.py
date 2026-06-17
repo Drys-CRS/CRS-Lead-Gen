@@ -404,7 +404,7 @@ def ai_analyse_partners(awarded_df: pd.DataFrame) -> list:
 @st.cache_data(ttl=300)
 def _load_tenders() -> pd.DataFrame:
     r = (supabase.table("sa_tenders").select("*")
-         .neq("status", "Awarded").neq("is_irrelevant", True)
+         .neq("is_irrelevant", True)
          .order("closing_date", desc=False).limit(1000).execute())
     return pd.DataFrame(r.data or [])
 
