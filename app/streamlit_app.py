@@ -8,6 +8,7 @@ import sys
 import json
 import re
 import time as _time
+import threading
 import streamlit as st
 import pandas as pd
 from supabase import create_client, Client
@@ -473,6 +474,30 @@ def _badge(urgency: str) -> str:
     return urgency or "—"
 
 # ─────────────────────────────────────────────────────────────────────────────
+# BACKGROUND PULL — module-level so it survives across Streamlit reruns
+# ─────────────────────────────────────────────────────────────────────────────
+_PULL_STATE: dict = {"status": "idle", "logs": [], "result": None}
+
+def _pull_worker(env_overrides: dict) -> None:
+    _PULL_STATE.update({"status": "running", "logs": [], "result": None})
+    for k, v in env_overrides.items():
+        if not os.environ.get(k):
+            os.environ[k] = v
+    def _log(m: str) -> None:
+        _PULL_STATE["logs"].append(str(m)[:200])
+    try:
+        import ingest_core as _ic  # type: ignore[import-not-found]
+        _ic.init_supabase()
+        _ic.init_ai(log=lambda _: None)
+        result = _ic.run_all(
+            years_back=3, max_score=300, do_partner=True,
+            score_time_budget_s=3000, trigger="manual_app", log=_log,
+        )
+        _PULL_STATE.update({"status": "done", "result": result})
+    except Exception as _e:
+        _PULL_STATE.update({"status": "failed", "result": {"error": str(_e)}})
+
+# ─────────────────────────────────────────────────────────────────────────────
 # SIDEBAR — Health check + action buttons only
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -518,53 +543,38 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
 
+    _ps = _PULL_STATE["status"]
     if st.button("📥 Pull all tenders", use_container_width=True,
-                 help="Scrapes all open & awarded tenders across English-speaking Africa, then scores and runs partner analysis"):
-        # Bridge st.secrets → os.environ so ingest_core can find keys
-        for _k in ("SUPABASE_URL", "SUPABASE_KEY", "GROQ_API_KEY", "CEREBRAS_API_KEY",
-                   "OPENROUTER_API_KEY", "GH_PAT", "GITHUB_TOKEN", "NVIDIA_API_KEY",
-                   "DEEPSEEK_API_KEY", "GEMINI_API_KEY"):
-            if not os.environ.get(_k):
-                _v = st.secrets.get(_k, "")
-                if _v:
-                    os.environ[_k] = _v
+                 disabled=(_ps == "running"),
+                 help="Scrapes all open & awarded tenders across English-speaking Africa in the background"):
+        if _ps != "running":
+            _env_ov: dict = {}
+            for _k in ("SUPABASE_URL", "SUPABASE_KEY", "GROQ_API_KEY", "CEREBRAS_API_KEY",
+                       "OPENROUTER_API_KEY", "GH_PAT", "GITHUB_TOKEN", "NVIDIA_API_KEY",
+                       "DEEPSEEK_API_KEY", "GEMINI_API_KEY"):
+                if not os.environ.get(_k):
+                    _v = st.secrets.get(_k, "")
+                    if _v:
+                        _env_ov[_k] = _v
+            threading.Thread(target=_pull_worker, args=(_env_ov,), daemon=True).start()
+            st.rerun()
 
-        try:
-            import ingest_core as _ic  # type: ignore[import-not-found]
-        except ImportError:
-            st.error("ingest_core not found — ensure app/ingest_core.py is present.")
-            st.stop()
-
-        with st.status("🌍 Pulling tenders across Africa…", expanded=True) as _pull_status:
-            try:
-                st.write("🔌 Connecting to Supabase…")
-                _ic.init_supabase()
-                st.write("🤖 Initialising AI providers…")
-                _avail = _ic.init_ai(log=lambda _: None)
-                st.write(f"   Providers: {', '.join(_avail) if _avail else 'none (scrape only)'}")
-
-                _pull_result = _ic.run_all(
-                    years_back=3,
-                    max_score=300,
-                    do_partner=True,
-                    score_time_budget_s=3000,
-                    trigger="manual_app",
-                    log=lambda m: st.write(str(m)),
-                )
-                if _pull_result.get("status") == "success":
-                    _pull_status.update(
-                        label=(f"✅ Done — {_pull_result.get('tenders_scraped', 0):,} scraped, "
-                               f"{_pull_result.get('tenders_scored', 0)} scored"),
-                        state="complete",
-                    )
-                else:
-                    _pull_status.update(label="⚠️ Pipeline completed with errors — see log above",
-                                        state="error")
-            except Exception as _pull_exc:
-                _pull_status.update(label=f"❌ Failed: {str(_pull_exc)[:120]}", state="error")
-                st.exception(_pull_exc)
-
+    if _ps == "running":
+        _n = len(_PULL_STATE["logs"])
+        _last = _PULL_STATE["logs"][-1] if _PULL_STATE["logs"] else "Starting…"
+        st.caption(f"🔄 Running — {_n} steps completed")
+        st.caption(_last[:90])
+        if st.button("↻ Check progress", use_container_width=True):
+            st.rerun()
+    elif _ps == "done":
+        _r = _PULL_STATE.get("result") or {}
+        st.success(f"✅ {_r.get('tenders_scraped', 0):,} scraped · {_r.get('tenders_scored', 0)} scored")
+        _PULL_STATE["status"] = "idle"
         st.cache_data.clear()
+    elif _ps == "failed":
+        _r = _PULL_STATE.get("result") or {}
+        st.error(f"❌ {str(_r.get('error', 'Unknown'))[:150]}")
+        _PULL_STATE["status"] = "idle"
 
     if st.button("🤖 Score unscored tenders", use_container_width=True,
                  help="AI-scores up to 30 unscored open tenders now"):
@@ -692,100 +702,228 @@ with tab_overview:
 with tab_opps:
     st.subheader("Open Opportunities")
 
-    df = _score_filter(_country(_load_tenders()))
+    _df_all = _load_tenders()
+    _unscored_n = int(_df_all["ai_score"].isna().sum()) if "ai_score" in _df_all.columns else len(_df_all)
 
-    col_f1, col_f2 = st.columns([2, 3])
-    with col_f1:
-        status_opts = ["All"] + (sorted(df["status"].dropna().unique().tolist())
-                                 if "status" in df.columns else [])
-        sel_status = st.selectbox("Status", status_opts, key="opp_status")
-        if sel_status != "All" and "status" in df.columns:
-            df = df[df["status"] == sel_status]
-    with col_f2:
-        q = st.text_input("Search department / title", key="opp_search")
-        if q:
-            mask = pd.Series(False, index=df.index)
-            for col in ("department_name", "title", "description"):
-                if col in df.columns:
-                    mask |= df[col].str.contains(q, case=False, na=False)
-            df = df[mask]
+    # ── Score-all button ──────────────────────────────────────────────────────
+    _sb1, _sb2 = st.columns([3, 2])
+    with _sb1:
+        _do_score = st.button(
+            f"🤖 Score all open tenders  ({_unscored_n} unscored)",
+            type="primary", use_container_width=True,
+        )
+    with _sb2:
+        st.caption(f"{len(_df_all):,} total open tenders loaded")
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Shown", len(df))
-    if "country" in df.columns: c2.metric("Countries", df["country"].nunique())
-    if "ai_score" in df.columns:
-        avg = pd.to_numeric(df["ai_score"], errors="coerce").mean()
-        c3.metric("Avg AI score", f"{avg:.1f}" if pd.notna(avg) else "—")
+    if _do_score:
+        _to_score = (supabase.table("sa_tenders").select("*")
+                     .is_("ai_score", "null").neq("is_irrelevant", True)
+                     .limit(300).execute()).data or []
+        if not _to_score:
+            st.info("All tenders are already scored.")
+        else:
+            _sp = st.progress(0, text=f"Scoring 0 / {len(_to_score)}…")
+            _serr = 0
+            for _si, _srow in enumerate(_to_score):
+                try:
+                    _sc = ai_score_tender(_srow)
+                    supabase.table("sa_tenders").update({
+                        "ai_score": _sc["score"],
+                        "ai_rationale": json.dumps({
+                            "rationale": _sc["rationale"],
+                            "partner_type": _sc["partner_type"],
+                            "proposed_solutions": _sc["proposed_solutions"],
+                            "outreach_angle": _sc["outreach_angle"],
+                        }),
+                    }).eq("id", _srow["id"]).execute()
+                except Exception:
+                    _serr += 1
+                _sp.progress((_si + 1) / len(_to_score),
+                             text=f"Scoring {_si + 1} / {len(_to_score)}…")
+            _sp.empty()
+            st.cache_data.clear()
+            st.success(f"✅ Scored {len(_to_score) - _serr} / {len(_to_score)} tenders.")
+            _df_all = _load_tenders()
 
-    show_cols = [c for c in ["tender_number","department_name","title",
-                              "country","closing_date","ai_score","status"] if c in df.columns]
-    st.dataframe(df[show_cols], use_container_width=True, hide_index=True)
+    st.divider()
 
-    if not df.empty and "tender_number" in df.columns:
-        tn_list = df["tender_number"].dropna().tolist()
-        sel_tn = st.selectbox("Select tender to view / push", ["—"] + tn_list, key="opp_sel")
-        if sel_tn != "—":
-            row = df[df["tender_number"] == sel_tn].iloc[0]
-            rat = _parse_rationale(row.get("ai_rationale"))
+    # ── Filters ───────────────────────────────────────────────────────────────
+    _fc1, _fc2, _fc3 = st.columns([2, 3, 1])
+    with _fc1:
+        _ctries = sorted(_df_all["country"].dropna().unique().tolist()) if "country" in _df_all.columns else []
+        _sel_ctry = st.multiselect("Country", _ctries, key="opp_countries")
+    with _fc2:
+        _q = st.text_input("Search title / department", key="opp_search",
+                           placeholder="type to filter…")
+    with _fc3:
+        _min_s = st.number_input("Min score", 0, 10, 0, key="opp_min_score", step=1)
 
-            with st.expander("Tender detail", expanded=True):
-                dc1, dc2 = st.columns([2, 1])
-                with dc1:
-                    for field in ["title","department_name","country","description",
-                                  "closing_date","issue_date","category",
-                                  "compliance_requirements","portal_link","source_url"]:
-                        val = row.get(field)
-                        if val and str(val) not in ("", "nan", "None"):
-                            st.markdown(f"**{field.replace('_',' ').title()}:** {val}")
-                    for field in ["contact_person","contact_email","contact_phone"]:
-                        val = row.get(field)
-                        if val and str(val) not in ("", "nan", "None"):
-                            st.markdown(f"**{field.replace('_',' ').title()}:** {val}")
-                with dc2:
-                    score = row.get("ai_score")
-                    if score is not None:
-                        st.metric("AI Score", f"{score}/10")
-                    if rat.get("partner_type"):
-                        st.info(f"**Partner type:** {rat['partner_type']}")
-                    sols = rat.get("proposed_solutions", [])
-                    if sols:
-                        st.markdown("**Proposed solutions:**")
-                        for s in (sols if isinstance(sols, list) else [sols]):
-                            st.markdown(f"• {s}")
-                    if rat.get("outreach_angle"):
-                        st.markdown("**Outreach angle:**")
-                        st.info(rat["outreach_angle"])
-                    if rat.get("rationale"):
-                        st.markdown("**Rationale:**")
-                        st.caption(rat["rationale"])
+    _df = _df_all.copy()
+    if _sel_ctry and "country" in _df.columns:
+        _df = _df[_df["country"].isin(_sel_ctry)]
+    if _q:
+        _qm = pd.Series(False, index=_df.index)
+        for _qc in ("title", "department_name", "description"):
+            if _qc in _df.columns:
+                _qm |= _df[_qc].str.contains(_q, case=False, na=False)
+        _df = _df[_qm]
+    if _min_s > 0 and "ai_score" in _df.columns:
+        _df = _df[pd.to_numeric(_df["ai_score"], errors="coerce").fillna(0) >= _min_s]
+    if "ai_score" in _df.columns:
+        _df = (_df.assign(_s=pd.to_numeric(_df["ai_score"], errors="coerce"))
+               .sort_values("_s", ascending=False).drop(columns="_s"))
+    _df = _df.reset_index(drop=True)
 
-            col_a, col_b = st.columns(2)
-            with col_a:
+    _mc1, _mc2, _mc3 = st.columns(3)
+    _mc1.metric("Shown", len(_df))
+    if "country" in _df.columns:
+        _mc2.metric("Countries", _df["country"].nunique())
+    if "ai_score" in _df.columns:
+        _avg = pd.to_numeric(_df["ai_score"], errors="coerce").mean()
+        _mc3.metric("Avg score", f"{_avg:.1f}" if pd.notna(_avg) else "—")
+
+    if _df.empty:
+        st.info("No tenders match the current filters.")
+    else:
+        st.divider()
+        st.markdown("#### Tender review queue")
+
+        # ── Card navigation ───────────────────────────────────────────────────
+        _total = len(_df)
+
+        # Reset card index when filter set changes
+        _filter_sig = f"{_sel_ctry}|{_q}|{_min_s}"
+        if st.session_state.get("opp_filter_sig") != _filter_sig:
+            st.session_state["opp_filter_sig"] = _filter_sig
+            st.session_state["opp_card_idx"] = 0
+
+        _idx = max(0, min(st.session_state.get("opp_card_idx", 0), _total - 1))
+        st.session_state["opp_card_idx"] = _idx
+
+        _nav1, _nav2, _nav3 = st.columns([1, 4, 1])
+        with _nav1:
+            if st.button("← Prev", disabled=(_idx == 0), use_container_width=True, key="opp_prev"):
+                st.session_state["opp_card_idx"] = _idx - 1
+                st.rerun()
+        with _nav2:
+            st.markdown(
+                f"<p style='text-align:center;padding-top:6px;color:grey'>"
+                f"Tender {_idx + 1} of {_total}</p>",
+                unsafe_allow_html=True,
+            )
+        with _nav3:
+            if st.button("Next →", disabled=(_idx >= _total - 1), use_container_width=True, key="opp_next"):
+                st.session_state["opp_card_idx"] = _idx + 1
+                st.rerun()
+
+        # ── Card body ─────────────────────────────────────────────────────────
+        _row = _df.iloc[_idx]
+        _rat = _parse_rationale(_row.get("ai_rationale"))
+        _score_raw = _row.get("ai_score")
+        _score_num = pd.to_numeric(_score_raw, errors="coerce")
+
+        with st.container(border=True):
+            # Score badge
+            if pd.notna(_score_num):
+                _col = ("#b71c1c" if _score_num >= 8 else
+                        "#e65100" if _score_num >= 6 else
+                        "#2e7d32" if _score_num >= 4 else "#616161")
+                st.markdown(
+                    f"<span style='background:{_col};color:#fff;padding:3px 14px;"
+                    f"border-radius:12px;font-weight:700;font-size:0.95rem'>"
+                    f"Score {int(_score_num)}/10</span>",
+                    unsafe_allow_html=True,
+                )
+                st.write("")
+
+            st.markdown(f"### {_row.get('title', 'Untitled')}")
+
+            _meta1, _meta2, _meta3 = st.columns(3)
+            with _meta1:
+                st.markdown(f"**Department**  \n{_row.get('department_name', '—')}")
+            with _meta2:
+                st.markdown(f"**Country**  \n{_row.get('country', '—')}")
+            with _meta3:
+                st.markdown(f"**Closes**  \n{str(_row.get('closing_date', '—'))[:10]}")
+
+            _ref = _row.get("tender_number") or _row.get("source_url")
+            if _ref and str(_ref) not in ("nan", "None", ""):
+                st.caption(f"Ref: {_ref}")
+
+            st.divider()
+
+            # Description
+            _desc = str(_row.get("description") or "").strip()
+            if _desc and _desc not in ("nan", "None"):
+                with st.expander("Description", expanded=False):
+                    st.write(_desc[:1500])
+
+            # AI rationale block
+            if _rat.get("rationale"):
+                st.markdown("**AI Rationale**")
+                st.info(_rat["rationale"])
+
+            _ai1, _ai2 = st.columns(2)
+            with _ai1:
+                if _rat.get("partner_type"):
+                    st.markdown(f"**Partner type:** {_rat['partner_type']}")
+                _sols = _rat.get("proposed_solutions", [])
+                if _sols:
+                    _sl = _sols if isinstance(_sols, list) else [_sols]
+                    st.markdown("**Solutions:** " + "  ".join(f"`{s}`" for s in _sl))
+            with _ai2:
+                if _rat.get("outreach_angle"):
+                    st.markdown("**Outreach angle**")
+                    st.success(_rat["outreach_angle"])
+
+            # Contact info
+            _contacts = [(f.replace("contact_", "").title(), _row.get(f))
+                         for f in ("contact_person", "contact_email", "contact_phone")
+                         if _row.get(f) and str(_row.get(f)) not in ("nan", "None", "")]
+            if _contacts:
+                st.markdown("**Contact:** " + "  ·  ".join(f"{k}: {v}" for k, v in _contacts))
+
+            st.divider()
+
+            # Action buttons
+            _a1, _a2, _a3 = st.columns(3)
+            with _a1:
                 if monday_active:
-                    if st.button("Push to Monday", key="opp_push"):
+                    if st.button("📋 Push to Monday", key=f"opp_push_{_idx}",
+                                 use_container_width=True, type="primary"):
                         with st.spinner("Pushing…"):
-                            res = push_tender_to_monday(row.to_dict())
-                        st.success(f"Ticket: **{res.get('ticket_action')}** | Lead: **{res.get('lead_action')}**")
+                            _res = push_tender_to_monday(_row.to_dict())
+                        st.success(f"Ticket: {_res.get('ticket_action')} · Lead: {_res.get('lead_action')}")
                 else:
-                    st.info("Add MONDAY_API_KEY to enable push.")
-            with col_b:
-                if st.button("Re-score with AI", key="opp_rescore"):
+                    st.caption("Add MONDAY_API_KEY to enable push")
+            with _a2:
+                if st.button("🚫 Mark irrelevant", key=f"opp_irrel_{_idx}",
+                             use_container_width=True):
+                    supabase.table("sa_tenders").update(
+                        {"is_irrelevant": True}
+                    ).eq("id", int(_row["id"])).execute()
+                    st.cache_data.clear()
+                    st.session_state["opp_card_idx"] = max(0, _idx - 1)
+                    st.rerun()
+            with _a3:
+                _btn_label = "🤖 Score this" if pd.isna(_score_num) else "🔄 Re-score"
+                if st.button(_btn_label, key=f"opp_score_{_idx}", use_container_width=True):
                     with st.spinner("Scoring…"):
                         try:
-                            scored = ai_score_tender(row.to_dict())
-                            blob = json.dumps({
-                                "rationale": scored["rationale"],
-                                "partner_type": scored["partner_type"],
-                                "proposed_solutions": scored["proposed_solutions"],
-                                "outreach_angle": scored["outreach_angle"],
-                            })
-                            supabase.table("sa_tenders").update(
-                                {"ai_score": scored["score"], "ai_rationale": blob}
-                            ).eq("tender_number", sel_tn).execute()
+                            _sc2 = ai_score_tender(_row.to_dict())
+                            supabase.table("sa_tenders").update({
+                                "ai_score": _sc2["score"],
+                                "ai_rationale": json.dumps({
+                                    "rationale": _sc2["rationale"],
+                                    "partner_type": _sc2["partner_type"],
+                                    "proposed_solutions": _sc2["proposed_solutions"],
+                                    "outreach_angle": _sc2["outreach_angle"],
+                                }),
+                            }).eq("id", int(_row["id"])).execute()
                             st.cache_data.clear()
-                            st.success(f"Score: **{scored['score']}/10** — {scored['rationale']}")
-                        except Exception as e:
-                            st.error(f"Scoring failed: {e}")
+                            st.rerun()
+                        except Exception as _se:
+                            st.error(f"Scoring failed: {_se}")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 3 — PARTNERS
