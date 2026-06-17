@@ -14,12 +14,14 @@ jobs:
   ingest:
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    env:
+      ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true   # allow Node.js 20 actions until Sep 2026
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
