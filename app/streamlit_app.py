@@ -1664,6 +1664,48 @@ if _page == "✅ Lead Verification":
                 with _lk_rb:
                     if _lk_crm_r.get("crm_url"):
                         st.markdown(f"[Open in Monday →]({_lk_crm_r['crm_url']})")
+                    _crm_ph = _lk_crm_r.get("crm_phone", "")
+                    if not (_crm_ph and str(_crm_ph) not in ("", "nan", "None")):
+                        _cph_apo = bool(st.secrets.get("APOLLO_API_KEY","") or os.getenv("APOLLO_API_KEY",""))
+                        _cph_lsh = bool(st.secrets.get("LUSHA_API_KEY","")  or os.getenv("LUSHA_API_KEY",""))
+                        if (_cph_apo or _cph_lsh) and st.button(
+                                "📞 Find Phone", key="lk_crm_fp_btn",
+                                use_container_width=True):
+                            _cph = {}
+                            if _cph_apo:
+                                with st.spinner("Apollo…"):
+                                    try:
+                                        _cph_raw = _apollo_match(
+                                            _lk_n_disp,
+                                            _lk_crm_r.get("crm_linkedin",""),
+                                        )
+                                        _cph_phs = _cph_raw.get("phone_numbers") or []
+                                        if _cph_phs:
+                                            _p0 = _cph_phs[0]
+                                            _cph["phone"]  = ((_p0.get("sanitized_number") or _p0.get("raw_number")) if isinstance(_p0, dict) else str(_p0))
+                                            _cph["source"] = "Apollo"
+                                    except Exception:
+                                        pass
+                            if not _cph.get("phone") and _cph_lsh:
+                                with st.spinner("Lusha…"):
+                                    try:
+                                        _cph_np = _lk_n_disp.split()
+                                        _cph_l  = _lusha_search_contacts(
+                                            first_name=_cph_np[0] if _cph_np else "",
+                                            last_name=_cph_np[-1] if len(_cph_np) > 1 else "",
+                                        )
+                                        for _lc2 in _cph_l:
+                                            _ln2 = _norm_lusha(_lc2)
+                                            if _ln2["phone"]:
+                                                _cph["phone"]  = _ln2["phone"]
+                                                _cph["source"] = "Lusha"
+                                                break
+                                    except Exception:
+                                        pass
+                            if _cph.get("phone"):
+                                st.success(f"📞 {_cph['phone']} (via {_cph['source']})")
+                            else:
+                                st.caption("No phone found")
         else:
             st.warning(f"❌ **{_lk_n_disp}** not found in Monday CRM")
             _has_apo = bool(st.secrets.get("APOLLO_API_KEY", "") or os.getenv("APOLLO_API_KEY", ""))
@@ -1774,8 +1816,60 @@ if _page == "✅ Lead Verification":
                     if _cc.get("email"):
                         _ev = " ✓" if _cc.get("email_status") in ("verified",) else ""
                         st.markdown(f"📧 **{_cc['email']}**{_ev}")
-                    if _cc.get("phone"):
-                        st.markdown(f"📞 **{_cc['phone']}**")
+                    _ph_sk = f"lk_phone_{card_set_key}_{_ci}"
+                    _found_phone = _cc.get("phone") or st.session_state.get(_ph_sk, {}).get("phone", "")
+                    if _found_phone:
+                        st.markdown(f"📞 **{_found_phone}**")
+                    else:
+                        _fp_has_apo = bool(st.secrets.get("APOLLO_API_KEY","") or os.getenv("APOLLO_API_KEY",""))
+                        _fp_has_lsh = bool(st.secrets.get("LUSHA_API_KEY","")  or os.getenv("LUSHA_API_KEY",""))
+                        if (_fp_has_apo or _fp_has_lsh) and st.button(
+                                "📞 Find Phone", key=f"lk_fp_btn_{card_set_key}_{_ci}",
+                                use_container_width=False):
+                            _fp_result = {}
+                            if _fp_has_apo:
+                                with st.spinner("Apollo phone lookup…"):
+                                    try:
+                                        _fp_raw = _apollo_match(
+                                            _cc.get("name",""),
+                                            _cc.get("linkedin",""),
+                                        )
+                                        _fp_phones = _fp_raw.get("phone_numbers") or []
+                                        if _fp_phones:
+                                            _fp0 = _fp_phones[0]
+                                            _fp_result["phone"] = (
+                                                (_fp0.get("sanitized_number") or _fp0.get("raw_number"))
+                                                if isinstance(_fp0, dict) else str(_fp0)
+                                            )
+                                            _fp_result["source"] = "Apollo"
+                                    except Exception:
+                                        pass
+                            if not _fp_result.get("phone") and _fp_has_lsh:
+                                with st.spinner("Lusha phone lookup…"):
+                                    try:
+                                        _fp_np = (_cc.get("name","")).split()
+                                        _fp_l = _lusha_search_contacts(
+                                            first_name=_fp_np[0] if _fp_np else "",
+                                            last_name=_fp_np[-1] if len(_fp_np) > 1 else "",
+                                            company=_cc.get("company",""),
+                                        )
+                                        for _fpc in _fp_l:
+                                            _fp_norm = _norm_lusha(_fpc)
+                                            if _fp_norm["phone"]:
+                                                _fp_result["phone"] = _fp_norm["phone"]
+                                                _fp_result["source"] = "Lusha"
+                                                break
+                                    except Exception:
+                                        pass
+                            if _fp_result.get("phone"):
+                                st.session_state[_ph_sk] = _fp_result
+                                st.rerun()
+                            else:
+                                st.caption("📞 No phone found via Apollo or Lusha")
+                        elif not (_fp_has_apo or _fp_has_lsh):
+                            st.caption("📞 —")
+                    if st.session_state.get(_ph_sk, {}).get("source"):
+                        st.caption(f"Phone via {st.session_state[_ph_sk]['source']}")
                     if _cc.get("company_phone"):
                         st.markdown(f"🏢 **{_cc['company_phone']}** (company)")
                     if _cc.get("linkedin"):
