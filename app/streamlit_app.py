@@ -572,11 +572,12 @@ def _apollo_match(name: str, linkedin_url: str) -> dict:
     key = st.secrets.get("APOLLO_API_KEY", "") or os.getenv("APOLLO_API_KEY", "")
     if not key:
         return {}
-    payload = json.dumps({"api_key": key, "name": name,
-                          "linkedin_url": linkedin_url}).encode()
+    payload = json.dumps({"name": name, "linkedin_url": linkedin_url}).encode()
     req = _urlreq.Request(
         "https://api.apollo.io/api/v1/people/match",
-        data=payload, headers={"Content-Type": "application/json"}, method="POST",
+        data=payload,
+        headers={"Content-Type": "application/json", "X-Api-Key": key},
+        method="POST",
     )
     with _urlreq.urlopen(req, timeout=20) as r:
         return json.loads(r.read()).get("person") or {}
@@ -2913,10 +2914,10 @@ _INTEL_COUNTRIES = [
 
 _INTEL_EVENT_TYPES = {
     "Ransomware":         "ransomleak",
-    "Credential Leak":    "credential",
-    "Dark Web Mention":   "chat_message",
+    "Credential Leak":    "leaked-credential",
+    "Dark Web Mention":   "chat-message",
     "Paste / Dump":       "paste",
-    "Stealer Log":        "stealer_log",
+    "Stealer Log":        "stealer-log",
 }
 
 _INTEL_GOOGLE_TERMS = (
