@@ -836,7 +836,7 @@ with st.sidebar:
 
     # ── Country selector ──────────────────────────────────────────────────────
     if "pull_countries" not in st.session_state:
-        st.session_state["pull_countries"] = _PULL_ALL_COUNTRIES[:]
+        st.session_state["pull_countries"] = []
     with st.expander("🌍 Countries to pull", expanded=False):
         _ca, _cb = st.columns(2)
         with _ca:
@@ -854,14 +854,18 @@ with st.sidebar:
             label_visibility="collapsed",
         )
 
-    _pull_label = (
-        f"📥 Pull ({len(_pull_countries)} countries)"
-        if _pull_countries and len(_pull_countries) < len(_PULL_ALL_COUNTRIES)
-        else "📥 Pull all tenders"
-    )
+    if not _pull_countries:
+        _pull_label = "📥 Pull all tenders"
+        _pull_help  = "No countries selected — will scrape all"
+    elif len(_pull_countries) == len(_PULL_ALL_COUNTRIES):
+        _pull_label = "📥 Pull all tenders"
+        _pull_help  = "Scrapes all countries"
+    else:
+        _pull_label = f"📥 Pull ({len(_pull_countries)} countries)"
+        _pull_help  = ", ".join(_pull_countries[:6]) + ("…" if len(_pull_countries) > 6 else "")
     if st.button(_pull_label, use_container_width=True,
                  disabled=_pull_blocked, type="primary",
-                 help="Scrapes open & awarded tenders for selected countries in the background"):
+                 help=_pull_help):
         if _ps != "running":
             _env_ov: dict = {}
             for _k in ("SUPABASE_URL", "SUPABASE_KEY", "GROQ_API_KEY", "CEREBRAS_API_KEY",
