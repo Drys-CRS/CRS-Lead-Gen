@@ -12,6 +12,7 @@ import threading
 import datetime as _dt
 import urllib.request as _urlreq
 import urllib.parse as _urlparse
+import urllib.error as _urlerr
 import xml.etree.ElementTree as _ET
 import streamlit as st
 import pandas as pd
@@ -578,9 +579,10 @@ def _apollo_post(endpoint: str, payload: dict) -> dict:
     key = _apollo_key()
     if not key:
         raise RuntimeError("APOLLO_API_KEY not configured")
+    body_with_key = {**payload, "api_key": key}
     req = _urlreq.Request(
         f"https://api.apollo.io/api/v1/{endpoint}",
-        data=json.dumps(payload).encode(),
+        data=json.dumps(body_with_key).encode(),
         headers={"Content-Type": "application/json",
                  "Cache-Control": "no-cache", "X-Api-Key": key},
         method="POST",
@@ -588,7 +590,7 @@ def _apollo_post(endpoint: str, payload: dict) -> dict:
     try:
         with _urlreq.urlopen(req, timeout=20) as r:
             return json.loads(r.read())
-    except _urlreq.HTTPError as e:
+    except _urlerr.HTTPError as e:
         body = ""
         try: body = e.read().decode("utf-8", errors="ignore")[:300]
         except Exception: pass
