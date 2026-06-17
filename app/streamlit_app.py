@@ -857,6 +857,137 @@ def _pull_worker(env_overrides: dict, countries_sel: list | None = None) -> None
         _PULL_STATE.update({"status": "failed", "result": {"error": str(_e)}})
 
 # ─────────────────────────────────────────────────────────────────────────────
+# CRS PORTFOLIO — decision-maker title maps (used by Lead Verification DM
+# search and the Weekly Leads tab)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_CRS_DM_TITLES: dict[str, list[str]] = {
+    "All CRS products": [
+        "CISO", "Chief Information Security Officer",
+        "CTO", "CIO", "IT Director", "Head of IT", "IT Manager",
+        "ICT Manager", "Group IT Manager", "Head of Cybersecurity",
+        "Security Manager", "Information Security Manager",
+        "Head of Security", "Cybersecurity Manager", "SOC Manager",
+    ],
+    "NDR / XDR / SOC — VECTRA AI": [
+        "CISO", "SOC Manager", "Head of Security Operations",
+        "VP Security", "Security Architect", "Head of Cybersecurity",
+        "Information Security Manager", "Security Operations Manager",
+        "Head of SOC", "Threat Intelligence Lead",
+    ],
+    "Vulnerability Mgmt — vRx / Strobes": [
+        "CISO", "IT Manager", "Head of IT", "Security Manager",
+        "IT Security Lead", "Head of Vulnerability Management",
+        "Patch Management Lead", "IT Risk Manager",
+    ],
+    "AppSec / DevSecOps — Aikido / BlueFlag": [
+        "CTO", "Head of Engineering", "Head of Software Development",
+        "DevOps Lead", "Application Security Lead", "VP Engineering",
+        "CISO", "Head of Development", "Software Architect",
+    ],
+    "GRC / Compliance / POPIA — Panorays / Telivy": [
+        "CIO", "CISO", "Head of Compliance", "Risk Manager",
+        "IT Governance Manager", "Data Protection Officer",
+        "Head of Risk & Compliance", "Chief Risk Officer",
+        "Privacy Officer", "Compliance Manager",
+    ],
+    "Dark Web / Threat Intel — Flare": [
+        "CISO", "Head of Cybersecurity", "Threat Intelligence Manager",
+        "Security Operations Manager", "SOC Manager",
+        "Information Security Manager",
+    ],
+    "SASE / SIEM / MDR — Todyl": [
+        "CISO", "IT Manager", "Head of IT", "Network Manager",
+        "Head of Infrastructure", "IT Operations Manager",
+        "Network Security Manager", "SOC Manager",
+    ],
+    "Endpoint / Encryption — BeachheadSecure / SMBsecure": [
+        "IT Manager", "Head of IT", "Head of Infrastructure",
+        "Systems Administrator", "IT Operations Manager",
+        "IT Security Manager", "Desktop Manager",
+    ],
+    "Phishing Sim / Awareness — GoldPhish": [
+        "CIO", "CISO", "L&D Manager", "Head of Learning",
+        "HR Director", "Training Manager", "IT Security Manager",
+        "Information Security Manager",
+    ],
+    "IBM / Red Hat / SUSE Training": [
+        "L&D Manager", "Training Manager", "Head of Learning",
+        "IT Skills Manager", "HR Director",
+        "Head of IT", "IT Manager", "CIO",
+    ],
+    "CompTIA Training": [
+        "L&D Manager", "Training Manager", "Head of Learning",
+        "IT Skills Manager", "HR Director", "Head of IT", "IT Manager",
+    ],
+    "VAPT / Pentest — CRS Services": [
+        "CISO", "Head of Cybersecurity", "IT Manager",
+        "Risk Manager", "IT Governance Manager",
+        "Head of IT Audit", "Information Security Manager",
+    ],
+}
+
+# Strong-fit sectors: financial services, government, healthcare, telco, mining
+_CRS_STRONG_SECTORS = {
+    "bank", "financ", "insur", "govern", "public sector", "municipal",
+    "health", "hospital", "clinic", "telecom", "telco", "network",
+    "mining", "energy", "utility", "utilities", "defence", "defense",
+    "revenue service", "treasury",
+}
+_CRS_MEDIUM_SECTORS = {
+    "retail", "manufactur", "logistics", "transport", "education",
+    "university", "law firm", "legal", "media", "broadcast",
+    "property", "construction ict", "technology",
+}
+
+# Titles that indicate a genuine security/IT decision-maker
+_CRS_DM_KEYWORDS = {
+    "ciso", "information security", "cybersecurity", "cyber security",
+    "soc manager", "head of security", "security manager",
+    "it director", "head of it", "ict manager", "group it",
+    "cto", "cio", "it manager", "it governance", "data protection officer",
+    "risk manager", "compliance manager", "devops", "application security",
+    "threat intelligence", "vulnerability", "pentest",
+}
+
+
+def _crs_fit_score(title: str, company_sector: str,
+                   country: str, has_email: bool, has_phone: bool) -> int:
+    """Deterministic CRS-fit score for an Apollo contact (0–100)."""
+    score = 0
+    t = title.lower()
+    s = (company_sector or "").lower()
+    c = (country or "").lower()
+
+    # Title fit
+    if any(kw in t for kw in _CRS_DM_KEYWORDS):
+        score += 35
+    elif any(x in t for x in ("manager", "director", "head", "officer", "lead")):
+        score += 18
+
+    # Sector fit
+    if any(sk in s for sk in _CRS_STRONG_SECTORS):
+        score += 30
+    elif any(sk in s for sk in _CRS_MEDIUM_SECTORS):
+        score += 15
+
+    # Geography — African priority
+    african_countries = {"south africa", "nigeria", "kenya", "ghana", "tanzania",
+                         "uganda", "zimbabwe", "zambia", "botswana", "namibia",
+                         "rwanda", "ethiopia", "mozambique", "senegal", "ivory coast"}
+    if c in african_countries:
+        score += 20
+    elif c:
+        score += 8
+
+    # Contact availability
+    if has_email:  score += 8
+    if has_phone:  score += 7
+
+    return min(score, 100)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # SIDEBAR — Navigation + health check + action buttons
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -866,6 +997,7 @@ _NAV_PAGES = [
     "🤝 Partners",
     "🔍 LinkedIn Dork",
     "🛡️ Lead Intelligence",
+    "💡 Weekly Leads",
 ]
 
 with st.sidebar:
@@ -1618,26 +1750,61 @@ if _page == "✅ Lead Verification":
         if not _lk_results:
             st.info("No results found. Try the LinkedIn Dork tab for manual search.")
         else:
-            _rc1, _rc2 = st.columns([3, 1])
-            with _rc1:
-                st.markdown(f"**{len(_lk_results)} contacts found**")
-            with _rc2:
-                if _lk_c_val and _has_apo:
-                    if st.button("👥 Decision makers", key="lk_dm_btn",
-                                 use_container_width=True):
-                        with st.spinner(f"Apollo: decision makers at {_lk_c_val}…"):
-                            try:
-                                st.session_state["lk_dm"] = [
-                                    _norm_apollo(p) for p in _apollo_search_people(
-                                        company=_lk_c_val, num=8,
-                                        titles=["CISO","CTO","CIO","CEO","IT Director",
-                                                "Head of IT","IT Manager","ICT Manager",
-                                                "Security Manager","Head of Cybersecurity",
-                                                "VP Technology","Group IT Manager"],
+            st.markdown(f"**{len(_lk_results)} contacts found**")
+
+            # ── Decision-maker search: CRS portfolio–focused ─────────────────
+            if _has_apo:
+                with st.expander("👥 Find decision makers (CRS portfolio)", expanded=bool(_lk_c_val)):
+                    _dm1, _dm2, _dm3 = st.columns([3, 3, 2])
+                    with _dm1:
+                        _dm_company_val = st.text_input(
+                            "Company", value=_lk_c_val,
+                            key="dm_company_input",
+                            placeholder="e.g. Absa Bank",
+                        )
+                    with _dm2:
+                        _dm_sol = st.selectbox(
+                            "Solution focus",
+                            list(_CRS_DM_TITLES.keys()),
+                            key="dm_solution",
+                            help="Filters Apollo titles to decision makers who buy this solution",
+                        )
+                    with _dm3:
+                        _dm_num = st.number_input("Max results", 5, 20, 10, step=5, key="dm_num")
+                    _dm_titles_resolved = _CRS_DM_TITLES[_dm_sol]
+                    st.caption(
+                        f"Searching for: {', '.join(_dm_titles_resolved[:6])}"
+                        + (f" + {len(_dm_titles_resolved)-6} more" if len(_dm_titles_resolved) > 6 else "")
+                    )
+                    if st.button("🔍 Search decision makers", key="lk_dm_btn",
+                                 type="primary", use_container_width=True):
+                        if not _dm_company_val.strip():
+                            st.warning("Enter a company name to search decision makers.")
+                        else:
+                            with st.spinner(f"Apollo: {_dm_sol} contacts at {_dm_company_val}…"):
+                                try:
+                                    _raw_dm = _apollo_search_people(
+                                        company=_dm_company_val.strip(),
+                                        num=int(_dm_num),
+                                        titles=_dm_titles_resolved,
                                     )
-                                ]
-                            except Exception as _dme:
-                                st.error(f"Apollo error: {_dme}")
+                                    _dm_normed = [_norm_apollo(p) for p in _raw_dm]
+                                    # Score each result for CRS fit so they render ranked
+                                    for _dmp in _dm_normed:
+                                        _dmp["crs_fit"] = _crs_fit_score(
+                                            _dmp.get("title", ""),
+                                            "",
+                                            "",
+                                            _dmp.get("has_email", False),
+                                            bool(_dmp.get("has_phone")),
+                                        )
+                                    _dm_normed.sort(key=lambda x: -x.get("crs_fit", 0))
+                                    st.session_state["lk_dm"] = _dm_normed
+                                    st.session_state["lk_dm_label"] = (
+                                        f"{_dm_sol} · {_dm_company_val.strip()}"
+                                    )
+                                except Exception as _dme:
+                                    st.error(f"Apollo error: {_dme}")
 
         def _render_lk_cards(cards: list, key_prefix: str) -> None:
             for _ci, _cc in enumerate(cards):
@@ -1874,7 +2041,8 @@ if _page == "✅ Lead Verification":
     _lk_dm = st.session_state.get("lk_dm")
     if _lk_dm:
         st.divider()
-        st.markdown(f"**{len(_lk_dm)} decision makers — {st.session_state.get('lk_company','')}**")
+        _dm_label = st.session_state.get("lk_dm_label") or st.session_state.get("lk_company", "")
+        st.markdown(f"**{len(_lk_dm)} decision makers — {_dm_label}**")
         _render_lk_cards(_lk_dm, "dm")
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -3536,3 +3704,270 @@ if _page == "🛡️ Lead Intelligence":
                     ]
                 _copy_block("\n".join(l for l in _ir_lines if l),
                             key=f"intel_copy_{_ir_idx}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE 6 — WEEKLY LEADS
+# ══════════════════════════════════════════════════════════════════════════════
+if _page == "💡 Weekly Leads":
+    st.subheader("Weekly Lead Recommendations")
+    st.caption(
+        "Apollo-powered proactive pipeline: search by CRS solution and African sector, "
+        "scored for CRS-portfolio fit and auto-checked against Monday CRM. "
+        "Refresh manually — results are cached for the session."
+    )
+
+    _has_apo_wl = bool(st.secrets.get("APOLLO_API_KEY","") or os.getenv("APOLLO_API_KEY",""))
+    if not _has_apo_wl:
+        st.warning("Apollo API key required. Add APOLLO_API_KEY to your secrets.")
+        st.stop()
+
+    # ── Controls ──────────────────────────────────────────────────────────────
+    _wl_c1, _wl_c2, _wl_c3 = st.columns([3, 3, 2])
+    with _wl_c1:
+        _wl_solutions = st.multiselect(
+            "Solution focus",
+            list(_CRS_DM_TITLES.keys()),
+            default=["All CRS products"],
+            key="wl_solutions",
+            help="Drives which decision-maker titles Apollo searches for",
+        )
+    with _wl_c2:
+        _WL_SECTORS = [
+            "financial services",
+            "banking",
+            "insurance",
+            "government",
+            "public sector",
+            "healthcare",
+            "hospital",
+            "telecommunications",
+            "mining",
+            "energy",
+            "education",
+            "retail",
+            "manufacturing",
+            "logistics",
+            "technology",
+        ]
+        _wl_sectors = st.multiselect(
+            "Industry / sector",
+            _WL_SECTORS,
+            default=["financial services", "government", "healthcare", "telecommunications"],
+            key="wl_sectors",
+        )
+    with _wl_c3:
+        _wl_countries = st.multiselect(
+            "Countries",
+            ["South Africa", "Nigeria", "Kenya", "Ghana", "Tanzania",
+             "Uganda", "Zimbabwe", "Botswana", "Namibia", "Rwanda"],
+            default=["South Africa", "Nigeria", "Kenya"],
+            key="wl_countries",
+        )
+
+    _wl_num = st.slider("Max results per search", 5, 20, 10, step=5, key="wl_num")
+
+    _wl_run = st.button(
+        "🔄 Refresh leads", type="primary", key="wl_run",
+        use_container_width=False,
+    )
+
+    # ── Run Apollo ────────────────────────────────────────────────────────────
+    if _wl_run or "wl_results" not in st.session_state:
+        if not _wl_solutions:
+            st.warning("Select at least one solution focus.")
+        else:
+            # Deduplicate titles across selected solutions
+            _wl_titles_set: list[str] = []
+            for _sol_k in _wl_solutions:
+                for _t in _CRS_DM_TITLES.get(_sol_k, []):
+                    if _t not in _wl_titles_set:
+                        _wl_titles_set.append(_t)
+
+            _wl_raw_results: list[dict] = []
+            _seen_apo_ids: set[str] = set()
+            _total_searches = len(_wl_sectors) * len(_wl_countries)
+            _prog_bar = st.progress(0.0, text="Searching Apollo…")
+            _prog_step = 0
+
+            for _wl_sector in (_wl_sectors or ["cybersecurity"]):
+                for _wl_ctry in (_wl_countries or ["South Africa"]):
+                    try:
+                        _wl_payload: dict = {
+                            "per_page": int(_wl_num),
+                            "page": 1,
+                            "person_titles": _wl_titles_set[:10],
+                            "q_keywords": _wl_sector,
+                            "person_locations": [_wl_ctry],
+                        }
+                        _wl_raw = _apollo_post(
+                            "mixed_people/api_search", _wl_payload
+                        ).get("people") or []
+                        for _p in _wl_raw:
+                            _pid = _p.get("id", "")
+                            if _pid and _pid in _seen_apo_ids:
+                                continue
+                            if _pid:
+                                _seen_apo_ids.add(_pid)
+                            _normed = _norm_apollo(_p)
+                            _normed["_sector_searched"] = _wl_sector
+                            _normed["_country_searched"] = _wl_ctry
+                            # Score for CRS fit
+                            _org_industry = (
+                                (_p.get("organization") or {}).get("industry", "")
+                                or _wl_sector
+                            )
+                            _normed["crs_fit"] = _crs_fit_score(
+                                _normed.get("title", ""),
+                                _org_industry,
+                                _wl_ctry,
+                                _normed.get("has_email", False),
+                                bool(_normed.get("has_phone")),
+                            )
+                            _wl_raw_results.append(_normed)
+                    except Exception as _wl_err:
+                        st.warning(f"Apollo ({_wl_sector} / {_wl_ctry}): {str(_wl_err)[:100]}")
+                    _prog_step += 1
+                    _prog_bar.progress(
+                        min(_prog_step / max(_total_searches, 1), 1.0),
+                        text=f"Searched: {_wl_sector} / {_wl_ctry}",
+                    )
+
+            _prog_bar.empty()
+            # Sort by CRS fit descending
+            _wl_raw_results.sort(key=lambda r: -r.get("crs_fit", 0))
+            st.session_state["wl_results"]      = _wl_raw_results
+            st.session_state["wl_refreshed_at"] = _dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    # ── Display ───────────────────────────────────────────────────────────────
+    _wl_results: list[dict] = st.session_state.get("wl_results", [])
+    _wl_ts = st.session_state.get("wl_refreshed_at", "")
+    if _wl_ts:
+        st.caption(f"Last refreshed: {_wl_ts} · {len(_wl_results)} contacts")
+
+    if not _wl_results:
+        st.info("Click **Refresh leads** to pull this week's recommended contacts from Apollo.")
+    else:
+        # ── Fit-score filter ──────────────────────────────────────────────────
+        _wl_min_fit = st.slider(
+            "Minimum CRS-fit score", 0, 100, 30, step=5, key="wl_min_fit",
+        )
+        _wl_filtered = [r for r in _wl_results if r.get("crs_fit", 0) >= _wl_min_fit]
+        st.markdown(f"**{len(_wl_filtered)} leads** (fit ≥ {_wl_min_fit}%)")
+
+        for _wi, _wc in enumerate(_wl_filtered):
+            _wcrm_sk = f"wl_crm_{_wi}"
+            _wph_sk  = f"wl_ph_{_wi}"
+            _wem_sk  = f"wl_em_{_wi}"
+            _wname   = _wc.get("name") or f"Contact {_wi+1}"
+            _wfit    = _wc.get("crs_fit", 0)
+
+            # Auto CRM check
+            _wcrm = _auto_crm_check(
+                _wc.get("name", ""), _wc.get("email", ""),
+                _wc.get("linkedin", ""), _wcrm_sk,
+            )
+            _wmon_email = (_wcrm.get("crm_email", "") if _wcrm and _wcrm.get("on_crm") else "")
+            _wmon_phone = (_wcrm.get("crm_phone", "") if _wcrm and _wcrm.get("on_crm") else "")
+
+            # Fit colour band
+            _fit_colour = (
+                "🟢" if _wfit >= 70
+                else "🟡" if _wfit >= 45
+                else "🔴"
+            )
+
+            with st.container(border=True):
+                _wA, _wB = st.columns([4, 2])
+                with _wA:
+                    _w_hdr = f"### {_fit_colour} {_wname}"
+                    if _wcrm and _wcrm.get("on_crm"):
+                        _w_hdr += "  `✓ CRM`"
+                    st.markdown(_w_hdr)
+                    _wrow = [x for x in [_wc.get("title"), _wc.get("company")] if x]
+                    if _wrow:
+                        st.caption(" · ".join(_wrow))
+                    _wtags = []
+                    if _wc.get("_sector_searched"):
+                        _wtags.append(f"🏭 {_wc['_sector_searched'].title()}")
+                    if _wc.get("_country_searched"):
+                        _wtags.append(f"📍 {_wc['_country_searched']}")
+                    if _wtags:
+                        st.caption("  ".join(_wtags))
+                    if _wc.get("linkedin"):
+                        st.markdown(f"[LinkedIn]({_wc['linkedin']})")
+                with _wB:
+                    st.metric("CRS Fit", f"{_wfit}%")
+                    _we_disp = _wmon_email or _wc.get("email", "")
+                    _wp_disp = _wmon_phone or _wc.get("phone", "")
+                    if _we_disp:
+                        _w_esrc = "✅ Monday" if _wmon_email else "Apollo"
+                        st.markdown(f"📧 `{_we_disp}` _{_w_esrc}_")
+                    elif _wc.get("has_email"):
+                        st.caption("📧 Email available (enrich to reveal)")
+                    if _wp_disp:
+                        st.markdown(f"📞 `{_wp_disp}`")
+                    elif _wc.get("has_phone"):
+                        st.caption("📞 Phone available (enrich to reveal)")
+
+                # ── Enrich / push row ─────────────────────────────────────────
+                _wact1, _wact2, _wact3 = st.columns(3)
+                with _wact1:
+                    if not _we_disp and _wc.get("id") and not st.session_state.get(_wem_sk):
+                        if st.button("💳 Enrich (1 credit)", key=f"wl_enrich_{_wi}",
+                                     use_container_width=True):
+                            with st.spinner("Apollo enrichment…"):
+                                try:
+                                    _wenr = _apollo_post("people/match", {
+                                        "id": _wc["id"],
+                                        "reveal_personal_emails": True,
+                                        "reveal_phone_number": True,
+                                    }).get("person") or {}
+                                    _wenr_n = _norm_apollo(_wenr)
+                                    st.session_state[_wem_sk] = _wenr_n.get("email", "")
+                                    st.session_state[_wph_sk] = _wenr_n.get("phone", "")
+                                    st.rerun()
+                                except Exception as _wee:
+                                    st.error(f"Enrichment failed: {_wee}")
+                    elif st.session_state.get(_wem_sk):
+                        st.success(f"📧 {st.session_state[_wem_sk]}")
+                with _wact2:
+                    if monday_active:
+                        _wpush_pl = {
+                            "name":           _wname,
+                            "title":          _wc.get("title", ""),
+                            "company":        _wc.get("company", ""),
+                            "email":          st.session_state.get(_wem_sk) or _we_disp,
+                            "phone":          st.session_state.get(_wph_sk) or _wp_disp,
+                            "linkedin":       _wc.get("linkedin", ""),
+                            "accuracy_score": str(_wfit),
+                            "provider_chain": f"Weekly Leads · Apollo",
+                        }
+                        _w_push_lbl = (
+                            "♻️ Update Monday" if (_wcrm and _wcrm.get("on_crm"))
+                            else "📋 Push to Monday"
+                        )
+                        if st.button(_w_push_lbl, key=f"wl_push_{_wi}",
+                                     use_container_width=True,
+                                     type="primary" if not (_wcrm and _wcrm.get("on_crm")) else "secondary"):
+                            with st.spinner("Syncing…"):
+                                try:
+                                    _wmr = sync_lead_to_monday(_wpush_pl)
+                                    st.success(f"{_wmr.get('action','done').title()} · "
+                                               f"ID: {_wmr.get('item_id')}")
+                                    del st.session_state[_wcrm_sk]
+                                except Exception as _wpe:
+                                    st.error(f"Push failed: {_wpe}")
+                with _wact3:
+                    _copy_block(
+                        "\n".join(l for l in [
+                            f"NAME: {_wname}",
+                            f"Title: {_wc.get('title','')}",
+                            f"Company: {_wc.get('company','')}",
+                            f"Email: {st.session_state.get(_wem_sk) or _we_disp}",
+                            f"Phone: {st.session_state.get(_wph_sk) or _wp_disp}",
+                            f"LinkedIn: {_wc.get('linkedin','')}",
+                            f"CRS Fit: {_wfit}%",
+                            f"Sector: {_wc.get('_sector_searched','')}",
+                        ] if l),
+                        key=f"wl_copy_{_wi}",
+                    )
