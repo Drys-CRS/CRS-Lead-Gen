@@ -629,13 +629,149 @@ def _lusha_lookup(linkedin_url: str) -> dict:
 # ── Contact lookup helpers ────────────────────────────────────────────────────
 
 def _apollo_search_people(name: str = "", company: str = "",
-                           num: int = 5, titles: list = None) -> list:
-    """Search Apollo REST API. Returns list of raw people dicts."""
+                           num: int = 5, titles: list = None,
+                           locations: list = None) -> list:
+    """Search Apollo REST API for people. Returns list of raw people dicts."""
     kw = " ".join(p for p in [name, company] if p)
     payload: dict = {"per_page": num, "page": 1}
-    if kw:     payload["q_keywords"]    = kw
-    if titles: payload["person_titles"] = titles
+    if kw:        payload["q_keywords"]       = kw
+    if titles:    payload["person_titles"]    = titles
+    if locations: payload["person_locations"] = locations
     return _apollo_post("mixed_people/api_search", payload).get("people") or []
+
+
+def _apollo_search_companies(keywords: str = "", locations: list = None,
+                              employee_ranges: list = None,
+                              industries: list = None,
+                              num: int = 10) -> list:
+    """Search Apollo for organizations. Returns list of raw org dicts."""
+    payload: dict = {"per_page": min(num, 25), "page": 1}
+    if keywords:        payload["q_keywords"]                     = keywords
+    if locations:       payload["organization_locations"]         = locations
+    if employee_ranges: payload["organization_num_employees_ranges"] = employee_ranges
+    if industries:      payload["q_organization_keyword_tags"]    = industries
+    return _apollo_post("mixed_companies/search", payload).get("organizations") or []
+
+
+def _norm_org(o: dict) -> dict:
+    """Flatten an Apollo organization dict into a standard company dict."""
+    tech_raw = o.get("technologies") or []
+    tech_names = [
+        (t.get("name") or t.get("uid") or "")
+        for t in tech_raw if isinstance(t, dict)
+    ]
+    return {
+        "id":          o.get("id", ""),
+        "name":        o.get("name", ""),
+        "domain":      o.get("primary_domain") or o.get("website_url", ""),
+        "industry":    o.get("industry", ""),
+        "employees":   o.get("estimated_num_employees"),
+        "country":     o.get("country", ""),
+        "city":        o.get("city", ""),
+        "phone":       o.get("phone", ""),
+        "linkedin":    o.get("linkedin_url", ""),
+        "description": o.get("short_description", ""),
+        "keywords":    o.get("keywords") or [],
+        "tech":        [t for t in tech_names if t],
+    }
+
+
+# ── Tech-stack → CRS opportunity map ─────────────────────────────────────────
+# Keys are lowercase substrings matched against Apollo technology names.
+# Values: crs_fit bonus (added to base score) + opportunity text + solution tag.
+_TECH_OPP: dict[str, dict] = {
+    # Active security tooling → overlay / upgrade opportunities
+    "crowdstrike":     {"pts": 22, "sol": "VECTRA AI",         "why": "EDR in place → VECTRA NDR/XDR network layer gap"},
+    "sentinelone":     {"pts": 20, "sol": "VECTRA AI",         "why": "EDR buyer → VECTRA AI XDR overlay"},
+    "cylance":         {"pts": 18, "sol": "VECTRA AI",         "why": "Legacy AV → VECTRA AI NDR upgrade"},
+    "carbon black":    {"pts": 18, "sol": "VECTRA AI",         "why": "VMware Carbon Black → VECTRA AI"},
+    "microsoft defender": {"pts": 15, "sol": "VECTRA AI / Todyl", "why": "MS Defender → VECTRA ITDR + Todyl SIEM"},
+    "palo alto":       {"pts": 20, "sol": "Todyl SASE",        "why": "NGFW/Prisma → Todyl SASE consolidation"},
+    "fortinet":        {"pts": 18, "sol": "Todyl SASE",        "why": "FortiGate → Todyl SASE/SIEM upgrade"},
+    "checkpoint":      {"pts": 18, "sol": "Todyl SASE",        "why": "CheckPoint → Todyl SASE consolidation"},
+    "cisco meraki":    {"pts": 15, "sol": "Todyl SASE",        "why": "Cisco → Todyl SASE modernisation"},
+    "splunk":          {"pts": 22, "sol": "Todyl MXDR",        "why": "Splunk SIEM → Todyl MXDR cost reduction"},
+    "qradar":          {"pts": 22, "sol": "Todyl / IBM training", "why": "QRadar → IBM training + Todyl SIEM"},
+    "arcsight":        {"pts": 18, "sol": "Todyl MXDR",        "why": "Legacy SIEM → Todyl MXDR"},
+    "qualys":          {"pts": 22, "sol": "vRx / Strobes",     "why": "Vuln scanner → vRx patch mgmt + Strobes CTEM"},
+    "tenable":         {"pts": 22, "sol": "vRx / Strobes",     "why": "Tenable → vRx/Strobes CTEM upgrade"},
+    "nessus":          {"pts": 20, "sol": "vRx / Strobes",     "why": "Nessus → vRx patch management"},
+    "rapid7":          {"pts": 18, "sol": "Strobes PTaaS",     "why": "Rapid7 VM → Strobes PTaaS"},
+    "github":          {"pts": 18, "sol": "Aikido / BlueFlag", "why": "GitHub repos → Aikido DevSecOps + BlueFlag SDLC"},
+    "gitlab":          {"pts": 18, "sol": "Aikido / BlueFlag", "why": "GitLab → Aikido SAST/DAST + BlueFlag"},
+    "jira":            {"pts": 12, "sol": "Aikido",            "why": "Dev team → Aikido AppSec integration"},
+    "jenkins":         {"pts": 15, "sol": "Aikido",            "why": "CI/CD pipeline → Aikido DevSecOps scanning"},
+    "aws":             {"pts": 15, "sol": "Aikido / Strobes",  "why": "AWS cloud → Aikido CSPM + Strobes ASM"},
+    "azure":           {"pts": 15, "sol": "Aikido / Strobes",  "why": "Azure → Aikido CSPM + Strobes ASM"},
+    "google cloud":    {"pts": 12, "sol": "Aikido",            "why": "GCP → Aikido CSPM"},
+    "okta":            {"pts": 15, "sol": "VECTRA ITDR",       "why": "Okta IAM → VECTRA ITDR identity threat layer"},
+    "active directory":{"pts": 12, "sol": "VECTRA ITDR",       "why": "AD env → VECTRA ITDR lateral movement detection"},
+    "sailpoint":       {"pts": 15, "sol": "VECTRA ITDR",       "why": "IGA in place → VECTRA ITDR complement"},
+    "cyberark":        {"pts": 18, "sol": "VECTRA ITDR",       "why": "PAM user → VECTRA ITDR + BlueFlag"},
+    "office 365":      {"pts": 12, "sol": "Standss SendGuard", "why": "O365 email → SendGuard GRC + DLP"},
+    "microsoft 365":   {"pts": 12, "sol": "Standss SendGuard", "why": "M365 → SendGuard confirm-before-send"},
+    "salesforce":      {"pts": 10, "sol": "Panorays",          "why": "SaaS-heavy → Panorays 3rd-party risk"},
+    "servicenow":      {"pts": 10, "sol": "Panorays / Telivy", "why": "Enterprise ITSM → Telivy audit + Panorays TPRM"},
+    "vmware":          {"pts": 12, "sol": "BeachheadSecure",   "why": "VMware VMs → BeachheadSecure endpoint encryption"},
+    "bitlocker":       {"pts": 10, "sol": "BeachheadSecure",   "why": "BitLocker → BeachheadSecure RiskResponder upgrade"},
+    "knowbe4":         {"pts": 18, "sol": "GoldPhish",         "why": "Phishing training → GoldPhish replacement/supplement"},
+    "proofpoint":      {"pts": 15, "sol": "Standss / GoldPhish", "why": "Proofpoint → Standss email GRC + GoldPhish"},
+    "red hat":         {"pts": 12, "sol": "IBM/Red Hat training", "why": "Red Hat infra → Red Hat/IBM training demand"},
+    "ansible":         {"pts": 10, "sol": "Red Hat training",  "why": "Ansible → Red Hat Ansible training"},
+    "openshift":       {"pts": 12, "sol": "Red Hat training",  "why": "OpenShift platform → Red Hat training"},
+}
+
+
+def _score_org_for_crs(industry: str, country: str,
+                        employees: int | None, tech: list[str]) -> tuple[int, list[str], list[str]]:
+    """Returns (score 0-100, matched_tech_names, opportunity_angles)."""
+    score = 0
+    matched: list[str] = []
+    angles:  list[str] = []
+
+    ind = (industry or "").lower()
+    ctr = (country  or "").lower()
+    emp = employees or 0
+
+    # Sector fit (mirrors _crs_fit_score)
+    if any(sk in ind for sk in _CRS_STRONG_SECTORS):
+        score += 28
+    elif any(sk in ind for sk in _CRS_MEDIUM_SECTORS):
+        score += 14
+
+    # Geography
+    african = {"south africa", "nigeria", "kenya", "ghana", "tanzania",
+               "uganda", "zimbabwe", "zambia", "botswana", "namibia",
+               "rwanda", "ethiopia", "mozambique", "senegal"}
+    if ctr in african:
+        score += 18
+    elif ctr:
+        score += 6
+
+    # Company size — CRS sweet spot 50–5 000 employees
+    if 50 <= emp <= 500:
+        score += 12
+    elif 501 <= emp <= 5000:
+        score += 10
+    elif emp > 5000:
+        score += 6
+
+    # Tech-stack signals
+    tech_lower = [t.lower() for t in tech]
+    added_pts = 0
+    seen_sols: set[str] = set()
+    for kw, opp in _TECH_OPP.items():
+        if any(kw in t for t in tech_lower):
+            matched.append(kw.title())
+            if opp["sol"] not in seen_sols:
+                angles.append(f"**{opp['sol']}**: {opp['why']}")
+                seen_sols.add(opp["sol"])
+            pts = opp["pts"]
+            if added_pts + pts <= 30:
+                score += pts
+                added_pts += pts
+
+    return min(score, 100), matched, angles
 
 
 def _norm_apollo(p: dict) -> dict:
@@ -998,6 +1134,7 @@ _NAV_PAGES = [
     "🔍 LinkedIn Dork",
     "🛡️ Lead Intelligence",
     "💡 Weekly Leads",
+    "🎯 End-User Targets",
 ]
 
 with st.sidebar:
@@ -1627,6 +1764,139 @@ if _page == "🤝 Partners":
                         with st.spinner("Pushing…"):
                             res_p = push_partner_to_companies(pr.to_dict())
                         st.success(f"Action: **{res_p.get('action')}** | ID: {res_p.get('item_id')}")
+
+                # ── Apollo contact finder ─────────────────────────────────────
+                _p_has_apo = bool(st.secrets.get("APOLLO_API_KEY","") or os.getenv("APOLLO_API_KEY",""))
+                _p_apo_key = f"p_apo_contacts_{card_idx}"
+                if _p_has_apo:
+                    with st.expander(f"👥 Find contacts at {company}", expanded=False):
+                        _pa1, _pa2 = st.columns([3, 2])
+                        with _pa1:
+                            _p_sol = st.selectbox(
+                                "Solution focus",
+                                list(_CRS_DM_TITLES.keys()),
+                                key=f"p_sol_{card_idx}",
+                                index=0,
+                            )
+                        with _pa2:
+                            _p_dm_num = st.number_input(
+                                "Max", 5, 15, 8, step=5, key=f"p_dm_num_{card_idx}",
+                            )
+                        _p_titles = _CRS_DM_TITLES[_p_sol]
+                        st.caption(", ".join(_p_titles[:6]) + (f" +{len(_p_titles)-6} more" if len(_p_titles)>6 else ""))
+                        if st.button("🔍 Search", key=f"p_apo_search_{card_idx}",
+                                     type="primary", use_container_width=True):
+                            with st.spinner(f"Apollo: {_p_sol} at {company}…"):
+                                try:
+                                    _p_raw = _apollo_search_people(
+                                        company=company, num=int(_p_dm_num),
+                                        titles=_p_titles,
+                                    )
+                                    _p_normed = []
+                                    for _pr2 in _p_raw:
+                                        _pn = _norm_apollo(_pr2)
+                                        _pn["crs_fit"] = _crs_fit_score(
+                                            _pn.get("title",""), p_type or "",
+                                            country, _pn.get("has_email",False),
+                                            bool(_pn.get("has_phone")),
+                                        )
+                                        _p_normed.append(_pn)
+                                    _p_normed.sort(key=lambda z: -z.get("crs_fit",0))
+                                    st.session_state[_p_apo_key] = _p_normed
+                                except Exception as _pae:
+                                    st.error(f"Apollo error: {_pae}")
+
+                        _p_contacts = st.session_state.get(_p_apo_key, [])
+                        if _p_contacts:
+                            st.markdown(f"**{len(_p_contacts)} contacts found:**")
+                            for _pci, _pcc in enumerate(_p_contacts):
+                                _pc_crm_k = f"p_crm_{card_idx}_{_pci}"
+                                _pc_em_k  = f"p_em_{card_idx}_{_pci}"
+                                _pc_ph_k  = f"p_ph_{card_idx}_{_pci}"
+                                _pc_crm = _auto_crm_check(
+                                    _pcc.get("name",""), _pcc.get("email",""),
+                                    _pcc.get("linkedin",""), _pc_crm_k,
+                                )
+                                _pc_mon_email = (_pc_crm.get("crm_email","") if _pc_crm and _pc_crm.get("on_crm") else "")
+                                _pc_mon_phone = (_pc_crm.get("crm_phone","") if _pc_crm and _pc_crm.get("on_crm") else "")
+                                _pc_email = st.session_state.get(_pc_em_k) or _pc_mon_email or _pcc.get("email","")
+                                _pc_phone = st.session_state.get(_pc_ph_k) or _pc_mon_phone or _pcc.get("phone","")
+                                _pc_fit   = _pcc.get("crs_fit", 0)
+                                _pc_name  = _pcc.get("name") or f"Contact {_pci+1}"
+                                _pc_badge = "🟢" if _pc_fit >= 70 else "🟡" if _pc_fit >= 45 else "🔴"
+                                with st.container(border=True):
+                                    _pca, _pcb = st.columns([3, 2])
+                                    with _pca:
+                                        _pc_hdr = f"**{_pc_badge} {_pc_name}**"
+                                        if _pc_crm and _pc_crm.get("on_crm"):
+                                            _pc_hdr += "  `✓ CRM`"
+                                        st.markdown(_pc_hdr)
+                                        if _pcc.get("title"):
+                                            st.caption(_pcc["title"])
+                                        if _pcc.get("linkedin"):
+                                            st.markdown(f"[LinkedIn]({_pcc['linkedin']})")
+                                    with _pcb:
+                                        st.caption(f"Fit: {_pc_fit}%")
+                                        if _pc_email:
+                                            st.markdown(f"📧 `{_pc_email}`")
+                                        elif _pcc.get("has_email"):
+                                            st.caption("📧 available (enrich)")
+                                        if _pc_phone:
+                                            st.markdown(f"📞 `{_pc_phone}`")
+                                        elif _pcc.get("has_phone"):
+                                            st.caption("📞 available (enrich)")
+                                    _pcc1, _pcc2, _pcc3 = st.columns(3)
+                                    with _pcc1:
+                                        if not _pc_email and _pcc.get("id") and not st.session_state.get(_pc_em_k):
+                                            if st.button("💳 Enrich", key=f"p_enrich_{card_idx}_{_pci}",
+                                                         use_container_width=True):
+                                                with st.spinner("Enriching…"):
+                                                    try:
+                                                        _pe = _apollo_post("people/match", {
+                                                            "id": _pcc["id"],
+                                                            "reveal_personal_emails": True,
+                                                            "reveal_phone_number": True,
+                                                        }).get("person") or {}
+                                                        _pen = _norm_apollo(_pe)
+                                                        st.session_state[_pc_em_k] = _pen.get("email","")
+                                                        st.session_state[_pc_ph_k] = _pen.get("phone","")
+                                                        st.rerun()
+                                                    except Exception as _pee:
+                                                        st.error(f"Enrich failed: {_pee}")
+                                    with _pcc2:
+                                        if monday_active:
+                                            _pc_push_lbl = ("♻️ Update" if _pc_crm and _pc_crm.get("on_crm") else "📋 Push")
+                                            if st.button(_pc_push_lbl, key=f"p_push_{card_idx}_{_pci}",
+                                                         use_container_width=True,
+                                                         type="secondary" if (_pc_crm and _pc_crm.get("on_crm")) else "primary"):
+                                                with st.spinner("Syncing…"):
+                                                    try:
+                                                        _pmr = sync_lead_to_monday({
+                                                            "name":           _pc_name,
+                                                            "title":          _pcc.get("title",""),
+                                                            "company":        company,
+                                                            "email":          _pc_email,
+                                                            "phone":          _pc_phone,
+                                                            "linkedin":       _pcc.get("linkedin",""),
+                                                            "accuracy_score": str(_pc_fit),
+                                                            "provider_chain": f"Partners tab · {_p_sol}",
+                                                        })
+                                                        st.success(f"{_pmr.get('action','done').title()} · ID: {_pmr.get('item_id')}")
+                                                        del st.session_state[_pc_crm_k]
+                                                    except Exception as _ppe:
+                                                        st.error(f"Push failed: {_ppe}")
+                                    with _pcc3:
+                                        _copy_block(
+                                            "\n".join(l for l in [
+                                                f"NAME: {_pc_name}",
+                                                f"Title: {_pcc.get('title','')}",
+                                                f"Company: {company}",
+                                                f"Email: {_pc_email}",
+                                                f"Phone: {_pc_phone}",
+                                                f"LinkedIn: {_pcc.get('linkedin','')}",
+                                            ] if l),
+                                            key=f"pc_copy_{card_idx}_{_pci}",
+                                        )
 
                 # ── Copy ──────────────────────────────────────────────────────
                 _p_copy_lines = [
@@ -3971,3 +4241,328 @@ if _page == "💡 Weekly Leads":
                         ] if l),
                         key=f"wl_copy_{_wi}",
                     )
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE 7 — END-USER TARGETS
+# ══════════════════════════════════════════════════════════════════════════════
+if _page == "🎯 End-User Targets":
+    st.subheader("End-User Targets")
+    st.caption(
+        "Find African companies by sector and size, score them on CRS-portfolio fit using "
+        "their tech stack, then drill into decision-maker contacts. "
+        "Apollo org search + optional tech-stack enrichment."
+    )
+
+    _eu_has_apo = bool(st.secrets.get("APOLLO_API_KEY","") or os.getenv("APOLLO_API_KEY",""))
+    if not _eu_has_apo:
+        st.warning("Apollo API key required. Add APOLLO_API_KEY to secrets.")
+        st.stop()
+
+    # ── Search controls ───────────────────────────────────────────────────────
+    _eu_c1, _eu_c2, _eu_c3 = st.columns(3)
+    with _eu_c1:
+        _EU_INDUSTRIES = [
+            "financial services", "banking", "insurance",
+            "government administration", "public sector",
+            "hospital & health care", "healthcare",
+            "telecommunications", "information technology",
+            "mining & metals", "oil & energy",
+            "education management", "higher education",
+            "retail", "manufacturing",
+            "logistics & supply chain", "law practice",
+            "media & broadcasting", "real estate",
+        ]
+        _eu_industries = st.multiselect(
+            "Industry / sector",
+            _EU_INDUSTRIES,
+            default=["financial services", "government administration",
+                     "hospital & health care", "telecommunications"],
+            key="eu_industries",
+        )
+    with _eu_c2:
+        _eu_countries = st.multiselect(
+            "Countries",
+            ["South Africa", "Nigeria", "Kenya", "Ghana",
+             "Tanzania", "Uganda", "Zimbabwe", "Botswana",
+             "Namibia", "Rwanda", "Zambia", "Mozambique"],
+            default=["South Africa", "Nigeria", "Kenya"],
+            key="eu_countries",
+        )
+    with _eu_c3:
+        _EU_EMP_RANGES = {
+            "SME  (50 – 200)":     ["50,200"],
+            "Mid  (200 – 1 000)":  ["201,1000"],
+            "Large (1 000 – 5 000)": ["1001,5000"],
+            "Enterprise (5 000+)": ["5001,20000"],
+            "All sizes":           [],
+        }
+        _eu_size_key = st.selectbox(
+            "Company size", list(_EU_EMP_RANGES.keys()),
+            index=1, key="eu_size",
+        )
+        _eu_emp_ranges = _EU_EMP_RANGES[_eu_size_key]
+
+    _eu_kw_col, _eu_num_col = st.columns([4, 1])
+    with _eu_kw_col:
+        _eu_keyword = st.text_input(
+            "Additional keyword (optional)",
+            key="eu_keyword",
+            placeholder="e.g. cybersecurity, POPIA, digital transformation",
+        )
+    with _eu_num_col:
+        _eu_num = st.number_input("Per search", 5, 25, 10, step=5, key="eu_num")
+
+    _eu_run = st.button("🔍 Find target companies", type="primary", key="eu_run")
+
+    # ── Run company search ────────────────────────────────────────────────────
+    if _eu_run:
+        if not _eu_industries and not _eu_keyword:
+            st.warning("Select at least one industry or enter a keyword.")
+        else:
+            _eu_raw: list[dict] = []
+            _eu_seen: set[str] = set()
+            _eu_searches = len(_eu_industries or [""]) * len(_eu_countries or ["South Africa"])
+            _eu_pb = st.progress(0.0, text="Searching Apollo…")
+            _eu_step = 0
+            for _eu_ind in (_eu_industries or [""]):
+                for _eu_ctr in (_eu_countries or ["South Africa"]):
+                    try:
+                        kw_parts = [p for p in [_eu_ind, _eu_keyword] if p]
+                        _eu_orgs = _apollo_search_companies(
+                            keywords=" ".join(kw_parts),
+                            locations=[_eu_ctr],
+                            employee_ranges=_eu_emp_ranges or None,
+                            num=int(_eu_num),
+                        )
+                        for _eo in _eu_orgs:
+                            _eid = _eo.get("id","") or _eo.get("name","")
+                            if _eid in _eu_seen:
+                                continue
+                            _eu_seen.add(_eid)
+                            _enorm = _norm_org(_eo)
+                            _enorm["_searched_ind"] = _eu_ind
+                            _enorm["_searched_ctr"] = _eu_ctr
+                            _escore, _etech_matched, _eangles = _score_org_for_crs(
+                                _enorm["industry"] or _eu_ind,
+                                _enorm["country"]  or _eu_ctr,
+                                _enorm["employees"],
+                                _enorm["tech"],
+                            )
+                            _enorm["crs_score"]    = _escore
+                            _enorm["tech_matched"] = _etech_matched
+                            _enorm["opp_angles"]   = _eangles
+                            _eu_raw.append(_enorm)
+                    except Exception as _eue:
+                        st.warning(f"Apollo ({_eu_ind}/{_eu_ctr}): {str(_eue)[:100]}")
+                    _eu_step += 1
+                    _eu_pb.progress(
+                        min(_eu_step / max(_eu_searches, 1), 1.0),
+                        text=f"{_eu_ind} / {_eu_ctr}",
+                    )
+            _eu_pb.empty()
+            _eu_raw.sort(key=lambda o: -o.get("crs_score", 0))
+            st.session_state["eu_results"]     = _eu_raw
+            st.session_state["eu_refreshed"]   = _dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    # ── Display ───────────────────────────────────────────────────────────────
+    _eu_results: list[dict] = st.session_state.get("eu_results", [])
+    _eu_ts = st.session_state.get("eu_refreshed", "")
+    if _eu_ts:
+        st.caption(f"Last search: {_eu_ts} · {len(_eu_results)} companies")
+
+    if not _eu_results:
+        st.info("Click **Find target companies** to search.")
+    else:
+        _eu_min = st.slider("Minimum CRS interest score", 0, 100, 20, step=5, key="eu_min")
+        _eu_filt = [r for r in _eu_results if r.get("crs_score", 0) >= _eu_min]
+        st.markdown(f"**{len(_eu_filt)} companies** (score ≥ {_eu_min})")
+
+        for _ei, _ec in enumerate(_eu_filt):
+            _ename  = _ec.get("name", "Unknown")
+            _escore = _ec.get("crs_score", 0)
+            _eind   = _ec.get("industry") or _ec.get("_searched_ind", "")
+            _ectr   = _ec.get("country") or _ec.get("_searched_ctr", "")
+            _eemp   = _ec.get("employees")
+            _etech  = _ec.get("tech_matched", [])
+            _eangles = _ec.get("opp_angles", [])
+            _efit   = "🟢" if _escore >= 65 else "🟡" if _escore >= 40 else "🔴"
+
+            with st.container(border=True):
+                _ea, _eb = st.columns([4, 2])
+                with _ea:
+                    st.markdown(f"### {_efit} {_ename}")
+                    _emeta = [x for x in [_eind.title(), _ectr,
+                                          f"{_eemp:,} employees" if _eemp else ""] if x]
+                    if _emeta:
+                        st.caption("  ·  ".join(_emeta))
+                    if _ec.get("description"):
+                        st.caption(_ec["description"][:160])
+                    _elinks = []
+                    if _ec.get("linkedin"):
+                        _elinks.append(f"[LinkedIn]({_ec['linkedin']})")
+                    if _ec.get("domain"):
+                        _elinks.append(f"[Website](https://{_ec['domain']})")
+                    if _elinks:
+                        st.markdown("  ·  ".join(_elinks))
+                with _eb:
+                    st.metric("CRS Interest", f"{_escore}%")
+                    if _ec.get("phone"):
+                        st.markdown(f"📞 {_ec['phone']}")
+
+                # Tech stack badges
+                if _etech:
+                    st.markdown(
+                        "**Tech signals:** " + "  ".join(f"`{t}`" for t in _etech)
+                    )
+
+                # Opportunity angles
+                if _eangles:
+                    with st.expander("💡 CRS opportunity angles", expanded=(_escore >= 60)):
+                        for _ang in _eangles:
+                            st.markdown(f"- {_ang}")
+
+                # ── Contact finder ────────────────────────────────────────────
+                _eu_cont_key = f"eu_contacts_{_ei}"
+                with st.expander(f"👥 Find contacts at {_ename}", expanded=False):
+                    _ecs1, _ecs2, _ecs3 = st.columns([3, 3, 1])
+                    with _ecs1:
+                        _eu_sol = st.selectbox(
+                            "Solution focus",
+                            list(_CRS_DM_TITLES.keys()),
+                            key=f"eu_sol_{_ei}", index=0,
+                        )
+                    with _ecs2:
+                        _eu_loc_override = st.text_input(
+                            "Country (optional override)",
+                            value=_ectr,
+                            key=f"eu_loc_{_ei}",
+                        )
+                    with _ecs3:
+                        st.write(""); st.write("")
+                        _eu_cn = st.number_input("Max", 5, 15, 8, step=5,
+                                                  key=f"eu_cn_{_ei}")
+                    _eu_sol_titles = _CRS_DM_TITLES[_eu_sol]
+                    st.caption(
+                        ", ".join(_eu_sol_titles[:6])
+                        + (f" +{len(_eu_sol_titles)-6} more" if len(_eu_sol_titles) > 6 else "")
+                    )
+                    if st.button("🔍 Search contacts", key=f"eu_find_{_ei}",
+                                 type="primary", use_container_width=True):
+                        with st.spinner(f"Apollo: {_eu_sol} at {_ename}…"):
+                            try:
+                                _eu_praw = _apollo_search_people(
+                                    company=_ename,
+                                    num=int(_eu_cn),
+                                    titles=_eu_sol_titles,
+                                    locations=[_eu_loc_override] if _eu_loc_override else None,
+                                )
+                                _eu_pnorm = []
+                                for _epp in _eu_praw:
+                                    _epn = _norm_apollo(_epp)
+                                    _epn["crs_fit"] = _crs_fit_score(
+                                        _epn.get("title",""),
+                                        _eind,
+                                        _ectr,
+                                        _epn.get("has_email", False),
+                                        bool(_epn.get("has_phone")),
+                                    )
+                                    _eu_pnorm.append(_epn)
+                                _eu_pnorm.sort(key=lambda q: -q.get("crs_fit", 0))
+                                st.session_state[_eu_cont_key] = _eu_pnorm
+                            except Exception as _euce:
+                                st.error(f"Apollo error: {_euce}")
+
+                    _eu_contacts = st.session_state.get(_eu_cont_key, [])
+                    if _eu_contacts:
+                        st.markdown(f"**{len(_eu_contacts)} contacts:**")
+                        for _eci2, _ecc in enumerate(_eu_contacts):
+                            _ec_crm_k = f"eu_crm_{_ei}_{_eci2}"
+                            _ec_em_k  = f"eu_em_{_ei}_{_eci2}"
+                            _ec_ph_k  = f"eu_ph_{_ei}_{_eci2}"
+                            _ec_crm = _auto_crm_check(
+                                _ecc.get("name",""), _ecc.get("email",""),
+                                _ecc.get("linkedin",""), _ec_crm_k,
+                            )
+                            _ec_mon_em = (_ec_crm.get("crm_email","") if _ec_crm and _ec_crm.get("on_crm") else "")
+                            _ec_mon_ph = (_ec_crm.get("crm_phone","") if _ec_crm and _ec_crm.get("on_crm") else "")
+                            _ec_email  = st.session_state.get(_ec_em_k) or _ec_mon_em or _ecc.get("email","")
+                            _ec_phone  = st.session_state.get(_ec_ph_k) or _ec_mon_ph or _ecc.get("phone","")
+                            _ec_fit    = _ecc.get("crs_fit", 0)
+                            _ec_name   = _ecc.get("name") or f"Contact {_eci2+1}"
+                            _ec_badge  = "🟢" if _ec_fit >= 70 else "🟡" if _ec_fit >= 45 else "🔴"
+                            with st.container(border=True):
+                                _eca2, _ecb2 = st.columns([3, 2])
+                                with _eca2:
+                                    _ech = f"**{_ec_badge} {_ec_name}**"
+                                    if _ec_crm and _ec_crm.get("on_crm"):
+                                        _ech += "  `✓ CRM`"
+                                    st.markdown(_ech)
+                                    if _ecc.get("title"):
+                                        st.caption(_ecc["title"])
+                                    if _ecc.get("linkedin"):
+                                        st.markdown(f"[LinkedIn]({_ecc['linkedin']})")
+                                with _ecb2:
+                                    st.caption(f"Fit: {_ec_fit}%")
+                                    if _ec_email:
+                                        st.markdown(f"📧 `{_ec_email}`")
+                                    elif _ecc.get("has_email"):
+                                        st.caption("📧 available")
+                                    if _ec_phone:
+                                        st.markdown(f"📞 `{_ec_phone}`")
+                                    elif _ecc.get("has_phone"):
+                                        st.caption("📞 available")
+                                _ec1, _ec2, _ec3 = st.columns(3)
+                                with _ec1:
+                                    if not _ec_email and _ecc.get("id") and not st.session_state.get(_ec_em_k):
+                                        if st.button("💳 Enrich", key=f"eu_enrich_{_ei}_{_eci2}",
+                                                     use_container_width=True):
+                                            with st.spinner("Enriching…"):
+                                                try:
+                                                    _eenr = _apollo_post("people/match", {
+                                                        "id": _ecc["id"],
+                                                        "reveal_personal_emails": True,
+                                                        "reveal_phone_number": True,
+                                                    }).get("person") or {}
+                                                    _eenrn = _norm_apollo(_eenr)
+                                                    st.session_state[_ec_em_k] = _eenrn.get("email","")
+                                                    st.session_state[_ec_ph_k] = _eenrn.get("phone","")
+                                                    st.rerun()
+                                                except Exception as _eee:
+                                                    st.error(f"Enrich failed: {_eee}")
+                                with _ec2:
+                                    if monday_active:
+                                        _ec_push_lbl = ("♻️ Update" if _ec_crm and _ec_crm.get("on_crm") else "📋 Push")
+                                        if st.button(_ec_push_lbl, key=f"eu_push_{_ei}_{_eci2}",
+                                                     use_container_width=True,
+                                                     type="secondary" if (_ec_crm and _ec_crm.get("on_crm")) else "primary"):
+                                            with st.spinner("Syncing…"):
+                                                try:
+                                                    _emr = sync_lead_to_monday({
+                                                        "name":           _ec_name,
+                                                        "title":          _ecc.get("title",""),
+                                                        "company":        _ename,
+                                                        "email":          _ec_email,
+                                                        "phone":          _ec_phone,
+                                                        "linkedin":       _ecc.get("linkedin",""),
+                                                        "accuracy_score": str(_ec_fit),
+                                                        "provider_chain": f"End-User Targets · {_eu_sol}",
+                                                    })
+                                                    st.success(f"{_emr.get('action','done').title()} · ID: {_emr.get('item_id')}")
+                                                    del st.session_state[_ec_crm_k]
+                                                except Exception as _epe:
+                                                    st.error(f"Push failed: {_epe}")
+                                with _ec3:
+                                    _copy_block(
+                                        "\n".join(l for l in [
+                                            f"NAME: {_ec_name}",
+                                            f"Title: {_ecc.get('title','')}",
+                                            f"Company: {_ename}",
+                                            f"Industry: {_eind}",
+                                            f"Email: {_ec_email}",
+                                            f"Phone: {_ec_phone}",
+                                            f"LinkedIn: {_ecc.get('linkedin','')}",
+                                            f"CRS Fit: {_ec_fit}%",
+                                            ("Tech signals: " + ", ".join(_etech)) if _etech else "",
+                                        ] if l),
+                                        key=f"eu_copy_{_ei}_{_eci2}",
+                                    )
