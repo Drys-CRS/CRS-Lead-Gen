@@ -568,14 +568,20 @@ def _dork_search(query: str, num: int = 10, start: int = 0) -> list:
     return profiles
 
 
-def _apollo_match(name: str, linkedin_url: str) -> dict:
+def _apollo_match(name: str, linkedin_url: str,
+                  company: str = "", email: str = "") -> dict:
+    """People Enrichment — costs 1 Apollo credit per matched person."""
     key = st.secrets.get("APOLLO_API_KEY", "") or os.getenv("APOLLO_API_KEY", "")
     if not key:
         return {}
-    payload = json.dumps({"name": name, "linkedin_url": linkedin_url}).encode()
+    payload: dict = {"reveal_personal_emails": True}
+    if name:         payload["name"]              = name
+    if linkedin_url: payload["linkedin_url"]      = linkedin_url
+    if company:      payload["organization_name"] = company
+    if email:        payload["email"]             = email
     req = _urlreq.Request(
         "https://api.apollo.io/api/v1/people/match",
-        data=payload,
+        data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json", "X-Api-Key": key},
         method="POST",
     )
@@ -660,7 +666,7 @@ def _lusha_search_contacts(first_name: str = "", last_name: str = "",
 
 
 def _norm_apollo(p: dict) -> dict:
-    """Flatten an Apollo people-search result into a standard contact dict."""
+    """Flatten an Apollo search or enrichment result into a standard contact dict."""
     org    = p.get("organization") or {}
     phones = p.get("phone_numbers") or []
     phone  = ""
@@ -668,11 +674,17 @@ def _norm_apollo(p: dict) -> dict:
         ph0   = phones[0]
         phone = ((ph0.get("sanitized_number") or ph0.get("raw_number"))
                  if isinstance(ph0, dict) else str(ph0))
+    # Enrichment returns personal_emails as a list; prefer over masked work email
+    personal_emails = p.get("personal_emails") or []
+    email = (personal_emails[0] if personal_emails
+             else p.get("email", ""))
+    email_status = ("verified" if personal_emails
+                    else p.get("email_status", ""))
     return {
         "name":          p.get("name", ""),
         "title":         p.get("title", ""),
-        "email":         p.get("email", ""),
-        "email_status":  p.get("email_status", ""),
+        "email":         email,
+        "email_status":  email_status,
         "phone":         phone or "",
         "linkedin":      p.get("linkedin_url", ""),
         "company":       org.get("name") or p.get("organization_name", ""),
@@ -1669,6 +1681,8 @@ if _page == "✅ Lead Verification":
                     if not (_crm_ph and str(_crm_ph) not in ("", "nan", "None")):
                         _cph_apo = bool(st.secrets.get("APOLLO_API_KEY","") or os.getenv("APOLLO_API_KEY",""))
                         _cph_lsh = bool(st.secrets.get("LUSHA_API_KEY","")  or os.getenv("LUSHA_API_KEY",""))
+                        if _cph_apo:
+                            st.caption("⚡ 1 Apollo credit")
                         if (_cph_apo or _cph_lsh) and st.button(
                                 "📞 Find Phone", key="lk_crm_fp_btn",
                                 use_container_width=True):
@@ -1679,6 +1693,7 @@ if _page == "✅ Lead Verification":
                                         _cph_raw = _apollo_match(
                                             _lk_n_disp,
                                             _lk_crm_r.get("crm_linkedin",""),
+                                            email=_lk_crm_r.get("crm_email",""),
                                         )
                                         _cph_phs = _cph_raw.get("phone_numbers") or []
                                         if _cph_phs:
@@ -1712,6 +1727,8 @@ if _page == "✅ Lead Verification":
             _has_apo = bool(st.secrets.get("APOLLO_API_KEY", "") or os.getenv("APOLLO_API_KEY", ""))
             _has_lsh = bool(st.secrets.get("LUSHA_API_KEY",  "") or os.getenv("LUSHA_API_KEY",  ""))
             if _has_apo or _has_lsh:
+                if _has_apo:
+                    st.caption("Apollo search is free · Phone lookup = 1 credit per person")
                 if st.button("🔍 Enrich via Apollo + Lusha", key="lk_enrich_btn",
                              type="primary"):
                     _enr: list = []
@@ -1824,6 +1841,8 @@ if _page == "✅ Lead Verification":
                     else:
                         _fp_has_apo = bool(st.secrets.get("APOLLO_API_KEY","") or os.getenv("APOLLO_API_KEY",""))
                         _fp_has_lsh = bool(st.secrets.get("LUSHA_API_KEY","")  or os.getenv("LUSHA_API_KEY",""))
+                        if _fp_has_apo:
+                            st.caption("⚡ 1 Apollo credit")
                         if (_fp_has_apo or _fp_has_lsh) and st.button(
                                 "📞 Find Phone", key=f"lk_fp_btn_{card_set_key}_{_ci}",
                                 use_container_width=False):
@@ -1834,6 +1853,8 @@ if _page == "✅ Lead Verification":
                                         _fp_raw = _apollo_match(
                                             _cc.get("name",""),
                                             _cc.get("linkedin",""),
+                                            company=_cc.get("company",""),
+                                            email=_cc.get("email",""),
                                         )
                                         _fp_phones = _fp_raw.get("phone_numbers") or []
                                         if _fp_phones:
