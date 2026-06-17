@@ -723,31 +723,6 @@ def _apollo_search_people(name: str = "", company: str = "",
         return json.loads(r.read()).get("people") or []
 
 
-def _lusha_search_contacts(first_name: str = "", last_name: str = "",
-                            company: str = "") -> list:
-    """GET Lusha prospecting/contacts/search. Returns list of raw contact dicts."""
-    key = st.secrets.get("LUSHA_API_KEY", "") or os.getenv("LUSHA_API_KEY", "")
-    if not key:
-        return []
-    params: dict = {}
-    if first_name:
-        params["firstName"] = first_name
-    if last_name:
-        params["lastName"] = last_name
-    if company:
-        params["company"] = company
-    if not params:
-        return []
-    qs = "&".join(f"{k}={_urlparse.quote(str(v))}" for k, v in params.items())
-    req = _urlreq.Request(
-        f"https://api.lusha.com/v2/prospecting/contacts/search?{qs}",
-        headers={"Api-Key": key},
-    )
-    with _urlreq.urlopen(req, timeout=15) as r:
-        data = json.loads(r.read())
-    return data.get("data") or data.get("contacts") or []
-
-
 def _norm_apollo(p: dict) -> dict:
     """Flatten an Apollo search or enrichment result into a standard contact dict."""
     org    = p.get("organization") or {}
@@ -775,29 +750,6 @@ def _norm_apollo(p: dict) -> dict:
         "domain":        org.get("primary_domain", ""),
         "twitter":       p.get("twitter_url", ""),
         "source":        "Apollo",
-    }
-
-
-def _norm_lusha(c: dict) -> dict:
-    """Flatten a Lusha prospecting result into a standard contact dict."""
-    def _first(lst):
-        if not lst: return ""
-        h = lst[0]
-        if isinstance(h, str): return h
-        return h.get("validatedEmail") or h.get("internationalNumber") or ""
-    co = c.get("company") or {}
-    return {
-        "name":          f"{c.get('firstName','')} {c.get('lastName','')}".strip(),
-        "title":         c.get("jobTitle") or c.get("title", ""),
-        "email":         _first(c.get("emailAddresses") or []),
-        "email_status":  "lusha",
-        "phone":         _first(c.get("phoneNumbers") or []),
-        "linkedin":      c.get("linkedInUrl", ""),
-        "company":       (co.get("name", "") if isinstance(co, dict) else str(co or "")),
-        "company_phone": (co.get("phone", "") if isinstance(co, dict) else ""),
-        "domain":        (co.get("domain", "") if isinstance(co, dict) else ""),
-        "twitter":       c.get("twitterUrl", ""),
-        "source":        "Lusha",
     }
 
 
@@ -1726,35 +1678,6 @@ if _page == "✅ Lead Verification":
                                 _apollo_search_people(name=_n, company=_c, num=8)]
                 except Exception as _ae:
                     st.toast(f"Apollo: {str(_ae)[:80]}")
-            _has_lsh0 = bool(st.secrets.get("LUSHA_API_KEY","") or os.getenv("LUSHA_API_KEY",""))
-            if _has_lsh0:
-                with st.spinner("Supplementing with Lusha…"):
-                    try:
-                        _np0 = _n.split()
-                        _l_raw = _lusha_search_contacts(
-                            first_name=_np0[0] if _np0 else "",
-                            last_name=_np0[-1] if len(_np0) > 1 else "",
-                            company=_c,
-                        )
-                        _apo_names = {x["name"].lower() for x in _results}
-                        for _lc in _l_raw:
-                            _ln = _norm_lusha(_lc)
-                            if not _ln["name"]: continue
-                            if _ln["name"].lower() in _apo_names:
-                                for _ex in _results:
-                                    if _ex["name"].lower() == _ln["name"].lower():
-                                        if not _ex["email"] and _ln["email"]:
-                                            _ex["email"] = _ln["email"]; _ex["email_status"] = "lusha"
-                                        if not _ex["phone"]         and _ln["phone"]:
-                                            _ex["phone"] = _ln["phone"]
-                                        if not _ex["company_phone"] and _ln["company_phone"]:
-                                            _ex["company_phone"] = _ln["company_phone"]
-                                        if "Lusha" not in _ex["source"]:
-                                            _ex["source"] += " + Lusha"
-                            else:
-                                _results.append(_ln)
-                    except Exception as _le:
-                        st.toast(f"Lusha: {str(_le)[:80]}")
             if monday_active and _c:
                 with st.spinner("Checking Monday Companies…"):
                     try:
@@ -1783,7 +1706,6 @@ if _page == "✅ Lead Verification":
     if _lk_results is not None:
         _lk_c_val = st.session_state.get("lk_company", "")
         _has_apo  = bool(st.secrets.get("APOLLO_API_KEY","") or os.getenv("APOLLO_API_KEY",""))
-        _has_lsh  = bool(st.secrets.get("LUSHA_API_KEY","")  or os.getenv("LUSHA_API_KEY",""))
 
         if not _lk_results:
             st.info("No results found. Try the LinkedIn Dork tab for manual search.")
@@ -1891,40 +1813,26 @@ if _page == "✅ Lead Verification":
                                 st.caption(f"via {st.session_state[_ph_sk]['source']}")
                         else:
                             if _has_apo: st.caption("⚡ 1 credit")
-                            if (_has_apo or _has_lsh) and st.button("📞 Get Phone",
+                            if _has_apo and st.button("📞 Get Phone",
                                     key=f"lk_ph_btn_{key_prefix}_{_ci}",
                                     use_container_width=True):
                                 _fp: dict = {}
-                                if _has_lsh:
-                                    with st.spinner("Lusha…"):
-                                        try:
-                                            _np0 = (_cc.get("name","")).split()
-                                            for _fpc in _lusha_search_contacts(
-                                                    first_name=_np0[0] if _np0 else "",
-                                                    last_name=_np0[-1] if len(_np0)>1 else "",
-                                                    company=_cc.get("company","")):
-                                                _fpn = _norm_lusha(_fpc)
-                                                if _fpn["phone"]:
-                                                    _fp = {"phone": _fpn["phone"], "source": "Lusha"}
-                                                    break
-                                        except Exception: pass
-                                if not _fp.get("phone") and _has_apo:
-                                    with st.spinner("Apollo…"):
-                                        try:
-                                            _fp_r = _apollo_match(
-                                                _cc.get("name",""), _cc.get("linkedin",""),
-                                                company=_cc.get("company",""),
-                                                email=_cc.get("email",""),
-                                            )
-                                            _fp_phs = _fp_r.get("phone_numbers") or []
-                                            if _fp_phs:
-                                                _p0 = _fp_phs[0]
-                                                _fp = {
-                                                    "phone": ((_p0.get("sanitized_number") or _p0.get("raw_number"))
-                                                              if isinstance(_p0,dict) else str(_p0)),
-                                                    "source": "Apollo"
-                                                }
-                                        except Exception: pass
+                                with st.spinner("Apollo…"):
+                                    try:
+                                        _fp_r = _apollo_match(
+                                            _cc.get("name",""), _cc.get("linkedin",""),
+                                            company=_cc.get("company",""),
+                                            email=_cc.get("email",""),
+                                        )
+                                        _fp_phs = _fp_r.get("phone_numbers") or []
+                                        if _fp_phs:
+                                            _p0 = _fp_phs[0]
+                                            _fp = {
+                                                "phone": ((_p0.get("sanitized_number") or _p0.get("raw_number"))
+                                                          if isinstance(_p0,dict) else str(_p0)),
+                                                "source": "Apollo"
+                                            }
+                                    except Exception: pass
                                 if _fp.get("phone"):
                                     st.session_state[_ph_sk] = _fp
                                     st.rerun()
