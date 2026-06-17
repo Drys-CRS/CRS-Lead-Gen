@@ -488,10 +488,14 @@ def _badge(urgency: str) -> str:
     if u == "low":    return "🟢 Low"
     return urgency or "—"
 
-def _copy_block(text: str, label: str = "📋 Copy", key: str = "") -> None:
-    """Renders a collapsed expander with a copyable code block (native copy icon)."""
-    with st.expander(label, expanded=False):
+def _copy_block(text: str, label: str = "📋 Copy", key: str = "",
+                flat: bool = False) -> None:
+    """Copyable code block. flat=True skips the expander (use when already inside one)."""
+    if flat:
         st.code(text.strip(), language=None)
+    else:
+        with st.expander(label, expanded=False):
+            st.code(text.strip(), language=None)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DORK / ENRICHMENT HELPERS
@@ -1896,6 +1900,7 @@ if _page == "🤝 Partners":
                                                 f"LinkedIn: {_pcc.get('linkedin','')}",
                                             ] if l),
                                             key=f"pc_copy_{card_idx}_{_pci}",
+                                            flat=True,
                                         )
 
                 # ── Copy ──────────────────────────────────────────────────────
@@ -4565,4 +4570,5 @@ if _page == "🎯 End-User Targets":
                                             ("Tech signals: " + ", ".join(_etech)) if _etech else "",
                                         ] if l),
                                         key=f"eu_copy_{_ei}_{_eci2}",
+                                        flat=True,
                                     )
