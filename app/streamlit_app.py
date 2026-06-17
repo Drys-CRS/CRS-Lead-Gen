@@ -577,6 +577,113 @@ def _lusha_lookup(linkedin_url: str) -> dict:
         return json.loads(r.read()) or {}
 
 
+def _calc_contact_confidence(email: str, email_sources: list, phone: str) -> int:
+    score = 0
+    if email:
+        n = len(email_sources)
+        if n >= 2:
+            score += 75
+        else:
+            m = re.search(r"Hunter.*?(\d+)%", str(email_sources))
+            if m:
+                score += max(20, int(int(m.group(1)) * 0.85))
+            elif any(s in str(email_sources) for s in ("Apollo", "Lusha")):
+                score += 65
+            else:
+                score += 20
+    if phone:
+        score += 15
+    return min(score, 100)
+
+
+def _cascade_find_contact(name: str, linkedin_url: str,
+                           company: str = "", domain_hint: str = "") -> dict:
+    """Apollo → Hunter → Lusha → pattern-guess. Returns aggregated contact data + confidence."""
+    email = phone = title = comp = domain = None
+    email_srcs: list = []
+    phone_srcs: list = []
+
+    # ── Apollo (LinkedIn URL match) ─────────────────────────────────────────
+    if st.secrets.get("APOLLO_API_KEY", "") or os.getenv("APOLLO_API_KEY", ""):
+        try:
+            apo = _apollo_match(name, linkedin_url)
+            if apo.get("email"):
+                email = apo["email"]; email_srcs.append("Apollo")
+            _aph = apo.get("phone_numbers") or []
+            if _aph:
+                phone = _aph[0]; phone_srcs.append("Apollo")
+            title  = apo.get("title") or None
+            _org   = apo.get("organization") or {}
+            comp   = _org.get("name") or apo.get("organization_name") or None
+            domain = _org.get("primary_domain") or None
+        except Exception:
+            pass
+
+    # ── Hunter (email finder — needs domain) ────────────────────────────────
+    _eff_domain = domain or domain_hint or ""
+    if (st.secrets.get("HUNTER_API_KEY", "") or os.getenv("HUNTER_API_KEY", "")) and _eff_domain:
+        _np = name.split()
+        try:
+            hdata   = _hunter_find(_np[0] if _np else "", _np[-1] if len(_np) > 1 else "", _eff_domain)
+            h_email = hdata.get("email", "")
+            h_score = int(hdata.get("score") or 0)
+            if h_email:
+                label = f"Hunter ({h_score}%)"
+                if not email:
+                    email = h_email; email_srcs.append(label)
+                else:
+                    email_srcs.append(label)
+                    if h_score > 85:
+                        email = h_email
+        except Exception:
+            pass
+
+    # ── Lusha ───────────────────────────────────────────────────────────────
+    if st.secrets.get("LUSHA_API_KEY", "") or os.getenv("LUSHA_API_KEY", ""):
+        try:
+            ldata = _lusha_lookup(linkedin_url)
+            _le = ldata.get("emailAddresses") or []
+            _lp = ldata.get("phoneNumbers") or []
+            if _le:
+                _lem = _le[0] if isinstance(_le[0], str) else _le[0].get("validatedEmail", "")
+                if _lem:
+                    email_srcs.append("Lusha")
+                    if not email:
+                        email = _lem
+            if _lp and not phone:
+                _lph = _lp[0] if isinstance(_lp[0], str) else _lp[0].get("internationalNumber", "")
+                if _lph:
+                    phone = _lph; phone_srcs.append("Lusha")
+        except Exception:
+            pass
+
+    # ── Pattern guesses (free, unverified) ──────────────────────────────────
+    email_candidates: list = []
+    if not email and _eff_domain:
+        _np2 = name.split()
+        _f   = _np2[0].lower() if _np2 else ""
+        _l   = _np2[-1].lower() if len(_np2) > 1 else ""
+        if _f and _l:
+            email_candidates = [
+                f"{_f}.{_l}@{_eff_domain}",
+                f"{_f[0]}{_l}@{_eff_domain}",
+                f"{_f}@{_eff_domain}",
+                f"{_l}.{_f}@{_eff_domain}",
+            ]
+
+    return {
+        "email":            email,
+        "email_sources":    email_srcs,
+        "phone":            phone,
+        "phone_sources":    phone_srcs,
+        "title":            title,
+        "company":          comp or company or None,
+        "domain":           _eff_domain or None,
+        "email_candidates": email_candidates,
+        "confidence":       _calc_contact_confidence(email, email_srcs, phone),
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # BACKGROUND PULL — module-level so it survives across Streamlit reruns
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1445,147 +1552,108 @@ with tab_dork:
                     else:
                         st.warning("❌ Not in CRM")
 
-                # ── CRM detail ────────────────────────────────────────────────
+                # ── CRM contact info ───────────────────────────────────────────
                 if _crm_res and _crm_res.get("on_crm"):
-                    with st.expander("CRM Details", expanded=True):
-                        for _cf in ["crm_board", "crm_title", "contact_title",
-                                    "company", "email", "phone", "status"]:
+                    st.divider()
+                    _cc1, _cc2 = st.columns(2)
+                    with _cc1:
+                        for _cf, _icon in [("email", "📧"), ("phone", "📞"),
+                                           ("contact_title", "💼"), ("company", "🏢")]:
                             _cv = _crm_res.get(_cf)
                             if _cv and str(_cv) not in ("", "nan", "None"):
-                                st.markdown(f"**{_cf.replace('_',' ').title()}:** {_cv}")
+                                st.markdown(f"{_icon} **{_cv}**")
+                    with _cc2:
+                        if _crm_res.get("crm_board"):
+                            st.caption(f"Board: {_crm_res['crm_board']}")
+                        if _crm_res.get("status") and str(_crm_res["status"]) not in ("", "nan", "None"):
+                            st.caption(f"Status: {_crm_res['status']}")
                         if _crm_res.get("crm_url"):
-                            st.markdown(f"[Open in Monday]({_crm_res['crm_url']})")
+                            st.markdown(f"[Open in Monday →]({_crm_res['crm_url']})")
 
-                # ── Reachability (not on CRM yet) ─────────────────────────────
+                # ── Reachability cascade (not on CRM) ─────────────────────────
                 elif _crm_res is not None:
-                    st.markdown("**Reachability**")
-                    _apo = _enr_res.get("apollo")
-                    _hun = _enr_res.get("hunter")
-                    _lus = _enr_res.get("lusha")
+                    st.divider()
+                    _cascade = _enr_res.get("cascade")
 
-                    # Apollo
-                    if _apo is None:
-                        if _has_apollo:
-                            if st.button("🚀 Enrich with Apollo", key=f"dapo_{_pi}",
-                                         use_container_width=True):
-                                with st.spinner("Apollo match…"):
+                    if _cascade is None:
+                        _df1, _df2 = st.columns([3, 2])
+                        with _df1:
+                            _dom_hint = st.text_input(
+                                "Company domain (helps Hunter, optional)",
+                                key=f"ddom_{_pi}",
+                                placeholder="e.g. nedbank.co.za",
+                            )
+                        with _df2:
+                            st.write("")
+                            st.write("")
+                            if st.button("🔍 Find contact info", key=f"dcasc_{_pi}",
+                                         use_container_width=True, type="primary"):
+                                with st.spinner("Searching across sources…"):
                                     try:
-                                        _ad = _apollo_match(_prof["name"], _prof["url"])
-                                        st.session_state.setdefault("dork_enrich", {}).setdefault(_pkey, {})["apollo"] = _ad
-                                    except Exception as _ae:
-                                        st.session_state.setdefault("dork_enrich", {}).setdefault(_pkey, {})["apollo"] = {"error": str(_ae)}
+                                        _casc = _cascade_find_contact(
+                                            _prof["name"], _prof["url"],
+                                            company=_prof.get("company", ""),
+                                            domain_hint=_dom_hint.strip(),
+                                        )
+                                        st.session_state.setdefault("dork_enrich", {}).setdefault(_pkey, {})["cascade"] = _casc
+                                    except Exception as _ce2:
+                                        st.session_state.setdefault("dork_enrich", {}).setdefault(_pkey, {})["cascade"] = {"error": str(_ce2)}
                                 st.rerun()
-                        else:
-                            st.caption("⚪ Apollo (add APOLLO_API_KEY)")
-                    elif _apo.get("error"):
-                        st.caption(f"Apollo ❌ {_apo['error'][:100]}")
+
+                    elif _cascade.get("error"):
+                        st.error(f"Contact search failed: {_cascade['error'][:150]}")
+
                     else:
-                        _apo_org = _apo.get("organization") or {}
-                        st.markdown("**Apollo:**")
-                        for _af, _al in [("email", "Email"), ("title", "Title"),
-                                         ("organization_name", "Company"),
-                                         ("city", "City"), ("country", "Country")]:
-                            _av = _apo.get(_af)
-                            if _av:
-                                st.markdown(f"  **{_al}:** {_av}")
-                        _apo_phones = _apo.get("phone_numbers") or []
-                        if _apo_phones:
-                            st.markdown(f"  **Phone:** {_apo_phones[0]}")
-                        if _apo_org.get("primary_domain"):
-                            st.caption(f"Domain: {_apo_org['primary_domain']}")
-                        if _apo_org.get("estimated_num_employees"):
-                            st.caption(f"Employees: ~{_apo_org['estimated_num_employees']}")
-
-                    # Hunter — needs a company domain
-                    _inferred_domain = ""
-                    if _apo and not _apo.get("error"):
-                        _inferred_domain = (_apo.get("organization") or {}).get("primary_domain", "")
-
-                    if _hun is None and _has_hunter:
-                        _dom_in = st.text_input(
-                            "Company domain (for Hunter email finder)",
-                            value=_inferred_domain,
-                            key=f"ddom_{_pi}",
-                            placeholder="e.g. nedbank.co.za",
-                        )
-                        if st.button("📧 Find email (Hunter)", key=f"dhun_{_pi}",
-                                     use_container_width=True,
-                                     disabled=not bool(_dom_in)):
-                            _parts = _prof["name"].split()
-                            with st.spinner("Hunter lookup…"):
-                                try:
-                                    _hd = _hunter_find(
-                                        _parts[0] if _parts else "",
-                                        _parts[-1] if len(_parts) > 1 else "",
-                                        _dom_in,
-                                    )
-                                    st.session_state.setdefault("dork_enrich", {}).setdefault(_pkey, {})["hunter"] = _hd
-                                except Exception as _he:
-                                    st.session_state.setdefault("dork_enrich", {}).setdefault(_pkey, {})["hunter"] = {"error": str(_he)}
-                            st.rerun()
-                    elif _hun and not _hun.get("error"):
-                        _he = _hun.get("email")
-                        if _he:
-                            st.markdown(f"**Hunter email:** `{_he}` (confidence: {_hun.get('score', '—')})")
-                    elif _hun and _hun.get("error"):
-                        st.caption(f"Hunter ❌ {_hun['error'][:100]}")
-                    elif not _has_hunter:
-                        st.caption("⚪ Hunter (add HUNTER_API_KEY)")
-
-                    # Lusha
-                    if _lus is None and _has_lusha:
-                        if st.button("💼 Lusha lookup", key=f"dlus_{_pi}",
-                                     use_container_width=True):
-                            with st.spinner("Lusha lookup…"):
-                                try:
-                                    _ld = _lusha_lookup(_prof["url"])
-                                    st.session_state.setdefault("dork_enrich", {}).setdefault(_pkey, {})["lusha"] = _ld
-                                except Exception as _le:
-                                    st.session_state.setdefault("dork_enrich", {}).setdefault(_pkey, {})["lusha"] = {"error": str(_le)}
-                            st.rerun()
-                    elif _lus and not _lus.get("error"):
-                        _le2 = _lus.get("emailAddresses") or []
-                        _lp2 = _lus.get("phoneNumbers") or []
-                        if _le2:
-                            _lem = _le2[0] if isinstance(_le2[0], str) else _le2[0].get("validatedEmail", str(_le2[0]))
-                            st.markdown(f"**Lusha email:** `{_lem}`")
-                        if _lp2:
-                            _lph = _lp2[0] if isinstance(_lp2[0], str) else _lp2[0].get("internationalNumber", str(_lp2[0]))
-                            st.markdown(f"**Lusha phone:** `{_lph}`")
-                    elif _lus and _lus.get("error"):
-                        st.caption(f"Lusha ❌ {_lus['error'][:100]}")
-                    elif not _has_lusha:
-                        st.caption("⚪ Lusha (add LUSHA_API_KEY)")
-
-                    # Push to Monday Leads
-                    if monday_active:
+                        _conf = _cascade.get("confidence", 0)
+                        _bar  = "█" * (_conf // 10) + "░" * (10 - _conf // 10)
+                        st.markdown(f"**Confidence: `{_bar}` {_conf}%**")
                         st.divider()
-                        _apo_phones2 = (_apo or {}).get("phone_numbers") or []
-                        _lus_phones2 = (_lus or {}).get("phoneNumbers") or []
-                        def _pick_phone(lst):
-                            if not lst: return ""
-                            p = lst[0]
-                            return p if isinstance(p, str) else (p.get("internationalNumber") or "")
-                        _push_payload = {
-                            "name":           _prof["name"],
-                            "title":          (_apo or {}).get("title", ""),
-                            "company":        (_apo or {}).get("organization_name", ""),
-                            "email":          ((_apo or {}).get("email") or
-                                               (_hun or {}).get("email") or
-                                               (_lem if _lus and not _lus.get("error") and _le2 else "")),
-                            "phone":          (_pick_phone(_apo_phones2) or
-                                               _pick_phone(_lus_phones2)),
-                            "linkedin":       _prof["url"],
-                            "authority":      "",
-                            "accuracy_score": "",
-                            "provider_chain": "LinkedIn Dork",
-                            "country":        (_apo or {}).get("country", ""),
-                        }
-                        if st.button("📋 Add to Monday Leads", key=f"dpush_{_pi}",
-                                     use_container_width=True, type="primary"):
-                            with st.spinner("Pushing to Monday…"):
-                                try:
-                                    _pr = sync_lead_to_monday(_push_payload)
-                                    st.success(f"Action: {_pr.get('action')} · ID: {_pr.get('item_id')}")
-                                except Exception as _pe:
-                                    st.error(f"Push failed: {_pe}")
+
+                        _cr1, _cr2 = st.columns(2)
+                        with _cr1:
+                            if _cascade.get("email"):
+                                st.markdown(f"📧 **{_cascade['email']}**")
+                                _esrc = ", ".join(_cascade.get("email_sources", []))
+                                if _esrc:
+                                    st.caption(f"  ↳ {_esrc}")
+                            elif _cascade.get("email_candidates"):
+                                st.markdown("📧 Unverified patterns:")
+                                for _ec in _cascade["email_candidates"][:3]:
+                                    st.code(_ec, language=None)
+                            if _cascade.get("phone"):
+                                st.markdown(f"📞 **{_cascade['phone']}**")
+                                _psrc = ", ".join(_cascade.get("phone_sources", []))
+                                if _psrc:
+                                    st.caption(f"  ↳ {_psrc}")
+                        with _cr2:
+                            if _cascade.get("title"):
+                                st.markdown(f"💼 **{_cascade['title']}**")
+                            if _cascade.get("company"):
+                                st.markdown(f"🏢 **{_cascade['company']}**")
+                            if _cascade.get("domain"):
+                                st.caption(f"Domain: {_cascade['domain']}")
+
+                        if monday_active:
+                            _push2 = {
+                                "name":           _prof["name"],
+                                "title":          _cascade.get("title") or _prof.get("job_title", ""),
+                                "company":        _cascade.get("company") or _prof.get("company", ""),
+                                "email":          _cascade.get("email", ""),
+                                "phone":          _cascade.get("phone", ""),
+                                "linkedin":       _prof["url"],
+                                "authority":      "",
+                                "accuracy_score": str(_conf),
+                                "provider_chain": " → ".join(
+                                    _cascade.get("email_sources", []) +
+                                    _cascade.get("phone_sources", [])
+                                ) or "LinkedIn Dork",
+                                "country":        "",
+                            }
+                            if st.button("📋 Add to Monday Leads", key=f"dpush_{_pi}",
+                                         use_container_width=True, type="primary"):
+                                with st.spinner("Pushing…"):
+                                    try:
+                                        _pr2 = sync_lead_to_monday(_push2)
+                                        st.success(f"Action: {_pr2.get('action')} · ID: {_pr2.get('item_id')}")
+                                    except Exception as _pe2:
+                                        st.error(f"Push failed: {_pe2}")
