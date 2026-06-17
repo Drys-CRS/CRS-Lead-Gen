@@ -835,10 +835,18 @@ with st.sidebar:
     _pull_blocked = (_ps == "running") or _gh_running
 
     # ── Country selector ──────────────────────────────────────────────────────
+    if "pull_countries" not in st.session_state:
+        st.session_state["pull_countries"] = _PULL_ALL_COUNTRIES[:]
     with st.expander("🌍 Countries to pull", expanded=False):
-        if st.checkbox("Select all countries", key="pull_ctry_all",
-                       value=not bool(st.session_state.get("pull_countries"))):
-            st.session_state["pull_countries"] = _PULL_ALL_COUNTRIES[:]
+        _ca, _cb = st.columns(2)
+        with _ca:
+            if st.button("Select all", key="pull_ctry_all", use_container_width=True):
+                st.session_state["pull_countries"] = _PULL_ALL_COUNTRIES[:]
+                st.rerun()
+        with _cb:
+            if st.button("Clear", key="pull_ctry_none", use_container_width=True):
+                st.session_state["pull_countries"] = []
+                st.rerun()
         _pull_countries = st.multiselect(
             "Countries",
             _PULL_ALL_COUNTRIES,
