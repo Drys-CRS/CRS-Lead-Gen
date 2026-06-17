@@ -9,6 +9,8 @@ import json
 import re
 import time as _time
 import threading
+import urllib.request as _urlreq
+import urllib.parse as _urlparse
 import streamlit as st
 import pandas as pd
 from supabase import create_client, Client
@@ -474,6 +476,83 @@ def _badge(urgency: str) -> str:
     return urgency or "—"
 
 # ─────────────────────────────────────────────────────────────────────────────
+# DORK / ENRICHMENT HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _dork_search(query: str, num: int = 10) -> list:
+    g_key = st.secrets.get("GOOGLE_API_KEY", "") or os.getenv("GOOGLE_API_KEY", "")
+    g_cse = st.secrets.get("GOOGLE_CSE_ID", "") or os.getenv("GOOGLE_CSE_ID", "")
+    s_key = st.secrets.get("SERPER_API_KEY", "") or os.getenv("SERPER_API_KEY", "")
+    raw: list = []
+    if g_key and g_cse:
+        url = (f"https://www.googleapis.com/customsearch/v1"
+               f"?key={g_key}&cx={g_cse}&q={_urlparse.quote(query)}&num={min(num, 10)}")
+        with _urlreq.urlopen(url, timeout=20) as r:
+            raw = json.loads(r.read()).get("items", [])
+    elif s_key:
+        req = _urlreq.Request(
+            "https://google.serper.dev/search",
+            data=json.dumps({"q": query, "num": num}).encode(),
+            headers={"X-API-KEY": s_key, "Content-Type": "application/json"},
+            method="POST",
+        )
+        with _urlreq.urlopen(req, timeout=20) as r:
+            data = json.loads(r.read())
+        raw = [{"link": x.get("link", ""), "title": x.get("title", ""),
+                "snippet": x.get("snippet", "")} for x in data.get("organic", [])]
+    else:
+        raise RuntimeError("Set GOOGLE_API_KEY+GOOGLE_CSE_ID or SERPER_API_KEY in secrets")
+    profiles = []
+    for item in raw:
+        u = item.get("link", "")
+        if "linkedin.com/in/" not in u.lower():
+            continue
+        t = item.get("title", "")
+        name = re.sub(r"\s*[|–—-].*$", "", t).strip()
+        if not name:
+            m = re.search(r"linkedin\.com/in/([^/?&#]+)", u)
+            name = m.group(1).replace("-", " ").title() if m else "Unknown"
+        profiles.append({"name": name, "url": u, "snippet": item.get("snippet", "")})
+    return profiles
+
+
+def _apollo_match(name: str, linkedin_url: str) -> dict:
+    key = st.secrets.get("APOLLO_API_KEY", "") or os.getenv("APOLLO_API_KEY", "")
+    if not key:
+        return {}
+    payload = json.dumps({"api_key": key, "name": name,
+                          "linkedin_url": linkedin_url}).encode()
+    req = _urlreq.Request(
+        "https://api.apollo.io/api/v1/people/match",
+        data=payload, headers={"Content-Type": "application/json"}, method="POST",
+    )
+    with _urlreq.urlopen(req, timeout=20) as r:
+        return json.loads(r.read()).get("person") or {}
+
+
+def _hunter_find(first: str, last: str, domain: str) -> dict:
+    key = st.secrets.get("HUNTER_API_KEY", "") or os.getenv("HUNTER_API_KEY", "")
+    if not key or not domain:
+        return {}
+    url = (f"https://api.hunter.io/v2/email-finder"
+           f"?domain={_urlparse.quote(domain)}"
+           f"&first_name={_urlparse.quote(first)}&last_name={_urlparse.quote(last)}"
+           f"&api_key={key}")
+    with _urlreq.urlopen(url, timeout=15) as r:
+        return json.loads(r.read()).get("data") or {}
+
+
+def _lusha_lookup(linkedin_url: str) -> dict:
+    key = st.secrets.get("LUSHA_API_KEY", "") or os.getenv("LUSHA_API_KEY", "")
+    if not key:
+        return {}
+    url = f"https://api.lusha.com/v2/person?linkedInUrl={_urlparse.quote(linkedin_url)}"
+    req = _urlreq.Request(url, headers={"Api-Key": key})
+    with _urlreq.urlopen(req, timeout=15) as r:
+        return json.loads(r.read()) or {}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # BACKGROUND PULL — module-level so it survives across Streamlit reruns
 # ─────────────────────────────────────────────────────────────────────────────
 _PULL_STATE: dict = {"status": "idle", "logs": [], "result": None}
@@ -648,8 +727,8 @@ with st.sidebar:
 # ─────────────────────────────────────────────────────────────────────────────
 # TABS
 # ─────────────────────────────────────────────────────────────────────────────
-tab_overview, tab_opps, tab_partners, tab_leads = st.tabs([
-    "🏠 Overview", "📢 Opportunities", "🤝 Partners", "✅ Lead Verification",
+tab_overview, tab_opps, tab_partners, tab_leads, tab_dork = st.tabs([
+    "🏠 Overview", "📢 Opportunities", "🤝 Partners", "✅ Lead Verification", "🔍 LinkedIn Dork",
 ])
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1187,3 +1266,294 @@ with tab_leads:
                                 st.warning("Not found in Monday CRM.")
                 else:
                     st.info("Add MONDAY_API_KEY to enable push.")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 5 — LINKEDIN DORK
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_dork:
+    st.subheader("LinkedIn Lead Discovery")
+    st.caption(
+        "Google-dork LinkedIn profiles matching CRS solutions, "
+        "check Monday CRM, and surface reachability data via Apollo / Hunter / Lusha."
+    )
+
+    _DORK_SOLUTIONS = {
+        "Cybersecurity (general)":         "cybersecurity information security",
+        "NDR / XDR — VECTRA AI":           "network detection response NDR XDR threat detection",
+        "Vulnerability Mgmt — vRx":        "vulnerability management patch management",
+        "CTEM / PTaaS — Strobes":          "CTEM continuous threat exposure penetration testing",
+        "AppSec / DevSecOps — Aikido":     "application security DevSecOps SAST DAST",
+        "Dark Web / Threat Intel — Flare": "dark web threat intelligence monitoring",
+        "SASE / SIEM / MDR — Todyl":       "SASE SIEM MDR security operations",
+        "Supply Chain Risk — Panorays":    "third-party risk supply chain cyber",
+        "POPIA / GRC / Compliance":        "POPIA GDPR compliance GRC governance risk",
+        "Endpoint / Encryption — Beachhead": "endpoint security encryption MFA",
+        "IBM / Red Hat Training":          "IBM Red Hat Linux training certification",
+        "CompTIA Training":                "CompTIA Security+ Network+ training certification",
+        "VAPT / Pentest":                  "penetration testing VAPT red team ethical hacking",
+        "SOC / MDR":                       "SOC security operations centre MDR managed detection",
+    }
+
+    _DORK_TITLES = [
+        "CISO", "Chief Information Security Officer", "IT Manager", "Head of IT",
+        "ICT Manager", "Security Manager", "IT Director", "CTO",
+        "SOC Manager", "Head of Cybersecurity", "IT Governance Manager",
+        "Group IT Manager", "Head of Security", "Cybersecurity Manager",
+        "Information Security Officer", "Network Manager",
+    ]
+
+    _DORK_COUNTRIES = [
+        "South Africa", "Nigeria", "Kenya", "Ghana", "Tanzania",
+        "Uganda", "Zimbabwe", "Zambia", "Botswana", "Namibia",
+        "Rwanda", "Mozambique", "Ethiopia", "Senegal", "Ivory Coast",
+    ]
+
+    # ── Search builder ────────────────────────────────────────────────────────
+    _dc1, _dc2, _dc3 = st.columns(3)
+    with _dc1:
+        _d_sol_key = st.selectbox("Solution focus", list(_DORK_SOLUTIONS.keys()), key="dork_sol")
+    with _dc2:
+        _d_titles = st.multiselect("Job titles (OR)", _DORK_TITLES,
+                                   default=["CISO", "IT Manager", "Head of IT"], key="dork_titles")
+    with _dc3:
+        _d_countries = st.multiselect("Countries (OR)", _DORK_COUNTRIES,
+                                      default=["South Africa"], key="dork_countries")
+
+    _sol_kw    = _DORK_SOLUTIONS[_d_sol_key]
+    _title_kw  = " OR ".join(f'"{t}"' for t in _d_titles)  if _d_titles   else ""
+    _ctry_kw   = " OR ".join(f'"{c}"' for c in _d_countries) if _d_countries else ""
+    _auto_q    = f"site:linkedin.com/in/ {_sol_kw}"
+    if _title_kw:  _auto_q += f" ({_title_kw})"
+    if _ctry_kw:   _auto_q += f" ({_ctry_kw})"
+
+    _d_query = st.text_input("Dork query — auto-built, override freely",
+                              value=_auto_q, key="dork_query")
+
+    _dg1, _dg2 = st.columns([3, 1])
+    with _dg1:
+        _d_run = st.button("🔍 Search LinkedIn", type="primary", use_container_width=True)
+    with _dg2:
+        _d_num = st.number_input("# results", 5, 20, 10, step=5, key="dork_num")
+
+    # API availability indicators
+    _has_google = bool(
+        (st.secrets.get("GOOGLE_API_KEY", "") or os.getenv("GOOGLE_API_KEY", "")) and
+        (st.secrets.get("GOOGLE_CSE_ID",  "") or os.getenv("GOOGLE_CSE_ID",  ""))
+    )
+    _has_serper = bool(st.secrets.get("SERPER_API_KEY", "") or os.getenv("SERPER_API_KEY", ""))
+    _has_apollo = bool(st.secrets.get("APOLLO_API_KEY", "") or os.getenv("APOLLO_API_KEY", ""))
+    _has_hunter = bool(st.secrets.get("HUNTER_API_KEY", "") or os.getenv("HUNTER_API_KEY", ""))
+    _has_lusha  = bool(st.secrets.get("LUSHA_API_KEY",  "") or os.getenv("LUSHA_API_KEY",  ""))
+
+    st.caption(" · ".join([
+        "🟢 Google CSE" if _has_google else "⚪ Google CSE (need GOOGLE_API_KEY+GOOGLE_CSE_ID)",
+        "🟢 Serper"     if _has_serper else "⚪ Serper",
+        "🟢 Apollo"     if _has_apollo else "⚪ Apollo",
+        "🟢 Hunter"     if _has_hunter else "⚪ Hunter",
+        "🟢 Lusha"      if _has_lusha  else "⚪ Lusha",
+    ]))
+
+    # ── Execute search ────────────────────────────────────────────────────────
+    if _d_run:
+        if not _has_google and not _has_serper:
+            st.error("Add GOOGLE_API_KEY + GOOGLE_CSE_ID, or SERPER_API_KEY to search.")
+        else:
+            with st.spinner("Searching…"):
+                try:
+                    _found = _dork_search(_d_query, int(_d_num))
+                    st.session_state["dork_results"] = _found
+                    st.session_state.pop("dork_crm",    None)
+                    st.session_state.pop("dork_enrich", None)
+                    if not _found:
+                        st.warning("No LinkedIn profiles in results — try broadening the query.")
+                except Exception as _de:
+                    st.error(f"Search error: {_de}")
+
+    # ── Results ───────────────────────────────────────────────────────────────
+    _d_profiles = st.session_state.get("dork_results", [])
+
+    if not _d_profiles:
+        if not _d_run:
+            st.info("Configure a search above and click **🔍 Search LinkedIn**.")
+    else:
+        st.markdown(f"**{len(_d_profiles)} profiles found**")
+        st.divider()
+
+        for _pi, _prof in enumerate(_d_profiles):
+            _pkey    = _prof["url"]
+            _crm_res = st.session_state.get("dork_crm",    {}).get(_pkey)
+            _enr_res = st.session_state.get("dork_enrich", {}).get(_pkey, {})
+
+            with st.container(border=True):
+                _ph1, _ph2 = st.columns([5, 2])
+                with _ph1:
+                    st.markdown(f"### 👤 {_prof['name']}")
+                    st.markdown(f"[{_prof['url']}]({_prof['url']})")
+                    if _prof.get("snippet"):
+                        st.caption(_prof["snippet"][:250])
+                with _ph2:
+                    # CRM check button / badge
+                    if _crm_res is None:
+                        if _MONDAY_OK and monday_active:
+                            if st.button("🔍 Check CRM", key=f"dcrm_{_pi}",
+                                         use_container_width=True):
+                                with st.spinner("Checking Monday CRM…"):
+                                    try:
+                                        _cres = lookup_monday_crm(
+                                            {"name": _prof["name"], "linkedin": _prof["url"]})
+                                        st.session_state.setdefault("dork_crm", {})[_pkey] = _cres
+                                    except Exception as _ce:
+                                        st.session_state.setdefault("dork_crm", {})[_pkey] = {
+                                            "on_crm": False, "error": str(_ce)}
+                                st.rerun()
+                        else:
+                            st.caption("⚪ Monday not configured")
+                    elif _crm_res.get("on_crm"):
+                        st.success("✅ On CRM")
+                    else:
+                        st.warning("❌ Not in CRM")
+
+                # ── CRM detail ────────────────────────────────────────────────
+                if _crm_res and _crm_res.get("on_crm"):
+                    with st.expander("CRM Details", expanded=True):
+                        for _cf in ["crm_board", "crm_title", "contact_title",
+                                    "company", "email", "phone", "status"]:
+                            _cv = _crm_res.get(_cf)
+                            if _cv and str(_cv) not in ("", "nan", "None"):
+                                st.markdown(f"**{_cf.replace('_',' ').title()}:** {_cv}")
+                        if _crm_res.get("crm_url"):
+                            st.markdown(f"[Open in Monday]({_crm_res['crm_url']})")
+
+                # ── Reachability (not on CRM yet) ─────────────────────────────
+                elif _crm_res is not None:
+                    st.markdown("**Reachability**")
+                    _apo = _enr_res.get("apollo")
+                    _hun = _enr_res.get("hunter")
+                    _lus = _enr_res.get("lusha")
+
+                    # Apollo
+                    if _apo is None:
+                        if _has_apollo:
+                            if st.button("🚀 Enrich with Apollo", key=f"dapo_{_pi}",
+                                         use_container_width=True):
+                                with st.spinner("Apollo match…"):
+                                    try:
+                                        _ad = _apollo_match(_prof["name"], _prof["url"])
+                                        st.session_state.setdefault("dork_enrich", {}).setdefault(_pkey, {})["apollo"] = _ad
+                                    except Exception as _ae:
+                                        st.session_state.setdefault("dork_enrich", {}).setdefault(_pkey, {})["apollo"] = {"error": str(_ae)}
+                                st.rerun()
+                        else:
+                            st.caption("⚪ Apollo (add APOLLO_API_KEY)")
+                    elif _apo.get("error"):
+                        st.caption(f"Apollo ❌ {_apo['error'][:100]}")
+                    else:
+                        _apo_org = _apo.get("organization") or {}
+                        st.markdown("**Apollo:**")
+                        for _af, _al in [("email", "Email"), ("title", "Title"),
+                                         ("organization_name", "Company"),
+                                         ("city", "City"), ("country", "Country")]:
+                            _av = _apo.get(_af)
+                            if _av:
+                                st.markdown(f"  **{_al}:** {_av}")
+                        _apo_phones = _apo.get("phone_numbers") or []
+                        if _apo_phones:
+                            st.markdown(f"  **Phone:** {_apo_phones[0]}")
+                        if _apo_org.get("primary_domain"):
+                            st.caption(f"Domain: {_apo_org['primary_domain']}")
+                        if _apo_org.get("estimated_num_employees"):
+                            st.caption(f"Employees: ~{_apo_org['estimated_num_employees']}")
+
+                    # Hunter — needs a company domain
+                    _inferred_domain = ""
+                    if _apo and not _apo.get("error"):
+                        _inferred_domain = (_apo.get("organization") or {}).get("primary_domain", "")
+
+                    if _hun is None and _has_hunter:
+                        _dom_in = st.text_input(
+                            "Company domain (for Hunter email finder)",
+                            value=_inferred_domain,
+                            key=f"ddom_{_pi}",
+                            placeholder="e.g. nedbank.co.za",
+                        )
+                        if st.button("📧 Find email (Hunter)", key=f"dhun_{_pi}",
+                                     use_container_width=True,
+                                     disabled=not bool(_dom_in)):
+                            _parts = _prof["name"].split()
+                            with st.spinner("Hunter lookup…"):
+                                try:
+                                    _hd = _hunter_find(
+                                        _parts[0] if _parts else "",
+                                        _parts[-1] if len(_parts) > 1 else "",
+                                        _dom_in,
+                                    )
+                                    st.session_state.setdefault("dork_enrich", {}).setdefault(_pkey, {})["hunter"] = _hd
+                                except Exception as _he:
+                                    st.session_state.setdefault("dork_enrich", {}).setdefault(_pkey, {})["hunter"] = {"error": str(_he)}
+                            st.rerun()
+                    elif _hun and not _hun.get("error"):
+                        _he = _hun.get("email")
+                        if _he:
+                            st.markdown(f"**Hunter email:** `{_he}` (confidence: {_hun.get('score', '—')})")
+                    elif _hun and _hun.get("error"):
+                        st.caption(f"Hunter ❌ {_hun['error'][:100]}")
+                    elif not _has_hunter:
+                        st.caption("⚪ Hunter (add HUNTER_API_KEY)")
+
+                    # Lusha
+                    if _lus is None and _has_lusha:
+                        if st.button("💼 Lusha lookup", key=f"dlus_{_pi}",
+                                     use_container_width=True):
+                            with st.spinner("Lusha lookup…"):
+                                try:
+                                    _ld = _lusha_lookup(_prof["url"])
+                                    st.session_state.setdefault("dork_enrich", {}).setdefault(_pkey, {})["lusha"] = _ld
+                                except Exception as _le:
+                                    st.session_state.setdefault("dork_enrich", {}).setdefault(_pkey, {})["lusha"] = {"error": str(_le)}
+                            st.rerun()
+                    elif _lus and not _lus.get("error"):
+                        _le2 = _lus.get("emailAddresses") or []
+                        _lp2 = _lus.get("phoneNumbers") or []
+                        if _le2:
+                            _lem = _le2[0] if isinstance(_le2[0], str) else _le2[0].get("validatedEmail", str(_le2[0]))
+                            st.markdown(f"**Lusha email:** `{_lem}`")
+                        if _lp2:
+                            _lph = _lp2[0] if isinstance(_lp2[0], str) else _lp2[0].get("internationalNumber", str(_lp2[0]))
+                            st.markdown(f"**Lusha phone:** `{_lph}`")
+                    elif _lus and _lus.get("error"):
+                        st.caption(f"Lusha ❌ {_lus['error'][:100]}")
+                    elif not _has_lusha:
+                        st.caption("⚪ Lusha (add LUSHA_API_KEY)")
+
+                    # Push to Monday Leads
+                    if monday_active:
+                        st.divider()
+                        _apo_phones2 = (_apo or {}).get("phone_numbers") or []
+                        _lus_phones2 = (_lus or {}).get("phoneNumbers") or []
+                        def _pick_phone(lst):
+                            if not lst: return ""
+                            p = lst[0]
+                            return p if isinstance(p, str) else (p.get("internationalNumber") or "")
+                        _push_payload = {
+                            "name":           _prof["name"],
+                            "title":          (_apo or {}).get("title", ""),
+                            "company":        (_apo or {}).get("organization_name", ""),
+                            "email":          ((_apo or {}).get("email") or
+                                               (_hun or {}).get("email") or
+                                               (_lem if _lus and not _lus.get("error") and _le2 else "")),
+                            "phone":          (_pick_phone(_apo_phones2) or
+                                               _pick_phone(_lus_phones2)),
+                            "linkedin":       _prof["url"],
+                            "authority":      "",
+                            "accuracy_score": "",
+                            "provider_chain": "LinkedIn Dork",
+                            "country":        (_apo or {}).get("country", ""),
+                        }
+                        if st.button("📋 Add to Monday Leads", key=f"dpush_{_pi}",
+                                     use_container_width=True, type="primary"):
+                            with st.spinner("Pushing to Monday…"):
+                                try:
+                                    _pr = sync_lead_to_monday(_push_payload)
+                                    st.success(f"Action: {_pr.get('action')} · ID: {_pr.get('item_id')}")
+                                except Exception as _pe:
+                                    st.error(f"Push failed: {_pe}")
