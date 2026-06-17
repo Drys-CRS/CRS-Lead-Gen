@@ -27,6 +27,7 @@ import json
 import time
 import datetime as _dt
 import collections as _collections
+import concurrent.futures as _futures
 
 import requests
 
@@ -1341,14 +1342,19 @@ def run_partner_analysis(log) -> int:
 # ═══════════════════════════════════════════════════════════════════════════
 def run_scrape(log, years_back: int = 3,
                countries_filter: list | None = None,
-               include_non_ocds: bool = True) -> dict:
+               include_non_ocds: bool = True,
+               parallel_workers: int = 4,
+               progress_cb=None) -> dict:
     """Full Africa scrape, preserving AI annotations across the open-delete.
 
     countries_filter: if provided, only scrape those country names.
     include_non_ocds: if False, skip the World Bank / UNDP pass.
-    Passing neither argument reproduces the original full-scrape behaviour.
+    parallel_workers: number of concurrent country scrapers (default 4).
+    progress_cb: optional callable(fraction: float, country: str) for UI progress.
     """
+    import threading as _th
     _cf = set(countries_filter) if countries_filter else None
+
     before_open = _count_rows("sa_tenders", status="Open")
     before_awarded = _count_rows("awarded_tenders")
     log(f"📦 Start state — {before_open:,} open, {before_awarded:,} awarded in Supabase.")
@@ -1357,35 +1363,50 @@ def run_scrape(log, years_back: int = 3,
     if snap:
         log(f"💾 Saved AI scores/flags for {len(snap)} tender(s) to re-apply after scraping.")
 
-    # South Africa — live API, OCDS fallback
+    # Build ordered work list
+    _work: list = []
     if _cf is None or "South Africa" in _cf:
-        try:
-            scrape_south_africa(log)
-        except Exception as e:
-            log(f"  ⚠️ SA live API failed ({e}) — falling back to OCDS registry…")
-            try:
-                scrape_ocds_country("South Africa", log, years_back)
-            except Exception as e2:
-                log(f"  ❌ SA OCDS fallback also failed: {e2}")
-
-    # Other OCDS countries
-    for country in OCDS_REGISTRY:
-        if country == "South Africa":
+        _work.append("South Africa")
+    for _c in OCDS_REGISTRY:
+        if _c == "South Africa":
             continue
-        if _cf is not None and country not in _cf:
-            continue
-        try:
-            scrape_ocds_country(country, log, years_back)
-        except Exception as e:
-            log(f"  ❌ {country} crashed: {e}")
-
-    # Non-OCDS via World Bank + UNDP
+        if _cf is None or _c in _cf:
+            _work.append(_c)
     if include_non_ocds:
+        _work.append("__non_ocds__")
+
+    _total  = len(_work)
+    _done   = [0]
+    _lock   = _th.Lock()
+
+    def _scrape_one(item: str) -> None:
         try:
-            log("🌍 Scraping non-OCDS countries via World Bank & UNDP…")
-            scrape_non_ocds_countries(log)
-        except Exception as e:
-            log(f"  ❌ Non-OCDS scraper crashed: {e}")
+            if item == "South Africa":
+                try:
+                    scrape_south_africa(log)
+                except Exception as _e:
+                    log(f"  ⚠️ SA live API failed ({_e}) — falling back to OCDS registry…")
+                    try:
+                        scrape_ocds_country("South Africa", log, years_back)
+                    except Exception as _e2:
+                        log(f"  ❌ SA OCDS fallback also failed: {_e2}")
+            elif item == "__non_ocds__":
+                log("🌍 Scraping non-OCDS countries via World Bank & UNDP…")
+                scrape_non_ocds_countries(log)
+            else:
+                scrape_ocds_country(item, log, years_back)
+        except Exception as _e:
+            log(f"  ❌ {item} crashed: {_e}")
+        finally:
+            with _lock:
+                _done[0] += 1
+                if progress_cb and _total > 0:
+                    _label = "Non-OCDS" if item == "__non_ocds__" else item
+                    progress_cb(_done[0] / _total, _label)
+
+    log(f"🚀 Scraping {_total} source(s) with {parallel_workers} parallel worker(s)…")
+    with _futures.ThreadPoolExecutor(max_workers=parallel_workers) as _ex:
+        list(_ex.map(_scrape_one, _work))
 
     _restore_open_annotations(snap, log)
 
@@ -1402,6 +1423,7 @@ def run_scrape(log, years_back: int = 3,
 def run_all(years_back: int = 3, max_score: int = 300, do_partner: bool = True,
             score_time_budget_s: int = 3000, trigger: str = "github_action",
             countries_filter: list | None = None, include_non_ocds: bool = True,
+            parallel_workers: int = 4, progress_cb=None,
             log=_log_default) -> dict:
     """End-to-end nightly run: scrape → score → (optional) partner analysis.
     Logs a pipeline_runs record so the dashboard's Tab 6 history shows it."""
@@ -1421,7 +1443,9 @@ def run_all(years_back: int = 3, max_score: int = 300, do_partner: bool = True,
         log("─ 1. Scrape ─")
         scrape_res = run_scrape(log, years_back,
                                 countries_filter=countries_filter,
-                                include_non_ocds=include_non_ocds)
+                                include_non_ocds=include_non_ocds,
+                                parallel_workers=parallel_workers,
+                                progress_cb=progress_cb)
         counters["tenders_scraped"] = scrape_res.get("open", 0)
 
         log("─ 2. AI scoring ─")

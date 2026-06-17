@@ -712,7 +712,8 @@ def _cascade_find_contact(name: str, linkedin_url: str,
 # ─────────────────────────────────────────────────────────────────────────────
 # BACKGROUND PULL — module-level so it survives across Streamlit reruns
 # ─────────────────────────────────────────────────────────────────────────────
-_PULL_STATE: dict = {"status": "idle", "logs": [], "result": None}
+_PULL_STATE: dict = {"status": "idle", "logs": [], "result": None,
+                     "progress": 0.0, "current_country": ""}
 
 # Countries available for on-demand scraping (mirrors ingest_core.OCDS_REGISTRY keys)
 _PULL_OCDS_COUNTRIES = [
@@ -726,12 +727,17 @@ _PULL_NON_OCDS_KEY = "Non-OCDS (World Bank / UNDP)"
 _PULL_ALL_COUNTRIES = _PULL_OCDS_COUNTRIES + [_PULL_NON_OCDS_KEY]
 
 def _pull_worker(env_overrides: dict, countries_sel: list | None = None) -> None:
-    _PULL_STATE.update({"status": "running", "logs": [], "result": None})
+    _PULL_STATE.update({"status": "running", "logs": [], "result": None,
+                        "progress": 0.0, "current_country": "starting…"})
     for k, v in env_overrides.items():
         if not os.environ.get(k):
             os.environ[k] = v
     def _log(m: str) -> None:
         _PULL_STATE["logs"].append(str(m)[:200])
+
+    def _prog_cb(fraction: float, country: str) -> None:
+        _PULL_STATE["progress"]        = fraction
+        _PULL_STATE["current_country"] = country
 
     # Separate OCDS countries from the Non-OCDS toggle
     _ocds_filter: list | None = None
@@ -748,9 +754,11 @@ def _pull_worker(env_overrides: dict, countries_sel: list | None = None) -> None
             years_back=3, max_score=300, do_partner=True,
             score_time_budget_s=3000, trigger="manual_app",
             countries_filter=_ocds_filter, include_non_ocds=_non_ocds,
+            parallel_workers=4, progress_cb=_prog_cb,
             log=_log,
         )
-        _PULL_STATE.update({"status": "done", "result": result})
+        _PULL_STATE.update({"status": "done", "result": result,
+                            "progress": 1.0, "current_country": ""})
     except Exception as _e:
         _PULL_STATE.update({"status": "failed", "result": {"error": str(_e)}})
 
@@ -833,6 +841,23 @@ with st.sidebar:
 
     _ps = _PULL_STATE["status"]
     _pull_blocked = (_ps == "running") or _gh_running
+
+    # ── In-process pull progress ──────────────────────────────────────────────
+    if _ps == "running":
+        _prog  = float(_PULL_STATE.get("progress", 0.0))
+        _curr  = _PULL_STATE.get("current_country", "")
+        _ptext = f"Scraping {_curr}…" if _curr and _curr != "starting…" else "Starting…"
+        st.progress(_prog, text=_ptext)
+        for _ll in _PULL_STATE["logs"][-4:]:
+            st.caption(_ll)
+        if st.button("🔄 Refresh status", key="pull_refresh_btn", use_container_width=True):
+            st.rerun()
+    elif _ps == "done":
+        _r = _PULL_STATE.get("result") or {}
+        st.success(f"✅ Scraped {_r.get('tenders_scraped', '?')} tenders")
+    elif _ps == "failed":
+        _r = _PULL_STATE.get("result") or {}
+        st.error(str(_r.get("error", "Unknown error"))[:120])
 
     # ── Country selector ──────────────────────────────────────────────────────
     if "pull_countries" not in st.session_state:
