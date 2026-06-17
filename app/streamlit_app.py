@@ -398,42 +398,7 @@ def ai_analyse_partners(awarded_df: pd.DataFrame) -> list:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SIDEBAR
-# ─────────────────────────────────────────────────────────────────────────────
-with st.sidebar:
-    _logo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "crs_logo.png")
-    if os.path.exists(_logo):
-        st.image(_logo, width=160)
-    st.title("CRS Intelligence")
-    st.caption("v2 · pipeline owned by GitHub Actions")
-    st.divider()
-
-    country_filter = st.multiselect(
-        "Countries",
-        ["South Africa", "Kenya", "Nigeria", "Ghana", "Tanzania",
-         "Uganda", "Zambia", "Rwanda", "Botswana", "Namibia", "Zimbabwe",
-         "Mozambique", "Ethiopia", "Egypt", "Angola", "Cameroon"],
-        default=[], placeholder="All",
-    )
-    min_score = st.slider("Min AI score", 0, 10, 0)
-    st.divider()
-
-    monday_active = _MONDAY_OK and bool(
-        st.secrets.get("MONDAY_API_KEY") if hasattr(st, "secrets") else "")
-    st.success("Monday.com ✓") if monday_active else st.caption("Monday.com: key not set")
-
-    st.divider()
-    st.markdown("**AI Providers**")
-    for part in _provider_status().split(" · "):
-        st.caption(part)
-    st.divider()
-
-    if st.button("Clear cache", use_container_width=True):
-        st.cache_data.clear()
-        st.rerun()
-
-# ─────────────────────────────────────────────────────────────────────────────
-# DATA LOADERS
+# DATA LOADERS  (defined before sidebar so sidebar buttons can call them)
 # ─────────────────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=300)
 def _load_tenders() -> pd.DataFrame:
@@ -466,6 +431,10 @@ def _load_pipeline_runs() -> pd.DataFrame:
          .order("run_at", desc=True).limit(10).execute())
     return pd.DataFrame(r.data or [])
 
+# Filters live inside each tab; sidebar is control-only.
+country_filter: list = []
+min_score: int = 0
+
 def _country(df, col="country"):
     if country_filter and col in df.columns:
         return df[df[col].isin(country_filter)]
@@ -478,7 +447,6 @@ def _score_filter(df):
     return df
 
 def _parse_rationale(raw) -> dict:
-    """ai_rationale may be a JSON blob or plain string; always return a dict."""
     if not raw or str(raw) in ("nan", "None", ""):
         return {}
     try:
@@ -487,7 +455,6 @@ def _parse_rationale(raw) -> dict:
         return {"rationale": str(raw)}
 
 def _parse_list(raw) -> list:
-    """Parse a JSON list stored as a string. Returns []  on failure."""
     if not raw:
         return []
     if isinstance(raw, list):
@@ -498,15 +465,149 @@ def _parse_list(raw) -> list:
     except Exception:
         return [s.strip() for s in str(raw).split(",") if s.strip()]
 
-# ─────────────────────────────────────────────────────────────────────────────
-# URGENCY BADGE HELPER
-# ─────────────────────────────────────────────────────────────────────────────
 def _badge(urgency: str) -> str:
     u = str(urgency).lower()
     if u == "high":   return "🔴 High"
     if u == "medium": return "🟡 Medium"
     if u == "low":    return "🟢 Low"
     return urgency or "—"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SIDEBAR — Health check + action buttons only
+# ─────────────────────────────────────────────────────────────────────────────
+
+with st.sidebar:
+    _logo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "crs_logo.png")
+    if os.path.exists(_logo):
+        st.image(_logo, width=160)
+    st.title("CRS Intelligence")
+    st.caption("v2 · pipeline owned by GitHub Actions")
+    st.divider()
+
+    # ── Health Check ──────────────────────────────────────────────────────────
+    st.markdown("**Health Check**")
+
+    for part in _provider_status().split(" · "):
+        st.caption(part)
+
+    monday_active = _MONDAY_OK and bool(
+        st.secrets.get("MONDAY_API_KEY") if hasattr(st, "secrets") else "")
+    st.caption("🟢 Monday.com" if monday_active else "⚪ Monday.com (key not set)")
+
+    try:
+        _lr = (supabase.table("pipeline_runs").select("run_at,status,tenders_scraped")
+               .order("run_at", desc=True).limit(1).execute()).data
+        if _lr:
+            _r0 = _lr[0]
+            _ts = str(_r0.get("run_at", ""))[:16]
+            _st = _r0.get("status", "—")
+            _dot = "🟢" if _st == "success" else "🔴"
+            st.caption(f"{_dot} Last run: {_ts} — {_st}")
+            st.caption(f"   Scraped: {_r0.get('tenders_scraped', '—')}")
+        else:
+            st.caption("⚪ No pipeline runs yet")
+    except Exception:
+        st.caption("⚪ Pipeline status unavailable")
+
+    st.divider()
+
+    # ── Actions ───────────────────────────────────────────────────────────────
+    st.markdown("**Actions**")
+
+    if st.button("🔄 Refresh data", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
+
+    if st.button("📥 Pull all tenders", use_container_width=True,
+                 help="Triggers the nightly GitHub Actions pipeline immediately"):
+        _gh = (st.secrets.get("GH_PAT", "") or st.secrets.get("GITHUB_TOKEN", ""))
+        if not _gh:
+            st.error("Set GH_PAT in secrets to trigger the pipeline.")
+        else:
+            import requests as _req
+            try:
+                _resp = _req.post(
+                    "https://api.github.com/repos/Drys-CRS/CRS-Lead-Gen/actions/workflows/daily-ingest.yml/dispatches",
+                    headers={"Authorization": f"token {_gh}",
+                             "Accept": "application/vnd.github.v3+json"},
+                    json={"ref": "main"},
+                    timeout=15,
+                )
+                if _resp.status_code == 204:
+                    st.success("Pipeline triggered — check GitHub Actions for progress.")
+                else:
+                    st.error(f"Trigger failed ({_resp.status_code}): {_resp.text[:200]}")
+            except Exception as _e:
+                st.error(f"Request error: {_e}")
+
+    if st.button("🤖 Score unscored tenders", use_container_width=True,
+                 help="AI-scores up to 30 unscored open tenders now"):
+        with st.spinner("Fetching unscored tenders…"):
+            try:
+                _unscored = (supabase.table("sa_tenders").select("*")
+                             .is_("ai_score", "null").limit(30).execute()).data or []
+            except Exception as _e:
+                st.error(f"Fetch failed: {_e}")
+                _unscored = []
+        if not _unscored:
+            st.info("No unscored tenders found.")
+        else:
+            _prog = st.progress(0, text=f"Scoring 0/{len(_unscored)}…")
+            _errs = 0
+            for _i, _row in enumerate(_unscored):
+                try:
+                    _sc = ai_score_tender(_row)
+                    _blob = json.dumps({
+                        "rationale": _sc["rationale"],
+                        "partner_type": _sc["partner_type"],
+                        "proposed_solutions": _sc["proposed_solutions"],
+                        "outreach_angle": _sc["outreach_angle"],
+                    })
+                    supabase.table("sa_tenders").update(
+                        {"ai_score": _sc["score"], "ai_rationale": _blob}
+                    ).eq("id", _row["id"]).execute()
+                except Exception:
+                    _errs += 1
+                _prog.progress((_i + 1) / len(_unscored),
+                               text=f"Scoring {_i+1}/{len(_unscored)}…")
+            _prog.empty()
+            st.cache_data.clear()
+            st.success(f"Scored {len(_unscored) - _errs}/{len(_unscored)} tenders.")
+
+    if st.button("🤝 Run partner analysis", use_container_width=True,
+                 help="AI partner analysis from awarded tender data"):
+        _df_aw_sb = _load_awarded()
+        if _df_aw_sb.empty:
+            st.warning("No awarded tender data to analyse.")
+        else:
+            with st.spinner(f"Analysing {len(_df_aw_sb):,} awarded tenders…"):
+                try:
+                    _presults = ai_analyse_partners(_df_aw_sb)
+                    if _presults:
+                        def _js_sb(v):
+                            return json.dumps(v) if isinstance(v, (list, dict)) else str(v or "")
+                        _pins = [{
+                            "company":             str(p.get("company",""))[:200],
+                            "country":             str(p.get("country",""))[:100],
+                            "crs_score":           p.get("tenders_won"),
+                            "why":                 str(p.get("why_aligned",""))[:1000],
+                            "outreach_angle":      str(p.get("outreach_angle",""))[:1000],
+                            "urgency":             str(p.get("urgency",""))[:20],
+                            "partnership_type":    str(p.get("partner_classification",""))[:100],
+                            "tenders_won":         p.get("tenders_won"),
+                            "proposed_solutions":  _js_sb(p.get("proposed_solutions",[])),
+                            "key_tenders":         _js_sb(p.get("key_tenders",[])),
+                            "tenders_won_summary": str(p.get("tenders_won_summary",""))[:2000],
+                            "issuing_departments": _js_sb(p.get("issuing_departments",[])),
+                            "estimated_deal_size": str(p.get("estimated_deal_size",""))[:50],
+                        } for p in _presults]
+                        supabase.table("partner_recommendation_history").insert(_pins).execute()
+                        st.cache_data.clear()
+                        st.success(f"Found {len(_presults)} partner candidates — saved.")
+                    else:
+                        st.warning("AI returned no partner candidates.")
+                except Exception as _e:
+                    st.error(f"Analysis failed: {_e}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TABS
