@@ -12,6 +12,7 @@ import threading
 import datetime as _dt
 import urllib.request as _urlreq
 import urllib.parse as _urlparse
+import xml.etree.ElementTree as _ET
 import streamlit as st
 import pandas as pd
 from supabase import create_client, Client
@@ -2027,17 +2028,24 @@ def _news_search(query: str, num: int = 10) -> list:
 
 
 def _intel_ai_rate(company: str, country: str, event_type: str,
-                   description: str) -> dict:
+                   description: str, source_count: int = 1,
+                   all_sources: list | None = None,
+                   combined_description: str = "") -> dict:
+    context = (combined_description or description)[:1200]
+    src_line = (f"{source_count} source{'s' if source_count > 1 else ''}: "
+                f"{', '.join(all_sources or [])}")
     prompt = f"""You are a sales intelligence AI for CRS (Cyber Retaliator Solutions),
 an African IBM Security / Red Hat / SUSE / CompTIA training & distribution partner.
 
-Rate this African company as a CRS lead based on the cyber event below.
-Also extract any named individuals (executives, IT staff, spokespersons) mentioned.
+Rate this African company as a CRS lead. Use ALL sources provided — more sources
+mean higher confidence. Also extract any named individuals mentioned.
 
 Company: {company}
 Country: {country}
 Event type: {event_type}
-Details: {description[:800]}
+Sources: {src_line}
+Cross-referenced context:
+{context}
 
 Reply ONLY with valid JSON (no markdown fences):
 {{
@@ -2089,10 +2097,153 @@ def _intel_enrich_card(company: str, country: str, description: str) -> dict:
         except Exception:
             pass
 
-    # Extract names from all collected text (regex) then deduplicate with AI-found names
+    # Also scan African RSS feeds for the specific company
+    for _fn, _fu in _AFRICAN_FEEDS.items():
+        try:
+            _rss_hits = _fetch_rss_feed(
+                _fn, _fu,
+                keywords=(company.lower(),),
+                days_back=90,
+            )
+            for _rh in _rss_hits[:3]:
+                _rt = f"{_rh.get('title','')} {_rh.get('snippet','')}".strip()
+                all_text += "\n" + _rt
+                u2 = _rh.get("url", "")
+                if u2 and u2 not in seen_urls:
+                    seen_urls.add(u2)
+                    out["snippets"].append({
+                        "title":   _rh.get("title", ""),
+                        "url":     u2,
+                        "snippet": _rh.get("snippet", ""),
+                        "date":    _rh.get("date", ""),
+                        "source":  _fn,
+                    })
+        except Exception:
+            pass
+
     out["persons"] = _extract_names(all_text)
-    out["snippets"] = out["snippets"][:8]
+    out["snippets"] = out["snippets"][:10]
     return out
+
+
+def _dedupe_persons(persons: list) -> list:
+    """Deduplicate a list of {name, title} dicts by name."""
+    seen: set = set()
+    result: list = []
+    for p in persons:
+        n = (p.get("name") or "").strip().lower()
+        if n and n not in seen:
+            seen.add(n)
+            result.append(p)
+    return result[:10]
+
+
+@st.cache_data(ttl=1800)
+def _fetch_rss_feed(feed_name: str, feed_url: str,
+                    keywords: tuple, days_back: int = 30) -> list:
+    """Fetch an RSS/Atom feed and return items matching any keyword."""
+    try:
+        req = _urlreq.Request(
+            feed_url,
+            headers={"User-Agent": "CRSIntel/2.0 (cybersecurity research)"},
+        )
+        with _urlreq.urlopen(req, timeout=12) as r:
+            raw = r.read()
+        root = _ET.fromstring(raw)
+        # Detect Atom vs RSS
+        _atom_ns = "http://www.w3.org/2005/Atom"
+        is_atom = root.tag.startswith(f"{{{_atom_ns}}}")
+        cutoff = (_dt.datetime.now(_dt.timezone.utc)
+                  - _dt.timedelta(days=days_back))
+        results: list = []
+        items = (root.findall(f".//{{{_atom_ns}}}entry")
+                 if is_atom else root.findall(".//item"))
+        for item in items:
+            def _txt(tag: str) -> str:
+                el = item.find(tag)
+                return (el.text or "").strip() if el is not None else ""
+
+            if is_atom:
+                title   = _txt(f"{{{_atom_ns}}}title")
+                link_el = item.find(f"{{{_atom_ns}}}link")
+                link    = (link_el.get("href", "") if link_el is not None else "")
+                desc    = _txt(f"{{{_atom_ns}}}summary") or _txt(f"{{{_atom_ns}}}content")
+                pub     = _txt(f"{{{_atom_ns}}}published") or _txt(f"{{{_atom_ns}}}updated")
+            else:
+                title = _txt("title")
+                link  = _txt("link")
+                desc  = _txt("description")
+                pub   = _txt("pubDate")
+
+            # Strip HTML tags from description
+            desc = re.sub(r"<[^>]+>", " ", desc).strip()
+            desc = re.sub(r"\s{2,}", " ", desc)
+
+            # Date filter
+            pub_date = ""
+            if pub:
+                try:
+                    # ISO format (Atom)
+                    pub_dt = _dt.datetime.fromisoformat(pub.replace("Z", "+00:00"))
+                    if pub_dt.tzinfo is None:
+                        pub_dt = pub_dt.replace(tzinfo=_dt.timezone.utc)
+                    if pub_dt < cutoff:
+                        continue
+                    pub_date = pub_dt.strftime("%Y-%m-%d")
+                except ValueError:
+                    try:
+                        # RFC 2822 (RSS pubDate)
+                        from email.utils import parsedate_to_datetime
+                        pub_dt = parsedate_to_datetime(pub)
+                        if pub_dt.astimezone(_dt.timezone.utc) < cutoff:
+                            continue
+                        pub_date = pub_dt.strftime("%Y-%m-%d")
+                    except Exception:
+                        pass
+
+            # Keyword filter
+            text_lc = (title + " " + desc).lower()
+            if not any(kw in text_lc for kw in keywords):
+                continue
+
+            results.append({
+                "title":   title,
+                "url":     link,
+                "snippet": desc[:300],
+                "date":    pub_date,
+                "source":  feed_name,
+            })
+
+        return results
+    except Exception:
+        return []
+
+
+def _search_african_feeds(country: str, days_back: int = 30,
+                          max_per_feed: int = 3) -> list:
+    """Search all African feeds for cyber events mentioning a country."""
+    _cyber_kw = (
+        "breach", "ransomware", "hack", "cyber", "attack", "leak",
+        "credential", "malware", "phishing", "data",
+    )
+    results: list = []
+    for feed_name, feed_url in _AFRICAN_FEEDS.items():
+        try:
+            items = _fetch_rss_feed(
+                feed_name, feed_url,
+                keywords=(country.lower(), *_cyber_kw),
+                days_back=days_back,
+            )
+            for item in items[:max_per_feed]:
+                # Must mention both the country AND a cyber keyword
+                text_lc = (item["title"] + " " + item["snippet"]).lower()
+                has_country = country.lower() in text_lc
+                has_cyber   = any(k in text_lc for k in _cyber_kw)
+                if has_country and has_cyber:
+                    results.append(item)
+        except Exception:
+            pass
+    return results
 
 
 def _extract_company_from_news(title: str, snippet: str, country: str) -> str:
@@ -2160,6 +2311,25 @@ def _extract_names(text: str) -> list:
             break
     return results
 
+
+# African cybersecurity / tech news RSS feeds
+_AFRICAN_FEEDS: dict = {
+    "IT Web Security":   "https://itweb.co.za/rss/security.rss",
+    "MyBroadband":       "https://mybroadband.co.za/news/category/security/feed/",
+    "TechCentral":       "https://techcentral.co.za/feed/",
+    "IT News Africa":    "https://itnewsafrica.com/feed/",
+    "BusinessTech":      "https://businesstech.co.za/news/feed/",
+    "TechCabal":         "https://techcabal.com/feed/",
+    "TechPoint Africa":  "https://techpoint.africa/feed/",
+    "Daily Maverick":    "https://dailymaverick.co.za/dmx/feed/",
+}
+
+# site: restriction for Africa-focused Google pass
+_AFRICAN_SITES_GOOGLE = (
+    "site:itweb.co.za OR site:mybroadband.co.za OR site:techcentral.co.za "
+    "OR site:itnewsafrica.com OR site:businesstech.co.za OR site:techcabal.com "
+    "OR site:techpoint.africa OR site:dailymaverick.co.za"
+)
 
 _INTEL_COUNTRIES = [
     "South Africa", "Kenya", "Nigeria", "Ghana", "Tanzania", "Uganda",
@@ -2237,69 +2407,153 @@ if _page == "🛡️ Lead Intelligence":
             _intel_raw: list = []
 
             _ipb = st.progress(0, text="Searching…")
+            _n_sources = len(_i_countries)
             for _ic_idx, _ic in enumerate(_i_countries):
-                _ipb.progress((_ic_idx + 1) / len(_i_countries), text=f"Searching {_ic}…")
+                _ipb.progress(
+                    (_ic_idx + 1) / _n_sources,
+                    text=f"Searching {_ic} — Flare · Google · RSS…",
+                )
 
-                # Flare.io
+                # ── Flare.io ────────────────────────────────────────────────
                 if _i_src_flare and _flare_types:
                     try:
                         _fevts = _flare_search(
                             f'"{_ic}"', _flare_types,
-                            days_back=int(_i_days), size=int(_i_per_ctry)
+                            days_back=int(_i_days), size=int(_i_per_ctry),
                         )
                         for _fe in _fevts:
-                            _meta = _fe.get("metadata") or _fe
-                            _body = _fe.get("body") or _fe
-                            _desc = (str(_body.get("content") or _body.get("text") or
-                                        _body.get("description") or _meta.get("title") or "")[:600])
-                            _co   = (str(_meta.get("source_name") or _meta.get("domain") or
-                                        _meta.get("company") or "Unknown")[:120])
-                            _etype = str(_meta.get("type") or _meta.get("event_type") or
-                                         (_flare_types[0] if _flare_types else "unknown"))
-                            _date  = str(_meta.get("estimated_created_at") or
-                                         _meta.get("created_at") or "")[:10]
-                            _url   = str(_meta.get("url") or _meta.get("source_url") or "")
+                            _meta  = _fe.get("metadata") or _fe
+                            _body  = _fe.get("body") or _fe
+                            _desc  = str(
+                                _body.get("content") or _body.get("text") or
+                                _body.get("description") or _meta.get("title") or ""
+                            )[:600]
+                            _co    = str(
+                                _meta.get("source_name") or _meta.get("domain") or
+                                _meta.get("company") or "Unknown"
+                            )[:120]
+                            _etype = str(
+                                _meta.get("type") or _meta.get("event_type") or
+                                (_flare_types[0] if _flare_types else "unknown")
+                            )
                             _intel_raw.append({
-                                "company": _co, "country": _ic,
-                                "event_type": _etype, "date": _date,
-                                "description": _desc, "url": _url,
-                                "source": "Flare.io",
+                                "company":       _co,
+                                "country":       _ic,
+                                "event_type":    _etype,
+                                "date":          str(_meta.get("estimated_created_at") or
+                                                     _meta.get("created_at") or "")[:10],
+                                "description":   _desc,
+                                "url":           str(_meta.get("url") or
+                                                     _meta.get("source_url") or ""),
+                                "source":        "Flare.io",
+                                "persons_found": _extract_names(_desc),
                             })
                     except Exception as _fe2:
                         st.toast(f"Flare error for {_ic}: {str(_fe2)[:80]}")
 
-                # Google News — restrict to African context
+                # ── Google News (broad African context) ─────────────────────
                 if _i_src_google:
                     try:
                         _gq = f'"{_ic}" Africa {_INTEL_GOOGLE_TERMS}'
-                        _gnews = _news_search(_gq, num=int(_i_per_ctry))
-                        for _gn in _gnews:
-                            _co2 = _extract_company_from_news(
+                        for _gn in _news_search(_gq, num=int(_i_per_ctry)):
+                            _co2      = _extract_company_from_news(
                                 _gn["title"], _gn["snippet"], _ic)
                             _full_desc = f"{_gn['title']} — {_gn['snippet']}"
-                            _names_in_item = _extract_names(_full_desc)
                             _intel_raw.append({
-                                "company":          _co2,
-                                "country":          _ic,
-                                "event_type":       "news",
-                                "date":             _gn.get("date", ""),
-                                "description":      _full_desc,
-                                "url":              _gn["url"],
-                                "source":           "Google News",
-                                "persons_found":    _names_in_item,
+                                "company":       _co2,
+                                "country":       _ic,
+                                "event_type":    "news",
+                                "date":          _gn.get("date", ""),
+                                "description":   _full_desc,
+                                "url":           _gn["url"],
+                                "source":        "Google News",
+                                "persons_found": _extract_names(_full_desc),
                             })
                     except Exception as _ge:
                         st.toast(f"Google error for {_ic}: {str(_ge)[:80]}")
 
+                # ── Google — African publications only ──────────────────────
+                if _i_src_google:
+                    try:
+                        _gq2 = f'({_AFRICAN_SITES_GOOGLE}) "{_ic}" {_INTEL_GOOGLE_TERMS}'
+                        for _gn2 in _news_search(_gq2, num=int(_i_per_ctry)):
+                            _co3      = _extract_company_from_news(
+                                _gn2["title"], _gn2["snippet"], _ic)
+                            _fd2      = f"{_gn2['title']} — {_gn2['snippet']}"
+                            _src_name = (next(
+                                (s for s in _AFRICAN_FEEDS
+                                 if s.split()[0].lower() in _gn2["url"].lower()),
+                                "African Press",
+                            ))
+                            _intel_raw.append({
+                                "company":       _co3,
+                                "country":       _ic,
+                                "event_type":    "news",
+                                "date":          _gn2.get("date", ""),
+                                "description":   _fd2,
+                                "url":           _gn2["url"],
+                                "source":        _src_name,
+                                "persons_found": _extract_names(_fd2),
+                            })
+                    except Exception:
+                        pass
+
+                # ── African RSS feeds ────────────────────────────────────────
+                try:
+                    for _rss_item in _search_african_feeds(
+                        _ic, days_back=int(_i_days), max_per_feed=int(_i_per_ctry)
+                    ):
+                        _rfd = f"{_rss_item['title']} — {_rss_item['snippet']}"
+                        _rco = _extract_company_from_news(
+                            _rss_item["title"], _rss_item["snippet"], _ic)
+                        _intel_raw.append({
+                            "company":       _rco,
+                            "country":       _ic,
+                            "event_type":    "news",
+                            "date":          _rss_item.get("date", ""),
+                            "description":   _rfd,
+                            "url":           _rss_item["url"],
+                            "source":        _rss_item.get("source", "RSS"),
+                            "persons_found": _extract_names(_rfd),
+                        })
+                except Exception:
+                    pass
+
             _ipb.empty()
-            # Deduplicate by company+country
-            _seen_co: set = set()
-            _intel_dedup: list = []
+
+            # ── Cross-reference: group by (company_key, country) ────────────
+            _groups: dict = {}
             for _ev in _intel_raw:
-                _ck = (_ev["company"].lower()[:30], _ev["country"])
-                if _ck not in _seen_co and _ev["company"] not in ("Unknown", ""):
-                    _seen_co.add(_ck)
-                    _intel_dedup.append(_ev)
+                _ck = (_ev["company"].lower()[:35], _ev["country"])
+                if _ev["company"] in ("Unknown", ""):
+                    continue
+                if _ck not in _groups:
+                    _groups[_ck] = {
+                        "best":         _ev,
+                        "sources":      set(),
+                        "descriptions": [],
+                        "persons":      [],
+                    }
+                g = _groups[_ck]
+                g["sources"].add(_ev["source"])
+                g["descriptions"].append(f"[{_ev['source']}] {_ev['description']}")
+                g["persons"].extend(_ev.get("persons_found") or [])
+                # Keep richest description as the "best" representative
+                if len(_ev.get("description", "")) > len(g["best"].get("description", "")):
+                    g["best"] = _ev
+
+            # Flatten groups → merged result list, sorted by source count
+            _intel_dedup: list = []
+            for _ck2, g2 in _groups.items():
+                _merged = dict(g2["best"])
+                _merged["source_count"]          = len(g2["sources"])
+                _merged["all_sources"]           = sorted(g2["sources"])
+                _merged["combined_description"]  = "\n".join(g2["descriptions"])[:1500]
+                _merged["persons_found"]         = _dedupe_persons(g2["persons"])
+                _intel_dedup.append(_merged)
+
+            _intel_dedup.sort(key=lambda x: -x["source_count"])
+
             st.session_state["intel_results"] = _intel_dedup
             if not _intel_dedup:
                 st.warning("No events found — try more countries, a longer date range, or check API keys.")
@@ -2319,15 +2573,29 @@ if _page == "🛡️ Lead Intelligence":
             _urgency_icon = {"high": "🔴", "medium": "🟡", "low": "🟢"}.get(
                 st.session_state.get(f"{_ir_key}_urgency", "low"), "⚪")
 
+            _ir_src_count  = _ir.get("source_count", 1)
+            _ir_all_srcs   = _ir.get("all_sources", [_ir.get("source", "")])
+            _ir_combined   = _ir.get("combined_description", "")
+
             with st.container(border=True):
                 _ch1, _ch2 = st.columns([5, 2])
                 with _ch1:
                     st.markdown(f"### {_urgency_icon} {_ir['company']}")
+                    # Source-count confidence badge
+                    if _ir_src_count > 1:
+                        _src_badge_col = "#1565c0" if _ir_src_count >= 3 else "#2e7d32"
+                        st.markdown(
+                            f"<span style='background:{_src_badge_col};color:#fff;"
+                            f"padding:2px 10px;border-radius:10px;font-size:0.8rem;'>"
+                            f"✔ {_ir_src_count} sources</span>  "
+                            + "  ·  ".join(_ir_all_srcs),
+                            unsafe_allow_html=True,
+                        )
                     _tags = "  ·  ".join(filter(None, [
-                        _ir.get("country",""),
-                        _ir.get("event_type","").replace("_"," ").title(),
-                        _ir.get("date","")[:10],
-                        f"via {_ir.get('source','')}",
+                        _ir.get("country", ""),
+                        _ir.get("event_type", "").replace("_", " ").title(),
+                        _ir.get("date", "")[:10],
+                        (f"via {_ir.get('source','')}" if _ir_src_count == 1 else ""),
                     ]))
                     st.caption(_tags)
                     if _ir.get("description"):
@@ -2355,7 +2623,11 @@ if _page == "🛡️ Lead Intelligence":
                                 try:
                                     _r2 = _intel_ai_rate(
                                         _ir["company"], _ir["country"],
-                                        _ir["event_type"], _ir["description"])
+                                        _ir["event_type"], _ir["description"],
+                                        source_count=_ir_src_count,
+                                        all_sources=_ir_all_srcs,
+                                        combined_description=_ir_combined,
+                                    )
                                     st.session_state[f"{_ir_key}_rated"] = _r2
                                     st.rerun()
                                 except Exception as _ae:
