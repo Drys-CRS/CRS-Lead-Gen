@@ -1285,16 +1285,35 @@ def run_partner_analysis(log) -> int:
     except Exception as e:
         log(f"  Partner analysis error: {e}")
         return 0
-    rows = [{
-        "company": str(p.get("company", ""))[:200],
-        "country": str(p.get("country", ""))[:100],
-        "crs_score": p.get("crs_score") or p.get("urgency_score"),
-        "why": str(p.get("why_aligned", ""))[:500],
-        "outreach_angle": str(p.get("outreach_angle", ""))[:500],
-        "urgency": str(p.get("urgency", ""))[:20],
-        "partnership_type": str(p.get("partner_classification")
-                                 or p.get("partnership_type", ""))[:100],
-    } for p in partners if isinstance(p, dict) and p.get("company")]
+
+    def _js(v):
+        """Serialise list/dict to JSON string; pass strings through."""
+        if v is None:
+            return None
+        if isinstance(v, (list, dict)):
+            return json.dumps(v)
+        return str(v)
+
+    rows = []
+    for p in partners:
+        if not isinstance(p, dict) or not p.get("company"):
+            continue
+        rows.append({
+            "company":              str(p.get("company", ""))[:200],
+            "country":              str(p.get("country", ""))[:100],
+            "crs_score":            p.get("tenders_won"),          # count of wins as proxy score
+            "why":                  str(p.get("why_aligned", ""))[:1000],
+            "outreach_angle":       str(p.get("outreach_angle", ""))[:1000],
+            "urgency":              str(p.get("urgency", ""))[:20],
+            "partnership_type":     str(p.get("partner_classification", ""))[:100],
+            "tenders_won":          p.get("tenders_won"),
+            "proposed_solutions":   _js(p.get("proposed_solutions", [])),
+            "key_tenders":          _js(p.get("key_tenders", [])),
+            "tenders_won_summary":  str(p.get("tenders_won_summary", ""))[:2000],
+            "issuing_departments":  _js(p.get("issuing_departments", [])),
+            "estimated_deal_size":  str(p.get("estimated_deal_size", ""))[:50],
+        })
+
     if rows:
         try:
             supabase.table("partner_recommendation_history").insert(rows).execute()

@@ -50,4 +50,4 @@ jobs:
           SCORE_TIME_BUDGET:  '3000'   # hard wall-clock cap (s) on the scoring phase
           DO_PARTNER:         'true'   # also refresh partner recommendations
           RUN_TRIGGER:        'github_action'
-        run: python scripts/daily_ingest.py
+        run: python app/Daily_ingest.py
