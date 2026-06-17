@@ -568,33 +568,88 @@ def _dork_search(query: str, num: int = 10, start: int = 0) -> list:
     return profiles
 
 
+# ── Apollo MCP client ─────────────────────────────────────────────────────────
+try:
+    from mcp import ClientSession as _MCPSession
+    from mcp.client.streamable_http import streamablehttp_client as _mcp_http_client
+    _MCP_AVAILABLE = True
+except ImportError:
+    _MCPSession = None          # type: ignore[assignment,misc]
+    _mcp_http_client = None     # type: ignore[assignment]
+    _MCP_AVAILABLE = False
+
+import asyncio as _asyncio
+import concurrent.futures as _cf
+
+
+@st.cache_data(ttl=3000)
+def _apollo_mcp_token() -> str:
+    """Exchange Apollo API key for an MCP OAuth access token (client_credentials).
+    Returns "" if key is absent or the token endpoint rejects it."""
+    key = st.secrets.get("APOLLO_API_KEY", "") or os.getenv("APOLLO_API_KEY", "")
+    # Allow a pre-issued token to be stored directly (e.g. after an OAuth PKCE flow).
+    direct = st.secrets.get("APOLLO_MCP_TOKEN", "") or os.getenv("APOLLO_MCP_TOKEN", "")
+    if direct:
+        return direct
+    if not key:
+        return ""
+    try:
+        body = _urlparse.urlencode({
+            "grant_type":    "client_credentials",
+            "client_id":     key,
+            "client_secret": key,
+        }).encode()
+        req = _urlreq.Request(
+            "https://mcp.apollo.io/api/v1/oauth/token",
+            data=body,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+        )
+        with _urlreq.urlopen(req, timeout=15) as r:
+            return json.loads(r.read()).get("access_token", "")
+    except Exception:
+        return ""
+
+
+def _apollo_mcp_call(tool_name: str, arguments: dict) -> dict:
+    """Call an Apollo MCP tool over Streamable HTTP.  Returns the parsed JSON
+    result dict, or {} on error.  Requires the mcp package and a valid token."""
+    if not _MCP_AVAILABLE:
+        return {}
+    token = _apollo_mcp_token()
+    if not token:
+        return {}
+
+    async def _inner() -> dict:
+        async with _mcp_http_client(
+            "https://mcp.apollo.io/mcp",
+            headers={"Authorization": f"Bearer {token}"},
+        ) as (read, write, _):
+            async with _MCPSession(read, write) as session:
+                await session.initialize()
+                result = await session.call_tool(tool_name, arguments)
+                for item in result.content:
+                    if hasattr(item, "text"):
+                        try:
+                            return json.loads(item.text)
+                        except Exception:
+                            pass
+        return {}
+
+    with _cf.ThreadPoolExecutor(max_workers=1) as ex:
+        return ex.submit(_asyncio.run, _inner()).result(timeout=30)
+
+
 def _apollo_match(name: str, linkedin_url: str,
                   company: str = "", email: str = "") -> dict:
-    """People Enrichment — costs 1 Apollo export credit per matched person."""
-    key = st.secrets.get("APOLLO_API_KEY", "") or os.getenv("APOLLO_API_KEY", "")
-    if not key:
-        return {}
-    payload: dict = {"api_key": key, "reveal_personal_emails": True}
-    if name:         payload["name"]              = name
-    if linkedin_url: payload["linkedin_url"]      = linkedin_url
-    if company:      payload["organization_name"] = company
-    if email:        payload["email"]             = email
-    req = _urlreq.Request(
-        "https://api.apollo.io/api/v1/people/match",
-        data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json", "X-Api-Key": key},
-        method="POST",
-    )
-    try:
-        with _urlreq.urlopen(req, timeout=20) as r:
-            return json.loads(r.read()).get("person") or {}
-    except _urlreq.HTTPError as e:
-        body = ""
-        try:
-            body = e.read().decode("utf-8", errors="ignore")[:300]
-        except Exception:
-            pass
-        raise RuntimeError(f"Apollo {e.code}: {body or e.reason}") from e
+    """People Enrichment via Apollo MCP — 1 credit per matched person."""
+    args: dict = {"reveal_personal_emails": True}
+    if name:         args["name"]              = name
+    if linkedin_url: args["linkedin_url"]      = linkedin_url
+    if company:      args["organization_name"] = company
+    if email:        args["email"]             = email
+    result = _apollo_mcp_call("apollo_people_match", args)
+    return result.get("person") or {}
 
 
 def _hunter_find(first: str, last: str, domain: str) -> dict:
@@ -619,33 +674,17 @@ def _lusha_lookup(linkedin_url: str) -> dict:
         return json.loads(r.read()) or {}
 
 
-# ── Contact lookup helpers (Apollo search + Lusha prospecting) ────────────────
+# ── Contact lookup helpers (Apollo MCP + Lusha prospecting) ──────────────────
 
 def _apollo_search_people(name: str = "", company: str = "",
                            num: int = 5, titles: list = None) -> list:
-    """POST to Apollo mixed_people/search. Returns list of raw people dicts."""
-    key = st.secrets.get("APOLLO_API_KEY", "") or os.getenv("APOLLO_API_KEY", "")
-    if not key:
-        return []
-    payload: dict = {"per_page": num, "page": 1}
-    if name:
-        payload["q_keywords"] = name
-    if company:
-        payload["organization_names"] = [company]   # must be an array
-    if titles:
-        payload["person_titles"] = titles
-    req = _urlreq.Request(
-        "https://api.apollo.io/api/v1/mixed_people/search",
-        data=json.dumps(payload).encode(),
-        headers={
-            "Content-Type":  "application/json",
-            "Cache-Control": "no-cache",
-            "X-Api-Key":     key,
-        },
-        method="POST",
-    )
-    with _urlreq.urlopen(req, timeout=20) as r:
-        return json.loads(r.read()).get("people") or []
+    """Search Apollo via MCP. Returns list of raw people dicts."""
+    args: dict = {"per_page": num, "page": 1}
+    if name:    args["q_keywords"]         = name
+    if company: args["organization_names"] = [company]
+    if titles:  args["person_titles"]      = titles
+    result = _apollo_mcp_call("apollo_mixed_people_api_search", args)
+    return result.get("people") or []
 
 
 def _lusha_search_contacts(first_name: str = "", last_name: str = "",
