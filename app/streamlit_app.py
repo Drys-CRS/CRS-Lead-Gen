@@ -479,6 +479,28 @@ def _badge(urgency: str) -> str:
 # DORK / ENRICHMENT HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _parse_li_result(raw_title: str, snippet: str = "") -> dict:
+    """Extract name, job_title, company from a LinkedIn search-result title."""
+    t = re.sub(r"\s*\|\s*LinkedIn.*$", "", raw_title, flags=re.IGNORECASE).strip()
+    t = re.sub(r"\s*[-–—]\s*LinkedIn.*$", "", t, flags=re.IGNORECASE).strip()
+    parts = re.split(r"\s+[-–—]\s+", t, maxsplit=1)
+    name = parts[0].strip() if parts else t
+    job_title = company = ""
+    if len(parts) == 2:
+        role = parts[1].strip()
+        m = re.match(r"^(.+?)\s+at\s+(.+)$", role, re.IGNORECASE)
+        if m:
+            job_title = m.group(1).strip()
+            company   = m.group(2).strip()
+        else:
+            job_title = role
+    if not company and snippet:
+        m2 = re.search(r"(?:at|@)\s+([A-Z][^·|,\n]{2,50}?)(?:\s*[·|,]|\s*$)", snippet)
+        if m2:
+            company = m2.group(1).strip()
+    return {"name": name, "job_title": job_title, "company": company}
+
+
 def _dork_search(query: str, num: int = 10) -> list:
     g_key = st.secrets.get("GOOGLE_API_KEY", "") or os.getenv("GOOGLE_API_KEY", "")
     g_cse = st.secrets.get("GOOGLE_CSE_ID", "") or os.getenv("GOOGLE_CSE_ID", "")
@@ -503,12 +525,19 @@ def _dork_search(query: str, num: int = 10) -> list:
         u = item.get("link", "")
         if "linkedin.com/in/" not in u.lower():
             continue
-        t = item.get("title", "")
-        name = re.sub(r"\s*[|–—-].*$", "", t).strip()
-        if not name:
-            m = re.search(r"linkedin\.com/in/([^/?&#]+)", u)
-            name = m.group(1).replace("-", " ").title() if m else "Unknown"
-        profiles.append({"name": name, "url": u, "snippet": item.get("snippet", "")})
+        t       = item.get("title", "")
+        snippet = item.get("snippet", "")
+        parsed  = _parse_li_result(t, snippet)
+        if not parsed["name"]:
+            slug_m = re.search(r"linkedin\.com/in/([^/?&#]+)", u)
+            parsed["name"] = slug_m.group(1).replace("-", " ").title() if slug_m else "Unknown"
+        profiles.append({
+            "name":      parsed["name"],
+            "job_title": parsed["job_title"],
+            "company":   parsed["company"],
+            "url":       u,
+            "snippet":   snippet,
+        })
     return profiles
 
 
@@ -1358,12 +1387,29 @@ with tab_dork:
                 try:
                     _found = _dork_search(_d_query, int(_d_num))
                     st.session_state["dork_results"] = _found
-                    st.session_state.pop("dork_crm",    None)
                     st.session_state.pop("dork_enrich", None)
                     if not _found:
                         st.warning("No LinkedIn profiles in results — try broadening the query.")
                 except Exception as _de:
                     st.error(f"Search error: {_de}")
+                    _found = []
+            # Auto CRM check for every found profile
+            _found = st.session_state.get("dork_results", [])
+            if _found and _MONDAY_OK and monday_active:
+                _auto_crm: dict = {}
+                _crm_bar = st.progress(0, text="Checking CRM…")
+                for _ci, _pf in enumerate(_found):
+                    try:
+                        _auto_crm[_pf["url"]] = lookup_monday_crm(
+                            {"name": _pf["name"], "linkedin": _pf["url"]})
+                    except Exception:
+                        _auto_crm[_pf["url"]] = {"on_crm": False}
+                    _crm_bar.progress((_ci + 1) / len(_found),
+                                      text=f"CRM check {_ci + 1}/{len(_found)}…")
+                _crm_bar.empty()
+                st.session_state["dork_crm"] = _auto_crm
+            elif _found:
+                st.session_state["dork_crm"] = {}
 
     # ── Results ───────────────────────────────────────────────────────────────
     _d_profiles = st.session_state.get("dork_results", [])
@@ -1384,26 +1430,16 @@ with tab_dork:
                 _ph1, _ph2 = st.columns([5, 2])
                 with _ph1:
                     st.markdown(f"### 👤 {_prof['name']}")
+                    _role_parts = [x for x in [_prof.get("job_title", ""),
+                                               _prof.get("company", "")] if x]
+                    if _role_parts:
+                        st.caption("💼 " + "  ·  ".join(_role_parts))
                     st.markdown(f"[{_prof['url']}]({_prof['url']})")
                     if _prof.get("snippet"):
                         st.caption(_prof["snippet"][:250])
                 with _ph2:
-                    # CRM check button / badge
                     if _crm_res is None:
-                        if _MONDAY_OK and monday_active:
-                            if st.button("🔍 Check CRM", key=f"dcrm_{_pi}",
-                                         use_container_width=True):
-                                with st.spinner("Checking Monday CRM…"):
-                                    try:
-                                        _cres = lookup_monday_crm(
-                                            {"name": _prof["name"], "linkedin": _prof["url"]})
-                                        st.session_state.setdefault("dork_crm", {})[_pkey] = _cres
-                                    except Exception as _ce:
-                                        st.session_state.setdefault("dork_crm", {})[_pkey] = {
-                                            "on_crm": False, "error": str(_ce)}
-                                st.rerun()
-                        else:
-                            st.caption("⚪ Monday not configured")
+                        st.caption("⚪ CRM not checked")
                     elif _crm_res.get("on_crm"):
                         st.success("✅ On CRM")
                     else:
