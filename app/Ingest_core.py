@@ -928,7 +928,7 @@ def _call_nvidia(prompt, max_tokens=2000):
 
 
 def _call_deepseek(prompt, max_tokens=2000):
-    for model in ["deepseek-v4-flash", "deepseek-v4-pro"]:
+    for model in ["deepseek-chat", "deepseek-reasoner"]:
         try:
             resp = deepseek_ai.chat.completions.create(
                 model=model, messages=[{"role": "user", "content": prompt}],

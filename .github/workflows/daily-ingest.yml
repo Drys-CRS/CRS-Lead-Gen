@@ -27,6 +27,7 @@ jobs:
 
       - name: Install dependencies
         run: |
+          set -eo pipefail
           python -m pip install --upgrade pip
           pip install -r requirements-ingest.txt
 
@@ -50,4 +51,30 @@ jobs:
           SCORE_TIME_BUDGET:  '3000'   # hard wall-clock cap (s) on the scoring phase
           DO_PARTNER:         'true'   # also refresh partner recommendations
           RUN_TRIGGER:        'github_action'
-        run: python app/Daily_ingest.py
+        run: |
+          set -eo pipefail
+          python -u app/Daily_ingest.py
+
+      - name: Dump pipeline error log (always)
+        if: always()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          python - <<'PYEOF'
+          import os, sys
+          try:
+              from supabase import create_client
+              sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+              row = sb.table("pipeline_runs").select("run_at,status,tenders_scraped,tenders_scored,error_log") \
+                      .order("run_at", desc=True).limit(1).execute().data
+              if row:
+                  r = row[0]
+                  print(f"Last run: {r['run_at']}  status={r['status']}  scraped={r['tenders_scraped']}  scored={r['tenders_scored']}")
+                  if r.get("error_log"):
+                      print("ERROR LOG:", r["error_log"])
+              else:
+                  print("No pipeline_runs record found.")
+          except Exception as e:
+              print(f"Could not fetch pipeline log: {e}", file=sys.stderr)
+          PYEOF
