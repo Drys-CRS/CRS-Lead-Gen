@@ -1339,8 +1339,16 @@ def run_partner_analysis(log) -> int:
 # ═══════════════════════════════════════════════════════════════════════════
 # ORCHESTRATION
 # ═══════════════════════════════════════════════════════════════════════════
-def run_scrape(log, years_back: int = 3) -> dict:
-    """Full Africa scrape, preserving AI annotations across the open-delete."""
+def run_scrape(log, years_back: int = 3,
+               countries_filter: list | None = None,
+               include_non_ocds: bool = True) -> dict:
+    """Full Africa scrape, preserving AI annotations across the open-delete.
+
+    countries_filter: if provided, only scrape those country names.
+    include_non_ocds: if False, skip the World Bank / UNDP pass.
+    Passing neither argument reproduces the original full-scrape behaviour.
+    """
+    _cf = set(countries_filter) if countries_filter else None
     before_open = _count_rows("sa_tenders", status="Open")
     before_awarded = _count_rows("awarded_tenders")
     log(f"📦 Start state — {before_open:,} open, {before_awarded:,} awarded in Supabase.")
@@ -1350,18 +1358,21 @@ def run_scrape(log, years_back: int = 3) -> dict:
         log(f"💾 Saved AI scores/flags for {len(snap)} tender(s) to re-apply after scraping.")
 
     # South Africa — live API, OCDS fallback
-    try:
-        scrape_south_africa(log)
-    except Exception as e:
-        log(f"  ⚠️ SA live API failed ({e}) — falling back to OCDS registry…")
+    if _cf is None or "South Africa" in _cf:
         try:
-            scrape_ocds_country("South Africa", log, years_back)
-        except Exception as e2:
-            log(f"  ❌ SA OCDS fallback also failed: {e2}")
+            scrape_south_africa(log)
+        except Exception as e:
+            log(f"  ⚠️ SA live API failed ({e}) — falling back to OCDS registry…")
+            try:
+                scrape_ocds_country("South Africa", log, years_back)
+            except Exception as e2:
+                log(f"  ❌ SA OCDS fallback also failed: {e2}")
 
     # Other OCDS countries
     for country in OCDS_REGISTRY:
         if country == "South Africa":
+            continue
+        if _cf is not None and country not in _cf:
             continue
         try:
             scrape_ocds_country(country, log, years_back)
@@ -1369,11 +1380,12 @@ def run_scrape(log, years_back: int = 3) -> dict:
             log(f"  ❌ {country} crashed: {e}")
 
     # Non-OCDS via World Bank + UNDP
-    try:
-        log("🌍 Scraping non-OCDS countries via World Bank & UNDP…")
-        scrape_non_ocds_countries(log)
-    except Exception as e:
-        log(f"  ❌ Non-OCDS scraper crashed: {e}")
+    if include_non_ocds:
+        try:
+            log("🌍 Scraping non-OCDS countries via World Bank & UNDP…")
+            scrape_non_ocds_countries(log)
+        except Exception as e:
+            log(f"  ❌ Non-OCDS scraper crashed: {e}")
 
     _restore_open_annotations(snap, log)
 
@@ -1389,6 +1401,7 @@ def run_scrape(log, years_back: int = 3) -> dict:
 
 def run_all(years_back: int = 3, max_score: int = 300, do_partner: bool = True,
             score_time_budget_s: int = 3000, trigger: str = "github_action",
+            countries_filter: list | None = None, include_non_ocds: bool = True,
             log=_log_default) -> dict:
     """End-to-end nightly run: scrape → score → (optional) partner analysis.
     Logs a pipeline_runs record so the dashboard's Tab 6 history shows it."""
@@ -1406,7 +1419,9 @@ def run_all(years_back: int = 3, max_score: int = 300, do_partner: bool = True,
 
     try:
         log("─ 1. Scrape ─")
-        scrape_res = run_scrape(log, years_back)
+        scrape_res = run_scrape(log, years_back,
+                                countries_filter=countries_filter,
+                                include_non_ocds=include_non_ocds)
         counters["tenders_scraped"] = scrape_res.get("open", 0)
 
         log("─ 2. AI scoring ─")

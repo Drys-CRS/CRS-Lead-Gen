@@ -714,20 +714,41 @@ def _cascade_find_contact(name: str, linkedin_url: str,
 # ─────────────────────────────────────────────────────────────────────────────
 _PULL_STATE: dict = {"status": "idle", "logs": [], "result": None}
 
-def _pull_worker(env_overrides: dict) -> None:
+# Countries available for on-demand scraping (mirrors ingest_core.OCDS_REGISTRY keys)
+_PULL_OCDS_COUNTRIES = [
+    "South Africa", "Kenya", "Nigeria", "Ghana", "Tanzania", "Uganda",
+    "Zambia", "Rwanda", "Liberia",
+    "Nigeria (Abia)", "Nigeria (Anambra)", "Nigeria (Cross River)",
+    "Nigeria (Ebonyi)", "Nigeria (Edo)", "Nigeria (Ekiti)", "Nigeria (Enugu)",
+    "Nigeria (Gombe)", "Nigeria (Osun)", "Nigeria (Oyo)", "Nigeria (Plateau)",
+]
+_PULL_NON_OCDS_KEY = "Non-OCDS (World Bank / UNDP)"
+_PULL_ALL_COUNTRIES = _PULL_OCDS_COUNTRIES + [_PULL_NON_OCDS_KEY]
+
+def _pull_worker(env_overrides: dict, countries_sel: list | None = None) -> None:
     _PULL_STATE.update({"status": "running", "logs": [], "result": None})
     for k, v in env_overrides.items():
         if not os.environ.get(k):
             os.environ[k] = v
     def _log(m: str) -> None:
         _PULL_STATE["logs"].append(str(m)[:200])
+
+    # Separate OCDS countries from the Non-OCDS toggle
+    _ocds_filter: list | None = None
+    _non_ocds = True
+    if countries_sel is not None:
+        _non_ocds    = _PULL_NON_OCDS_KEY in countries_sel
+        _ocds_filter = [c for c in countries_sel if c != _PULL_NON_OCDS_KEY] or None
+
     try:
         import ingest_core as _ic  # type: ignore[import-not-found]
         _ic.init_supabase()
         _ic.init_ai(log=lambda _: None)
         result = _ic.run_all(
             years_back=3, max_score=300, do_partner=True,
-            score_time_budget_s=3000, trigger="manual_app", log=_log,
+            score_time_budget_s=3000, trigger="manual_app",
+            countries_filter=_ocds_filter, include_non_ocds=_non_ocds,
+            log=_log,
         )
         _PULL_STATE.update({"status": "done", "result": result})
     except Exception as _e:
@@ -754,8 +775,20 @@ with st.sidebar:
     st.caption("v2 · scrape on-demand or via nightly schedule")
     st.divider()
 
-    # ── Navigation ────────────────────────────────────────────────────────────
-    _page = st.radio("Navigate", _NAV_PAGES, label_visibility="collapsed")
+    # ── Navigation (menu-style buttons) ──────────────────────────────────────
+    if "_active_page" not in st.session_state:
+        st.session_state["_active_page"] = _NAV_PAGES[0]
+    for _nav_p in _NAV_PAGES:
+        _is_active = st.session_state["_active_page"] == _nav_p
+        if st.button(
+            _nav_p,
+            key=f"nav_{_nav_p}",
+            use_container_width=True,
+            type="primary" if _is_active else "secondary",
+        ):
+            st.session_state["_active_page"] = _nav_p
+            st.rerun()
+    _page = st.session_state["_active_page"]
     st.divider()
 
     # ── Pipeline status ───────────────────────────────────────────────────────
@@ -800,9 +833,27 @@ with st.sidebar:
 
     _ps = _PULL_STATE["status"]
     _pull_blocked = (_ps == "running") or _gh_running
-    if st.button("📥 Pull all tenders", use_container_width=True,
-                 disabled=_pull_blocked,
-                 help="Scrapes all open & awarded tenders across English-speaking Africa in the background"):
+
+    # ── Country selector ──────────────────────────────────────────────────────
+    with st.expander("🌍 Countries to pull", expanded=False):
+        if st.checkbox("Select all countries", key="pull_ctry_all",
+                       value=not bool(st.session_state.get("pull_countries"))):
+            st.session_state["pull_countries"] = _PULL_ALL_COUNTRIES[:]
+        _pull_countries = st.multiselect(
+            "Countries",
+            _PULL_ALL_COUNTRIES,
+            key="pull_countries",
+            label_visibility="collapsed",
+        )
+
+    _pull_label = (
+        f"📥 Pull ({len(_pull_countries)} countries)"
+        if _pull_countries and len(_pull_countries) < len(_PULL_ALL_COUNTRIES)
+        else "📥 Pull all tenders"
+    )
+    if st.button(_pull_label, use_container_width=True,
+                 disabled=_pull_blocked, type="primary",
+                 help="Scrapes open & awarded tenders for selected countries in the background"):
         if _ps != "running":
             _env_ov: dict = {}
             for _k in ("SUPABASE_URL", "SUPABASE_KEY", "GROQ_API_KEY", "CEREBRAS_API_KEY",
@@ -812,7 +863,10 @@ with st.sidebar:
                     _v = st.secrets.get(_k, "")
                     if _v:
                         _env_ov[_k] = _v
-            threading.Thread(target=_pull_worker, args=(_env_ov,), daemon=True).start()
+            _sel = _pull_countries if _pull_countries else None
+            threading.Thread(
+                target=_pull_worker, args=(_env_ov, _sel), daemon=True
+            ).start()
             st.rerun()
 
     if _ps == "running":
