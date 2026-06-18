@@ -369,6 +369,9 @@ _CO_COL_LINKEDIN      = "dup__of_website_url"  # type: link   ("Linkedin URL")
 _CO_COL_ORG_SIZE      = "numbers"              # type: numbers ("Organisational Count")
 _CO_COL_LOCATION      = "location"             # type: location ("Location")
 
+# ── Company link column — same ID on both Leads and Contacts boards ───────────
+_CONTACT_COMPANY_COL  = "link_to___accounts9"  # board_relation → Companies board
+
 # ── CRS solution → product status column on the Companies board ──────────────
 # Each of these status columns carries a "Warm Lead" label (used below). Setting
 # the column flags the company as a warm lead for that specific CRS solution.
@@ -518,6 +521,42 @@ def _add_monday_update(item_id: str, board_id: int, text: str):
     _gql(q, {"iid": item_id, "body": text})
 
 
+def _link_company_to_contact(item_id: str, board_id: int, company_name: str) -> str | None:
+    """Look up company on the Companies board and set the board_relation column.
+    Returns the company item_id if linked, None if company not found. Silent on error."""
+    if not company_name:
+        return None
+    try:
+        co_id = _find_company_by_name(company_name)
+        if co_id:
+            _update_item(board_id, item_id, {
+                _CONTACT_COMPANY_COL: {"item_ids": [int(co_id)]}
+            })
+        return co_id
+    except Exception:
+        return None
+
+
+def _build_outreach_note(contact: dict) -> str:
+    """Generate a CRS outreach opener from contact fields.
+    Uses the explicit opener if provided; otherwise derives one from role + company + solution."""
+    opener = (contact.get("opener") or "").strip()
+    if opener:
+        return opener
+    title   = (contact.get("title") or "").strip()
+    company = (contact.get("company") or "").strip()
+    source  = (contact.get("provider_chain") or contact.get("source_context") or "").strip()
+    parts = []
+    if title and company:
+        parts.append(f"As {title} at {company}, this contact is well-positioned for a CRS conversation.")
+    elif company:
+        parts.append(f"Decision maker at {company}.")
+    if source:
+        parts.append(f"Identified via: {source}.")
+    parts.append("Recommend leading with a relevant CRS solution briefing or compliance angle.")
+    return " ".join(parts)
+
+
 def push_partner_to_companies(partner: dict) -> dict:
     """
     Push a partner recommendation to the 2.1 - Companies board.
@@ -627,22 +666,24 @@ def push_verified_lead(contact: dict) -> dict:
     """Push a verified contact (from the Lead Verification cascade) to the
     Leads board. Creates the item by name and writes all verified details as
     the first update note — no per-column mapping needed. Dedupes by name."""
-    name = str(contact.get("name") or "").strip()
+    name    = str(contact.get("name") or "").strip()
     if not name:
         raise ValueError("contact must have a name")
+    company = str(contact.get("company") or "").strip()
     nl = "\n"
+    outreach = _build_outreach_note(contact)
     note = (
         f"**CRS Verified Lead** | {_sched_dt_str()}{nl}"
         f"Title: {contact.get('title','')}{nl}"
-        f"Company: {contact.get('company','')}{nl}"
+        f"Company: {company}{nl}"
         f"Email: {contact.get('email','')}{nl}"
         f"Phone: {contact.get('phone','')}{nl}"
         f"LinkedIn: {contact.get('linkedin','')}{nl}"
         f"Country: {contact.get('country','')}{nl}"
         f"Authority: {contact.get('authority','')}{nl}"
         f"Accuracy: {contact.get('accuracy_score','')}/100{nl}"
-        f"Source: {contact.get('provider_chain','')}{nl}"
-        f"Outreach opener: {contact.get('opener','')}"
+        f"Source: {contact.get('provider_chain','')}{nl}{nl}"
+        f"**Outreach note:** {outreach}"
     )
     try:
         existing = find_item_by_column(LEADS_BOARD_ID, "name", name)
@@ -650,6 +691,7 @@ def push_verified_lead(contact: dict) -> dict:
         existing = None
     if existing:
         _add_monday_update(existing, LEADS_BOARD_ID, note)
+        _link_company_to_contact(existing, LEADS_BOARD_ID, company)
         return {"item_id": existing, "action": "updated", "name": name}
 
     q = """
@@ -659,6 +701,7 @@ def push_verified_lead(contact: dict) -> dict:
     data = _gql(q, {"bid": str(LEADS_BOARD_ID), "name": name})
     new_id = data["data"]["create_item"]["id"]
     _add_monday_update(new_id, LEADS_BOARD_ID, note)
+    _link_company_to_contact(new_id, LEADS_BOARD_ID, company)
     return {"item_id": new_id, "action": "created", "name": name}
 
 
@@ -698,6 +741,7 @@ def _get_item_column_texts(item_id: str, col_ids: list) -> dict:
 
 def _lead_update_body(contact: dict) -> str:
     nl = "\n"
+    outreach = _build_outreach_note(contact)
     return (
         f"**CRS Lead Gen — verified contact** | {_sched_dt_str()}{nl}"
         f"Title: {contact.get('title','')}{nl}"
@@ -707,8 +751,8 @@ def _lead_update_body(contact: dict) -> str:
         f"LinkedIn: {contact.get('linkedin','')}{nl}"
         f"Authority: {contact.get('authority','')}{nl}"
         f"Accuracy: {contact.get('accuracy_score','')}/100{nl}"
-        f"Source: {contact.get('provider_chain','')}{nl}"
-        f"Outreach opener: {contact.get('opener','')}"
+        f"Source: {contact.get('provider_chain','')}{nl}{nl}"
+        f"**Outreach note:** {outreach}"
     )
 
 
@@ -726,7 +770,8 @@ def sync_lead_to_monday(contact: dict) -> dict:
     opener   = (contact.get("opener") or "").strip()
     title    = (contact.get("title") or "").strip()
     phone    = (contact.get("phone") or "").strip()
-    industry = (contact.get("industry") or contact.get("company") or "").strip()
+    company  = (contact.get("company") or "").strip()
+    industry = (contact.get("industry") or company).strip()
     score    = contact.get("accuracy_score")
     authority = (contact.get("authority") or "").strip()
     auth_label = _LEAD_AUTHORITY_MAP.get(authority.lower())
@@ -771,6 +816,7 @@ def sync_lead_to_monday(contact: dict) -> dict:
         if cv:
             _update_item(LEADS_BOARD_ID, item_id, cv)
         _add_monday_update(item_id, LEADS_BOARD_ID, _lead_update_body(contact))
+        _link_company_to_contact(item_id, LEADS_BOARD_ID, company)
         return {"action": "updated", "item_id": item_id, "name": name,
                 "fields_set": [k for k in cv if k != _LEAD_COL_NOTES], "notes_appended": True}
 
@@ -778,6 +824,7 @@ def sync_lead_to_monday(contact: dict) -> dict:
     cv[_LEAD_COL_NOTES] = note_line
     new_id = _create_item(LEADS_BOARD_ID, _LEAD_NEW_GROUP, name, cv)
     _add_monday_update(new_id, LEADS_BOARD_ID, _lead_update_body(contact))
+    _link_company_to_contact(new_id, LEADS_BOARD_ID, company)
     return {"action": "created", "item_id": new_id, "name": name,
             "fields_set": list(cv.keys()), "notes_appended": True}
 
@@ -929,17 +976,20 @@ def push_to_contacts_board(contact: dict) -> dict:
         cv["priority"] = {"label": auth_label}
 
     nl = "\n"
-    provider = contact.get("provider_chain") or "Apollo"
-    ctx      = contact.get("source_context", "")
+    provider  = contact.get("provider_chain") or "Apollo"
+    ctx       = contact.get("source_context", "")
+    company   = str(contact.get("company", "")).strip()
+    outreach  = _build_outreach_note(contact)
     _body = (
         f"**CRS Contact Lookup** | {_sched_dt_str()}{nl}"
-        f"Company: {contact.get('company', '')}{nl}"
+        f"Company: {company}{nl}"
         f"Email: {email}{nl}"
         f"Phone: {phone}"
         + (f"{nl}Company Phone: {contact['company_phone']}" if contact.get("company_phone") else "")
         + (f"{nl}Twitter: {contact['twitter']}"              if contact.get("twitter")        else "")
         + f"{nl}Source: {provider}"
         + (f"{nl}Context: {ctx}" if ctx else "")
+        + f"{nl}{nl}**Outreach note:** {outreach}"
     )
 
     note_line = _contact_note_line(contact)
@@ -954,11 +1004,13 @@ def push_to_contacts_board(contact: dict) -> dict:
         )[:2000]
         _update_item(CONTACTS_BOARD_ID, item_id, fill_cv)
         _add_monday_update(item_id, CONTACTS_BOARD_ID, _body)
+        _link_company_to_contact(item_id, CONTACTS_BOARD_ID, company)
         return {"action": "updated", "item_id": item_id, "name": name}
 
     cv[_CONTACTS_NOTES_COL] = note_line[:2000]
     new_id = _create_item(CONTACTS_BOARD_ID, CONTACTS_ACTIVE_GRP, name, cv)
     _add_monday_update(new_id, CONTACTS_BOARD_ID, _body)
+    _link_company_to_contact(new_id, CONTACTS_BOARD_ID, company)
     return {"action": "created", "item_id": new_id, "name": name}
 
 
