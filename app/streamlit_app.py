@@ -940,56 +940,121 @@ _TECH_OPP: dict[str, dict] = {
 }
 
 
-def _score_org_for_crs(industry: str, country: str,
-                        employees: int | None, tech: list[str]) -> tuple[int, list[str], list[str]]:
-    """Returns (score 0-100, matched_tech_names, opportunity_angles)."""
-    score = 0
+def _score_org_for_crs(
+    industry: str, country: str, employees: int | None, tech: list[str],
+    keywords: list[str] | None = None, description: str = "",
+) -> tuple[int, list[str], list[str], str]:
+    """Returns (score 0-100, matched_tech_names, opportunity_angles, rationale).
+
+    Scoring bands:
+      Sector fit  : 0 / 14 (medium) / 28 (strong)
+      Geography   : 0 / 6 (non-Africa) / 18 (Africa)
+      Size        : 0 / 8 (SMB <50) / 14 (50-500) / 10 (501-5k) / 6 (>5k)
+      Tech stack  : 0-30 (additive from _TECH_OPP)
+    Max theoretical = 28 + 18 + 14 + 30 = 90 (capped at 100)
+    """
+    score   = 0
     matched: list[str] = []
     angles:  list[str] = []
+    reason: list[str] = []
 
-    ind = (industry or "").lower()
-    ctr = (country  or "").lower()
-    emp = employees or 0
+    ind  = (industry or "").lower()
+    ctr  = (country  or "").lower()
+    emp  = employees or 0
+    kws  = " ".join((k or "").lower() for k in (keywords or []))
+    desc = (description or "").lower()
+    # Combined text used for sector matching — richer than industry alone
+    combined = f"{ind} {kws} {desc}"
 
-    # Sector fit (mirrors _crs_fit_score)
-    if any(sk in ind for sk in _CRS_STRONG_SECTORS):
+    # ── Sector fit ─────────────────────────────────────────────────────────
+    _STRONG_EXT = _CRS_STRONG_SECTORS | {
+        # Apollo-style industry labels that are strong CRS fits
+        "computer & network", "network security", "cybersecurity",
+        "cyber security", "information security", "security software",
+        "it security", "managed security", "computer security",
+        "government administration", "government relations",
+        "financial services", "capital markets", "investment management",
+        "insurance", "banking", "hospital & health", "health care",
+        "oil & energy", "oil & gas", "electric power", "utilities",
+    }
+    _MEDIUM_EXT = _CRS_MEDIUM_SECTORS | {
+        "software", "internet", "computer", "it service", "ict",
+        "saas", "cloud computing", "managed service", "consulting",
+        "professional service", "information technology",
+        "wireless", "mobile", "semiconductor", "e-learning",
+        "e-commerce", "outsourcing",
+    }
+
+    if any(sk in combined for sk in _STRONG_EXT):
         score += 28
-    elif any(sk in ind for sk in _CRS_MEDIUM_SECTORS):
+        _hit = next((sk for sk in _STRONG_EXT if sk in combined), "")
+        reason.append(f"Strong-fit sector ({industry or _hit})")
+    elif any(sk in combined for sk in _MEDIUM_EXT):
         score += 14
+        reason.append(f"Moderate-fit sector ({industry or 'technology'})")
+    else:
+        reason.append("Sector not a primary CRS target")
 
-    # Geography
-    african = {"south africa", "nigeria", "kenya", "ghana", "tanzania",
-               "uganda", "zimbabwe", "zambia", "botswana", "namibia",
-               "rwanda", "ethiopia", "mozambique", "senegal"}
-    if ctr in african:
+    # ── Geography ──────────────────────────────────────────────────────────
+    _AFRICAN = {
+        "south africa", "nigeria", "kenya", "ghana", "tanzania",
+        "uganda", "zimbabwe", "zambia", "botswana", "namibia",
+        "rwanda", "ethiopia", "mozambique", "senegal", "ivory coast",
+        "egypt", "mauritius", "madagascar", "cameroon", "sierra leone",
+        "the gambia", "liberia", "malawi", "lesotho", "eswatini",
+        "angola", "democratic republic of the congo", "cote d'ivoire",
+        "gabon", "niger", "mali", "burkina faso", "benin", "togo",
+    }
+    if ctr in _AFRICAN:
         score += 18
+        reason.append(f"African HQ — {country}")
+    elif "africa" in ctr or "african" in ctr:
+        # Catches "South African", "East Africa", etc.
+        score += 18
+        reason.append("African region")
     elif ctr:
         score += 6
+        reason.append(f"Non-African HQ ({country})")
+    else:
+        reason.append("Location unknown")
 
-    # Company size — CRS sweet spot 50–5 000 employees
+    # ── Company size (CRS sweet spot 50–5 000 employees) ──────────────────
     if 50 <= emp <= 500:
-        score += 12
-    elif 501 <= emp <= 5000:
+        score += 14
+        reason.append(f"{emp:,} employees — ideal SMB/mid-market range")
+    elif 501 <= emp <= 5_000:
         score += 10
-    elif emp > 5000:
+        reason.append(f"{emp:,} employees — enterprise account")
+    elif emp > 5_000:
         score += 6
+        reason.append(f"{emp:,} employees — large enterprise")
+    elif 10 <= emp < 50:
+        score += 8
+        reason.append(f"{emp:,} employees — small business")
+    else:
+        reason.append("Employee count unknown")
 
-    # Tech-stack signals
+    # ── Tech-stack signals ─────────────────────────────────────────────────
     tech_lower = [t.lower() for t in tech]
-    added_pts = 0
+    added_pts  = 0
     seen_sols: set[str] = set()
     for kw, opp in _TECH_OPP.items():
         if any(kw in t for t in tech_lower):
             matched.append(kw.title())
             if opp["sol"] not in seen_sols:
-                angles.append(f"**{opp['sol']}**: {opp['why']}")
+                angles.append(f"{opp['sol']}: {opp['why']}")
                 seen_sols.add(opp["sol"])
             pts = opp["pts"]
             if added_pts + pts <= 30:
                 score += pts
                 added_pts += pts
+    if matched:
+        reason.append(f"Tech signals: {', '.join(matched[:4])}")
+    else:
+        reason.append("No tech-stack data available")
 
-    return min(score, 100), matched, angles
+    rationale = "  ·  ".join(reason)
+    return min(score, 100), matched, angles, rationale
 
 
 def _norm_apollo(p: dict) -> dict:
@@ -2751,6 +2816,20 @@ if _page == "🔥 Intent Leads":
             st.caption(f"Showing **{len(_il_results)}** companies · {_il_total:,} total matching")
             st.divider()
 
+            # Regulatory context per country (used in outreach notes)
+            _REG_CTX = {
+                "south africa": "POPIA enforcement active",
+                "nigeria":      "NDPA 2023 in force",
+                "kenya":        "Data Protection Act 2019 enforced",
+                "ghana":        "Data Protection Act 2012",
+                "egypt":        "Personal Data Protection Law No. 151/2020",
+                "mauritius":    "Data Protection Act 2017",
+                "zimbabwe":     "Data Protection Act 2021",
+                "tanzania":     "Personal Data Protection Act 2022",
+                "botswana":     "Data Protection Act 2018",
+                "rwanda":       "Data Protection and Privacy Law 2021",
+            }
+
             for _ili, _ilorg in enumerate(_il_results):
                 _il_name     = _ilorg.get("name", "Unknown")
                 _il_domain   = _ilorg.get("domain", "")
@@ -2759,19 +2838,80 @@ if _page == "🔥 Intent Leads":
                 _il_city     = _ilorg.get("city", "")
                 _il_country  = _ilorg.get("country", "")
                 _il_loc_str  = ", ".join(x for x in [_il_city, _il_country] if x)
-                _il_kws      = _ilorg.get("keywords", [])[:6]
+                _il_kws      = _ilorg.get("keywords", [])[:8]
                 _il_tech     = _ilorg.get("tech", [])
+                _il_desc     = _ilorg.get("description", "")
                 _il_org_id   = _ilorg.get("id", "")
 
-                # CRS fit score using tech stack
-                _il_score, _il_matched, _il_angles = _score_org_for_crs(
-                    _il_industry, _il_country, _il_emp_cnt, _il_tech
+                _il_score, _il_matched, _il_angles, _il_rationale = _score_org_for_crs(
+                    _il_industry, _il_country, _il_emp_cnt, _il_tech,
+                    keywords=_il_kws, description=_il_desc,
                 )
                 _il_badge = (
                     "🟢 Excellent" if _il_score >= 60 else
                     "🟡 Good"      if _il_score >= 40 else
                     "🔵 Fair"      if _il_score >= 20 else "⚪ Low"
                 )
+
+                # ── Build outreach note ───────────────────────────────────
+                _il_reg    = _REG_CTX.get((_il_country or "").lower(), "")
+                _il_topics = st.session_state.get("il_topics", _CRS_INTENT_TOPICS[:6])
+                # Map topics → recommended products
+                _TOPIC_PROD: dict[str, str] = {
+                    "Certified Information Systems Security Professional (CISSP)": "CompTIA / IBM training",
+                    "Active Cyber Defense": "VECTRA AI + Todyl MXDR",
+                    "Cyber & Intelligence": "Flare + VECTRA AI",
+                    "Career Training Program": "CompTIA / IBM / Red Hat training",
+                    "Chief Information Security Officer (CISO)": "VECTRA AI + Panorays + Flare",
+                    "Cyber Essentials (CE)": "SMBsecure + GoldPhish",
+                    "Cybersecurity": "VECTRA AI + Todyl + vRx",
+                    "Network Security": "VECTRA AI NDR + Todyl SASE",
+                    "Information Security": "Flare + Panorays + BeachheadSecure",
+                    "Endpoint Security": "BeachheadSecure + VECTRA AI",
+                    "Cloud Security": "Aikido + Strobes ASM",
+                    "Vulnerability Management": "vRx + Strobes CTEM",
+                    "Penetration Testing": "Strobes PTaaS + CRS VAPT",
+                    "Security Operations": "VECTRA AI + Todyl MXDR",
+                    "Threat Intelligence": "Flare dark web monitoring",
+                    "Data Loss Prevention": "BeachheadSecure + Standss SendGuard",
+                    "Security Awareness Training": "GoldPhish phishing simulation",
+                    "Compliance Management": "Panorays + Telivy + SMBsecure",
+                    "Identity and Access Management": "VECTRA ITDR",
+                    "Zero Trust Security": "Todyl SASE + VECTRA ITDR",
+                    "Managed Security Services": "Todyl MXDR + VECTRA AI",
+                    "Incident Response": "VECTRA AI + Todyl MXDR",
+                    "GRC": "Panorays + Telivy",
+                    "POPIA": "SMBsecure + Telivy + Panorays",
+                    "IBM Training": "IBM / Red Hat training",
+                    "CompTIA": "CompTIA A+ / Security+ / CySA+ training",
+                    "Red Hat": "Red Hat training",
+                    "SUSE Linux": "SUSE Linux training",
+                }
+                _top_prods = list(dict.fromkeys(
+                    _TOPIC_PROD.get(t, "") for t in _il_topics
+                    if _TOPIC_PROD.get(t, "")
+                ))[:3]
+                # Best angle from tech stack if available, else from topics
+                _lead_prod = _il_angles[0].split(":")[0] if _il_angles else (
+                    _top_prods[0] if _top_prods else "VECTRA AI"
+                )
+                # Construct outreach note
+                _out_lines = [
+                    f"**{_il_name}** is actively researching "
+                    f"{'|'.join(_il_topics[:3]) if _il_topics else 'cybersecurity'} "
+                    f"— indicating a buying-cycle trigger.",
+                ]
+                if _il_industry:
+                    _out_lines.append(f"As a **{_il_industry}** organisation"
+                                      + (f" in {_il_country}" if _il_country else "")
+                                      + (f" ({_il_reg})" if _il_reg else "") + ".")
+                if _top_prods:
+                    _out_lines.append(f"**Lead with:** {' · '.join(_top_prods[:2])}")
+                if _il_angles:
+                    _out_lines.append(f"**Tech angle:** {_il_angles[0]}")
+                if _il_reg:
+                    _out_lines.append(f"**Reg hook:** Use {_il_reg} to open the compliance conversation.")
+                _il_outreach = "\n\n".join(_out_lines)
 
                 with st.container(border=True):
                     _ilh1, _ilh2, _ilh3 = st.columns([4, 2, 1])
@@ -2786,21 +2926,32 @@ if _page == "🔥 Intent Leads":
                             ("  ·  👥 " + f"{_il_emp_cnt:,}" if _il_emp_cnt else "")
                         )
                         if _il_kws:
-                            st.caption("🏷️ " + "  ·  ".join(_il_kws))
+                            st.caption("🏷️ " + "  ·  ".join(_il_kws[:5]))
                     with _ilh2:
                         if _il_matched:
                             st.caption("🔧 **Tech signals:**")
                             for _ilm in _il_matched[:3]:
-                                _opp = _TECH_OPP.get(_ilm, {})
-                                st.caption(f"• {_ilm} → {_opp.get('sol','')}")
-                        elif _il_industry:
-                            st.caption(f"📋 {_il_industry}")
+                                _opp_key = _ilm.lower()
+                                _opp = _TECH_OPP.get(_opp_key, {})
+                                st.caption(f"• {_ilm} → {_opp.get('sol', '')}")
+                        else:
+                            st.caption("📋 " + (_il_industry or "No tech data"))
                     with _ilh3:
                         st.metric("CRS Fit", f"{_il_score}/100")
                         st.caption(_il_badge)
 
+                    # Score rationale
+                    st.caption(f"📊 **Score rationale:** {_il_rationale}")
+
                     if _il_angles:
-                        st.caption("💡 " + " · ".join(_il_angles[:2]))
+                        for _ang in _il_angles[:2]:
+                            st.caption(f"💡 {_ang}")
+
+                    # Outreach notes
+                    with st.expander("📝 Outreach notes", expanded=False):
+                        st.markdown(_il_outreach)
+                        _copy_block(_il_outreach, label="📋 Copy outreach note",
+                                    key=f"il_copy_{_ili}", flat=True)
 
                     # ── Find contacts expander ────────────────────────────────
                     with st.expander("👥 Find contacts at this company", expanded=False):
@@ -4769,15 +4920,18 @@ if _page == "🎯 End-User Targets":
                             _enorm = _norm_org(_eo)
                             _enorm["_searched_ind"] = _eu_ind
                             _enorm["_searched_ctr"] = _eu_ctr
-                            _escore, _etech_matched, _eangles = _score_org_for_crs(
+                            _escore, _etech_matched, _eangles, _erationale = _score_org_for_crs(
                                 _enorm["industry"] or _eu_ind,
                                 _enorm["country"]  or _eu_ctr,
                                 _enorm["employees"],
                                 _enorm["tech"],
+                                keywords=_enorm.get("keywords", []),
+                                description=_enorm.get("description", ""),
                             )
                             _enorm["crs_score"]    = _escore
                             _enorm["tech_matched"] = _etech_matched
                             _enorm["opp_angles"]   = _eangles
+                            _enorm["rationale"]    = _erationale
                             _eu_raw.append(_enorm)
                     except Exception as _eue:
                         st.warning(f"Apollo ({_eu_ind}/{_eu_ctr}): {str(_eue)[:100]}")
@@ -4835,6 +4989,11 @@ if _page == "🎯 End-User Targets":
                     st.metric("CRS Interest", f"{_escore}%")
                     if _ec.get("phone"):
                         st.markdown(f"📞 {_ec['phone']}")
+
+                # Score rationale
+                _erat = _ec.get("rationale", "")
+                if _erat:
+                    st.caption(f"📊 {_erat}")
 
                 # Tech stack badges
                 if _etech:
