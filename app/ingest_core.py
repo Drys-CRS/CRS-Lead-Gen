@@ -1733,8 +1733,33 @@ def run_all(years_back: int = 1, max_score: int = 100, do_partner: bool = True,
     Checkpointing: completed countries are written to pipeline_runs.error_log
     as {"done": [...]} so a re-run triggered after a timeout can skip them.
     """
+    import signal as _signal
+
     t0 = time.time()
     run_id = None
+    status = "failed"
+    err_log = None
+    counters = {"tenders_scraped": 0, "tenders_scored": 0, "partners_found": 0}
+
+    def _mark_terminated(signum, frame):
+        """Flush the pipeline_runs record before the runner kills us."""
+        _dur = int(time.time() - t0)
+        if run_id:
+            try:
+                supabase.table("pipeline_runs").update({
+                    "status": "timed_out",
+                    "tenders_scraped": counters.get("tenders_scraped", 0),
+                    "tenders_scored": counters.get("tenders_scored", 0),
+                    "partners_found": counters.get("partners_found", 0),
+                    "duration_secs": _dur,
+                    "error_log": "Killed by runner (SIGTERM) — job timeout or cancel",
+                }).eq("id", run_id).execute()
+            except Exception:
+                pass
+        raise SystemExit(1)
+
+    _signal.signal(_signal.SIGTERM, _mark_terminated)
+
     try:
         rec = supabase.table("pipeline_runs").insert(
             {"trigger": trigger, "status": "running"}).execute()
@@ -1750,7 +1775,6 @@ def run_all(years_back: int = 1, max_score: int = 100, do_partner: bool = True,
         _completed.add(country)
         _save_checkpoint(run_id, _completed)
 
-    counters = {"tenders_scraped": 0, "tenders_scored": 0, "partners_found": 0}
     log("════════ CRS daily ingest ════════")
     log(f"Config — years_back={years_back} max_score={max_score} "
         f"do_partner={do_partner} score_budget={score_time_budget_s}s "
@@ -1792,7 +1816,7 @@ def run_all(years_back: int = 1, max_score: int = 100, do_partner: bool = True,
     if run_id:
         try:
             supabase.table("pipeline_runs").update({
-                "status": status if status != "running" else "complete",
+                "status": status,
                 "tenders_scraped": counters["tenders_scraped"],
                 "tenders_scored": counters["tenders_scored"],
                 "partners_found": counters["partners_found"],

@@ -15,9 +15,8 @@ on:
       skip_state_publishers:
         description: 'Skip sub-national publishers (Nigeria states etc.)'
         default: 'true'
-  # schedule disabled — pipeline now runs via Modal (modal_pipeline.py)
-  # schedule:
-  #   - cron: '0 1 * * *'
+  schedule:
+    - cron: '0 1 * * *'        # 01:00 UTC = 03:00 SAST, after free-tier daily reset
 
 # A new manual trigger cancels a stuck/slow scheduled run immediately.
 concurrency:
@@ -77,26 +76,48 @@ jobs:
           set -eo pipefail
           python -u app/Daily_ingest.py
 
-      - name: Dump pipeline error log (always)
+      - name: Cleanup + dump pipeline log (always)
         if: always()
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          GHA_JOB_STATUS: ${{ job.status }}
         run: |
           python - <<'PYEOF'
-          import os, sys
+          import os, sys, datetime as dt
           try:
               from supabase import create_client
               sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
-              row = sb.table("pipeline_runs").select("run_at,status,tenders_scraped,tenders_scored,error_log") \
-                      .order("run_at", desc=True).limit(1).execute().data
-              if row:
-                  r = row[0]
-                  print(f"Last run: {r['run_at']}  status={r['status']}  scraped={r['tenders_scraped']}  scored={r['tenders_scored']}")
+
+              # ── Force-close any record still stuck at 'running' from this run ──
+              # Catches SIGKILL (OOM / runner eviction) that the Python handler can't catch.
+              gha_status = os.environ.get("GHA_JOB_STATUS", "success")
+              cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=2)).isoformat()
+              stuck = (sb.table("pipeline_runs")
+                         .select("id")
+                         .eq("status", "running")
+                         .gte("run_at", cutoff)
+                         .execute().data)
+              for row in stuck:
+                  final = "timed_out" if gha_status in ("cancelled", "failure") else "failed"
+                  sb.table("pipeline_runs").update({
+                      "status": final,
+                      "error_log": f"Force-closed by GHA cleanup step (job.status={gha_status})",
+                  }).eq("id", row["id"]).execute()
+                  print(f"Force-closed stuck run {row['id']} → {final}")
+
+              # ── Print last run summary ──
+              rows = (sb.table("pipeline_runs")
+                        .select("run_at,status,tenders_scraped,tenders_scored,error_log")
+                        .order("run_at", desc=True).limit(1).execute().data)
+              if rows:
+                  r = rows[0]
+                  print(f"Last run: {r['run_at']}  status={r['status']}  "
+                        f"scraped={r['tenders_scraped']}  scored={r['tenders_scored']}")
                   if r.get("error_log"):
                       print("ERROR LOG:", r["error_log"])
               else:
                   print("No pipeline_runs record found.")
           except Exception as e:
-              print(f"Could not fetch pipeline log: {e}", file=sys.stderr)
+              print(f"Cleanup step error: {e}", file=sys.stderr)
           PYEOF
