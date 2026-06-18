@@ -15,8 +15,9 @@ on:
       skip_state_publishers:
         description: 'Skip sub-national publishers (Nigeria states etc.)'
         default: 'true'
-  schedule:
-    - cron: '0 1 * * *'        # 01:00 UTC = 03:00 SAST, after free-tier daily reset
+  # schedule disabled — pipeline now runs via Modal (modal_pipeline.py)
+  # schedule:
+  #   - cron: '0 1 * * *'
 
 # A new manual trigger cancels a stuck/slow scheduled run immediately.
 concurrency:
