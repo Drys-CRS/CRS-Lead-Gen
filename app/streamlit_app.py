@@ -2886,6 +2886,47 @@ if _page == "🔥 Intent Leads":
                     _il_industry, _il_country, _il_emp_cnt, _il_tech,
                     keywords=_il_kws, description=_il_desc,
                 )
+
+                # ── AI fallback scoring when rule-based score is 0 ───────────
+                _il_ai_scored = False
+                if _il_score == 0:
+                    _ai_score_key = f"il_ai_score_{_il_org_id or _ili}"
+                    if _ai_score_key not in st.session_state:
+                        _ai_prompt = (
+                            "You are a B2B sales analyst for CRS (Cyber Retaliator Solutions), a South African "
+                            "cybersecurity distributor and IBM/Red Hat/SUSE/CompTIA training partner. "
+                            "Score this prospect company 0-100 for fit as a CRS customer or reseller.\n\n"
+                            f"Company: {_il_name}\n"
+                            f"Industry: {_il_industry or 'Unknown'}\n"
+                            f"Country: {_il_country or 'Unknown'}\n"
+                            f"Employees: {_il_emp_cnt or 'Unknown'}\n"
+                            f"Keywords: {', '.join(_il_kws) if _il_kws else 'None'}\n"
+                            f"Description: {(_il_desc or '')[:300]}\n"
+                            f"Tech stack: {', '.join(_il_tech[:10]) if _il_tech else 'None'}\n\n"
+                            "Scoring guide: African HQ = +18, strong cyber/gov/finance sector = +28, "
+                            "50-500 employees = +14, relevant tech stack = up to +30. "
+                            "Reply ONLY with valid JSON: {\"score\": <int 0-100>, \"rationale\": \"<one sentence>\"}"
+                        )
+                        try:
+                            _raw = _call_ai(_ai_prompt)
+                            import re as _re2
+                            _jm = _re2.search(r'\{[^}]+\}', _raw or "")
+                            if _jm:
+                                _jd = json.loads(_jm.group())
+                                st.session_state[_ai_score_key] = (
+                                    max(0, min(100, int(_jd.get("score", 0)))),
+                                    str(_jd.get("rationale", "AI-assessed"))
+                                )
+                            else:
+                                st.session_state[_ai_score_key] = (0, "AI response unparseable")
+                        except Exception as _aie:
+                            st.session_state[_ai_score_key] = (0, f"AI scoring unavailable: {str(_aie)[:60]}")
+                    _ai_s, _ai_rat = st.session_state[_ai_score_key]
+                    if _ai_s > 0:
+                        _il_score = _ai_s
+                        _il_rationale = f"🤖 AI: {_ai_rat}"
+                        _il_ai_scored = True
+
                 _il_badge = (
                     "🟢 Excellent" if _il_score >= 60 else
                     "🟡 Good"      if _il_score >= 40 else
@@ -2986,11 +3027,10 @@ if _page == "🔥 Intent Leads":
                         for _ang in _il_angles[:2]:
                             st.caption(f"💡 {_ang}")
 
-                    # Outreach notes
-                    with st.expander("📝 Outreach notes", expanded=False):
-                        st.markdown(_il_outreach)
-                        _copy_block(_il_outreach, label="📋 Copy outreach note",
-                                    key=f"il_copy_{_ili}", flat=True)
+                    # Outreach note — inline, below company header
+                    st.markdown(_il_outreach)
+                    _copy_block(_il_outreach, label="📋 Copy outreach note",
+                                key=f"il_copy_{_ili}", flat=True)
 
                     # ── Find contacts expander ────────────────────────────────
                     with st.expander("👥 Find contacts at this company", expanded=False):
