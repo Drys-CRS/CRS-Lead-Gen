@@ -1264,9 +1264,10 @@ def _pull_worker(env_overrides: dict, countries_sel: list | None = None) -> None
         _ic.init_supabase()
         _ic.init_ai(log=lambda _: None)
         result = _ic.run_all(
-            years_back=3, max_score=300, do_partner=True,
-            score_time_budget_s=3000, trigger="manual_app",
+            years_back=1, max_score=100, do_partner=True,
+            score_time_budget_s=1800, trigger="manual_app",
             countries_filter=_ocds_filter, include_non_ocds=_non_ocds,
+            skip_state_publishers=True,
             parallel_workers=4, progress_cb=_prog_cb,
             log=_log,
         )
@@ -1465,17 +1466,55 @@ with st.sidebar:
     # ── Pipeline status ───────────────────────────────────────────────────────
     _gh_running = False
     _gh_started = ""
+    _stale_run_id = None
     try:
-        _lr = (supabase.table("pipeline_runs").select("run_at,status,tenders_scraped,trigger")
+        _lr = (supabase.table("pipeline_runs")
+               .select("id,run_at,status,tenders_scraped,trigger")
                .order("run_at", desc=True).limit(1).execute()).data
         if _lr:
             _r0 = _lr[0]
             _ts = str(_r0.get("run_at", ""))[:16]
             _st = _r0.get("status", "—")
             if _st == "running":
-                _gh_running = True
-                _gh_started = _ts
-                st.warning(f"⏳ Pipeline running since {_ts}  \n(trigger: {_r0.get('trigger','?')})\n\nDo not press Pull again — a run is already in progress.", icon="⚠️")
+                # Auto-expire runs that have been stuck for > 2 hours
+                try:
+                    _run_dt = _dt.datetime.fromisoformat(
+                        str(_r0.get("run_at", "")).replace("Z", "+00:00")
+                    )
+                    _age_h = (_dt.datetime.now(_dt.timezone.utc) - _run_dt).total_seconds() / 3600
+                except Exception:
+                    _age_h = 0
+                if _age_h > 2:
+                    _stale_run_id = _r0.get("id")
+                    # Mark it timed_out so Pull unblocks automatically
+                    try:
+                        supabase.table("pipeline_runs").update(
+                            {"status": "timed_out",
+                             "error_log": f"Auto-expired after {_age_h:.1f}h with no completion"}
+                        ).eq("id", _stale_run_id).execute()
+                    except Exception:
+                        pass
+                    st.caption(f"⚠️ Last run timed out after {_age_h:.1f}h — cleared")
+                else:
+                    _gh_running = True
+                    _gh_started = _ts
+                    st.warning(
+                        f"⏳ Pipeline running since {_ts}  \n"
+                        f"(trigger: {_r0.get('trigger','?')})\n\n"
+                        "Do not press Pull again — a run is already in progress.",
+                        icon="⚠️",
+                    )
+                    if st.button("🛑 Force cancel stuck run", key="force_cancel_run",
+                                 use_container_width=True):
+                        try:
+                            supabase.table("pipeline_runs").update(
+                                {"status": "timed_out",
+                                 "error_log": "Manually cancelled via dashboard"}
+                            ).eq("id", _r0["id"]).execute()
+                            st.success("Run marked as timed_out — Pull is now unblocked.")
+                            st.rerun()
+                        except Exception as _fce:
+                            st.error(f"Could not cancel: {_fce}")
             else:
                 _dot = "🟢" if _st in ("success", "complete") else "🔴"
                 st.caption(f"{_dot} Last run: {_ts} — {_st}")
