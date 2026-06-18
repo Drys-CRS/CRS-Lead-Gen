@@ -1482,6 +1482,28 @@ def _crs_fit_score(title: str, company_sector: str,
 # SIDEBAR — Navigation + health check + action buttons
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _queue_dm_and_go(company: str, solution: str, org_id: str = "",
+                     domain: str = "", location: str = "",
+                     industry: str = "", country: str = "",
+                     num: int = 8, source: str = "") -> None:
+    """Push a DM search request to the central queue and navigate to the Decision Makers tab."""
+    titles = _CRS_DM_TITLES.get(solution, _CRS_DM_TITLES["All CRS products"])
+    _key = f"{company.strip().lower()}|{solution}"
+    queue: list = st.session_state.setdefault("dm_queue", [])
+    for _e in queue:
+        if _e["key"] == _key:
+            _e.update({"org_id": org_id, "domain": domain, "location": location,
+                       "titles": titles, "num": num, "source": source,
+                       "industry": industry, "country": country})
+            break
+    else:
+        queue.append({"key": _key, "company": company.strip(), "solution": solution,
+                      "org_id": org_id, "domain": domain, "location": location,
+                      "industry": industry, "country": country,
+                      "titles": titles, "num": num, "source": source})
+    st.session_state["_active_page"] = "👥 Decision Makers"
+    st.rerun()
+
 _NAV_PAGES = [
     "✅ Lead Verification",
     "🔥 Intent Leads",
@@ -1491,6 +1513,7 @@ _NAV_PAGES = [
     "🛡️ Lead Intelligence",
     "💡 Weekly Leads",
     "🎯 End-User Targets",
+    "👥 Decision Makers",
 ]
 
 with st.sidebar:
@@ -2498,59 +2521,23 @@ if _page == "✅ Lead Verification":
         else:
             st.markdown(f"**{len(_lk_results)} contacts found**")
 
-            # ── Decision-maker search: CRS portfolio–focused ─────────────────
-            if _has_apo:
-                with st.expander("👥 Find decision makers (CRS portfolio)", expanded=bool(_lk_c_val)):
-                    _dm1, _dm2, _dm3 = st.columns([3, 3, 2])
-                    with _dm1:
-                        _dm_company_val = st.text_input(
-                            "Company", value=_lk_c_val,
-                            key="dm_company_input",
-                            placeholder="e.g. Absa Bank",
-                        )
-                    with _dm2:
-                        _dm_sol = st.selectbox(
-                            "Solution focus",
-                            list(_CRS_DM_TITLES.keys()),
-                            key="dm_solution",
-                            help="Filters Apollo titles to decision makers who buy this solution",
-                        )
-                    with _dm3:
-                        _dm_num = st.number_input("Max results", 5, 20, 10, step=5, key="dm_num")
-                    _dm_titles_resolved = _CRS_DM_TITLES[_dm_sol]
-                    st.caption(
-                        f"Searching for: {', '.join(_dm_titles_resolved[:6])}"
-                        + (f" + {len(_dm_titles_resolved)-6} more" if len(_dm_titles_resolved) > 6 else "")
+            # ── Decision-maker search → routes to dedicated DM tab ──────────
+            if _has_apo and _lk_c_val.strip():
+                _lv_sol_col, _lv_btn_col = st.columns([3, 2])
+                with _lv_sol_col:
+                    _lv_dm_sol = st.selectbox(
+                        "CRS solution focus",
+                        list(_CRS_DM_TITLES.keys()),
+                        key="lv_dm_sol",
                     )
-                    if st.button("🔍 Search decision makers", key="lk_dm_btn",
+                with _lv_btn_col:
+                    st.write(""); st.write("")
+                    if st.button("👥 Find decision makers →", key="lv_dm_go",
                                  type="primary", use_container_width=True):
-                        if not _dm_company_val.strip():
-                            st.warning("Enter a company name to search decision makers.")
-                        else:
-                            with st.spinner(f"Apollo: {_dm_sol} contacts at {_dm_company_val}…"):
-                                try:
-                                    _raw_dm = _apollo_search_people(
-                                        company=_dm_company_val.strip(),
-                                        num=int(_dm_num),
-                                        titles=_dm_titles_resolved,
-                                    )
-                                    _dm_normed = [_norm_apollo(p) for p in _raw_dm]
-                                    # Score each result for CRS fit so they render ranked
-                                    for _dmp in _dm_normed:
-                                        _dmp["crs_fit"] = _crs_fit_score(
-                                            _dmp.get("title", ""),
-                                            "",
-                                            "",
-                                            _dmp.get("has_email", False),
-                                            bool(_dmp.get("has_phone")),
-                                        )
-                                    _dm_normed.sort(key=lambda x: -x.get("crs_fit", 0))
-                                    st.session_state["lk_dm"] = _dm_normed
-                                    st.session_state["lk_dm_label"] = (
-                                        f"{_dm_sol} · {_dm_company_val.strip()}"
-                                    )
-                                except Exception as _dme:
-                                    st.error(f"Apollo error: {_dme}")
+                        _queue_dm_and_go(
+                            company=_lk_c_val, solution=_lv_dm_sol,
+                            num=10, source="✅ Lead Verification",
+                        )
 
         def _render_lk_cards(cards: list, key_prefix: str) -> None:
             for _ci, _cc in enumerate(cards):
@@ -2774,13 +2761,6 @@ if _page == "✅ Lead Verification":
 
         if _lk_results:
             _render_lk_cards(_lk_results, "main")
-
-    _lk_dm = st.session_state.get("lk_dm")
-    if _lk_dm:
-        st.divider()
-        _dm_label = st.session_state.get("lk_dm_label") or st.session_state.get("lk_company", "")
-        st.markdown(f"**{len(_lk_dm)} decision makers — {_dm_label}**")
-        _render_lk_cards(_lk_dm, "dm")
 
     # ══════════════════════════════════════════════════════════════════════════
     # PIPELINE VERIFICATION LOG
@@ -3176,94 +3156,21 @@ if _page == "🔥 Intent Leads":
                     _copy_block(_il_outreach, label="📋 Copy outreach note",
                                 key=f"il_copy_{_ili}", flat=True)
 
-                    # ── Find contacts expander ────────────────────────────────
-                    with st.expander("👥 Find contacts at this company", expanded=False):
-                        _il_dm_key = f"il_dm_{_ili}"
-                        _il_titles_key = f"il_titles_{_ili}"
-
+                    # ── Find decision makers → routes to DM tab ──────────────
+                    with st.expander("👥 Find decision makers", expanded=False):
                         _il_sol_pick = st.selectbox(
                             "CRS solution focus",
                             list(_CRS_DM_TITLES.keys()),
                             key=f"il_sol_{_ili}",
                         )
-                        _il_dm_titles = _CRS_DM_TITLES[_il_sol_pick]
-
-                        if st.button("Find decision makers", key=f"il_find_{_ili}",
-                                     type="primary"):
-                            with st.spinner("Searching Apollo…"):
-                                try:
-                                    _il_contacts = _apollo_search_people(
-                                        company=_il_name,
-                                        titles=_il_dm_titles[:5],
-                                        num=5,
-                                        org_id=_il_org_id,
-                                        domain=_il_domain,
-                                    )
-                                    st.session_state[_il_dm_key] = _il_contacts
-                                except Exception as _ile2:
-                                    st.error(str(_ile2))
-                                    st.session_state[_il_dm_key] = []
-
-                        _il_dms = st.session_state.get(_il_dm_key, [])
-                        if _il_dms:
-                            st.caption(f"Found **{len(_il_dms)}** contacts")
-                            for _ilci, _ilc in enumerate(_il_dms):
-                                _iln  = (st.session_state.get(f"il_nm_{_ili}_{_ilci}")
-                                         or _ilc.get("name") or f"Contact {_ilci+1}")
-                                _ilt  = _ilc.get("title", "")
-                                _ile2 = _ilc.get("email", "")
-                                _ilph = _ilc.get("phone", "")
-                                _ilem_sk = f"il_em_{_ili}_{_ilci}"
-                                _ilph_sk = f"il_ph_{_ili}_{_ilci}"
-                                _ilnm_sk = f"il_nm_{_ili}_{_ilci}"
-                                _ilem_val = (st.session_state.get(_ilem_sk) or {}).get("email", _ile2)
-                                _ilph_val = (st.session_state.get(_ilph_sk) or {}).get("phone", _ilph)
-
-                                _ilfit = _crs_fit_score(
-                                    _ilt, _il_industry, _il_country,
-                                    bool(_ilem_val), bool(_ilph_val)
-                                )
-                                _ilfit_str = ("🟢" if _ilfit >= 70 else "🟡" if _ilfit >= 40 else "🔵")
-
-                                with st.container(border=True):
-                                    _ilcc1, _ilcc2 = st.columns([3, 1])
-                                    with _ilcc1:
-                                        st.markdown(f"**{_iln}**")
-                                        if _ilt: st.caption(f"🎯 {_ilt}")
-                                        if _ilem_val: st.caption(f"📧 {_ilem_val}")
-                                        if _ilph_val: st.caption(f"📞 {_ilph_val}")
-                                    with _ilcc2:
-                                        st.caption(f"{_ilfit_str} {_ilfit}/100")
-                                        _ilapo_id = _ilc.get("id", "")
-                                        _il_enriched = bool(_ilem_val and _ilph_val)
-                                        if _ilapo_id and not _il_enriched:
-                                            _il_enr_lbl = ("💳 Enrich" if not _ilem_val
-                                                           else "💳 Find phone")
-                                            if st.button(_il_enr_lbl,
-                                                         key=f"il_enrich_{_ili}_{_ilci}",
-                                                         use_container_width=True):
-                                                with st.spinner("Enriching…"):
-                                                    _ile_r = _enrich_contact(
-                                                        apollo_id=_ilapo_id,
-                                                        name=_ilc.get("name",""),
-                                                        linkedin=_ilc.get("linkedin",""),
-                                                        company=_il_name,
-                                                    )
-                                                if _ile_r.get("name"):
-                                                    st.session_state[_ilnm_sk] = _ile_r["name"]
-                                                if _ile_r.get("email"):
-                                                    st.session_state[_ilem_sk] = {
-                                                        "email": _ile_r["email"],
-                                                        "source": "/".join(_ile_r.get("sources",["Apollo"])),
-                                                    }
-                                                if _ile_r.get("phone"):
-                                                    st.session_state[_ilph_sk] = {
-                                                        "phone": _ile_r["phone"],
-                                                        "source": "/".join(_ile_r.get("sources",["Apollo"])),
-                                                    }
-                                                if not _ile_r.get("email") and not _ile_r.get("phone"):
-                                                    st.toast("Nothing found in Apollo DB")
-                                                st.rerun()
+                        if st.button("👥 Find decision makers →", key=f"il_find_{_ili}",
+                                     type="primary", use_container_width=True):
+                            _queue_dm_and_go(
+                                company=_il_name, solution=_il_sol_pick,
+                                org_id=_il_org_id, domain=_il_domain,
+                                industry=_il_industry, country=_il_country,
+                                num=8, source="🔥 Intent Leads",
+                            )
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 5 — LINKEDIN DORK
@@ -5232,10 +5139,9 @@ if _page == "🎯 End-User Targets":
                         for _ang in _eangles:
                             st.markdown(f"- {_ang}")
 
-                # ── Contact finder ────────────────────────────────────────────
-                _eu_cont_key = f"eu_contacts_{_ei}"
+                # ── Contact finder → routes to DM tab ────────────────────────
                 with st.expander(f"👥 Find contacts at {_ename}", expanded=False):
-                    _ecs1, _ecs2, _ecs3 = st.columns([3, 3, 1])
+                    _ecs1, _ecs2 = st.columns([3, 3])
                     with _ecs1:
                         _eu_sol = st.selectbox(
                             "Solution focus",
@@ -5248,138 +5154,206 @@ if _page == "🎯 End-User Targets":
                             value=_ectr,
                             key=f"eu_loc_{_ei}",
                         )
-                    with _ecs3:
-                        st.write(""); st.write("")
-                        _eu_cn = st.number_input("Max", 5, 15, 8, step=5,
-                                                  key=f"eu_cn_{_ei}")
-                    _eu_sol_titles = _CRS_DM_TITLES[_eu_sol]
-                    st.caption(
-                        ", ".join(_eu_sol_titles[:6])
-                        + (f" +{len(_eu_sol_titles)-6} more" if len(_eu_sol_titles) > 6 else "")
-                    )
-                    if st.button("🔍 Search contacts", key=f"eu_find_{_ei}",
+                    if st.button("👥 Find decision makers →", key=f"eu_find_{_ei}",
                                  type="primary", use_container_width=True):
-                        with st.spinner(f"Apollo: {_eu_sol} at {_ename}…"):
-                            try:
-                                _eu_praw = _apollo_search_people(
-                                    company=_ename,
-                                    num=int(_eu_cn),
-                                    titles=_eu_sol_titles,
-                                    locations=[_eu_loc_override] if _eu_loc_override else None,
-                                    org_id=_ec.get("id", ""),
-                                    domain=_ec.get("domain", ""),
-                                )
-                                _eu_pnorm = []
-                                for _epp in _eu_praw:
-                                    _epn = _norm_apollo(_epp)
-                                    _epn["crs_fit"] = _crs_fit_score(
-                                        _epn.get("title",""),
-                                        _eind,
-                                        _ectr,
-                                        _epn.get("has_email", False),
-                                        bool(_epn.get("has_phone")),
-                                    )
-                                    _eu_pnorm.append(_epn)
-                                _eu_pnorm.sort(key=lambda q: -q.get("crs_fit", 0))
-                                st.session_state[_eu_cont_key] = _eu_pnorm
-                            except Exception as _euce:
-                                st.error(f"Apollo error: {_euce}")
+                        _queue_dm_and_go(
+                            company=_ename, solution=_eu_sol,
+                            org_id=_ec.get("id", ""), domain=_ec.get("domain", ""),
+                            location=_eu_loc_override,
+                            industry=_eind, country=_ectr,
+                            num=8, source="🎯 End-User Targets",
+                        )
 
-                    _eu_contacts = st.session_state.get(_eu_cont_key, [])
-                    if _eu_contacts:
-                        st.markdown(f"**{len(_eu_contacts)} contacts:**")
-                        for _eci2, _ecc in enumerate(_eu_contacts):
-                            _ec_crm_k = f"eu_crm_{_ei}_{_eci2}"
-                            _ec_em_k  = f"eu_em_{_ei}_{_eci2}"
-                            _ec_ph_k  = f"eu_ph_{_ei}_{_eci2}"
-                            _ec_crm = _auto_crm_check(
-                                _ecc.get("name",""), _ecc.get("email",""),
-                                _ecc.get("linkedin",""), _ec_crm_k,
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB — DECISION MAKERS
+# ══════════════════════════════════════════════════════════════════════════════
+if _page == "👥 Decision Makers":
+    _colored_header(
+        label="Decision Makers",
+        description="Apollo contact searches queued from Intent Leads, End-User Targets, and Lead Verification — all in one place.",
+        color_name="violet-70",
+    )
+
+    _dm_has_apo = bool(st.secrets.get("APOLLO_API_KEY","") or os.getenv("APOLLO_API_KEY",""))
+    _dm_queue: list = st.session_state.get("dm_queue", [])
+
+    if not _dm_queue:
+        st.info("No searches queued yet. Click **👥 Find decision makers →** from any company card in Intent Leads, End-User Targets, or Lead Verification to search here.")
+    else:
+        _dma, _dmb = st.columns([6, 2])
+        with _dma:
+            st.markdown(f"**{len(_dm_queue)} compan{'y' if len(_dm_queue)==1 else 'ies'} queued**")
+        with _dmb:
+            if st.button("🗑️ Clear all", key="dm_clear_all"):
+                st.session_state["dm_queue"] = []
+                for _k in list(st.session_state.keys()):
+                    if _k.startswith("dm_res_") or _k.startswith("dm_nm_") or _k.startswith("dm_em_") or _k.startswith("dm_ph_"):
+                        del st.session_state[_k]
+                st.rerun()
+
+        for _dqi, _dq in enumerate(_dm_queue):
+            _dq_company  = _dq["company"]
+            _dq_solution = _dq["solution"]
+            _dq_source   = _dq.get("source", "")
+            _dq_key      = _dq["key"]
+            _dq_res_key  = f"dm_res_{_dq_key}"
+            _dq_industry = _dq.get("industry", "")
+            _dq_country  = _dq.get("country", "")
+
+            st.divider()
+            _dqh1, _dqh2, _dqh3 = st.columns([4, 2, 1])
+            with _dqh1:
+                st.markdown(f"### 🏢 {_dq_company}")
+                _dq_meta = [x for x in [_dq_solution, _dq_country or _dq.get("location","")] if x]
+                if _dq_meta: st.caption("  ·  ".join(_dq_meta))
+                if _dq_source: st.caption(f"from {_dq_source}")
+            with _dqh2:
+                _dq_contacts = st.session_state.get(_dq_res_key)
+                if _dq_contacts is not None:
+                    _dq_refresh = st.button("🔄 Re-search", key=f"dm_refresh_{_dqi}", use_container_width=True)
+                else:
+                    _dq_refresh = False
+            with _dqh3:
+                if st.button("✕", key=f"dm_remove_{_dqi}", help="Remove this company"):
+                    st.session_state["dm_queue"] = [q for q in _dm_queue if q["key"] != _dq_key]
+                    st.session_state.pop(_dq_res_key, None)
+                    st.rerun()
+
+            # ── Run search (auto on first visit, or on refresh) ──────────────
+            _dq_contacts = st.session_state.get(_dq_res_key)
+            if (_dq_contacts is None or _dq_refresh) and _dm_has_apo:
+                with st.spinner(f"Apollo: {_dq_solution} contacts at {_dq_company}…"):
+                    try:
+                        _dq_raw = _apollo_search_people(
+                            company=_dq_company,
+                            num=_dq.get("num", 8),
+                            titles=_dq["titles"],
+                            locations=[_dq["location"]] if _dq.get("location") else None,
+                            org_id=_dq.get("org_id",""),
+                            domain=_dq.get("domain",""),
+                        )
+                        _dq_normed = []
+                        for _dqp in _dq_raw:
+                            _dqn = _norm_apollo(_dqp)
+                            _dqn["crs_fit"] = _crs_fit_score(
+                                _dqn.get("title",""), _dq_industry, _dq_country,
+                                _dqn.get("has_email", False), bool(_dqn.get("has_phone")),
                             )
-                            _ec_mon_em = (_ec_crm.get("crm_email","") if _ec_crm and _ec_crm.get("on_crm") else "")
-                            _ec_mon_ph = (_ec_crm.get("crm_phone","") if _ec_crm and _ec_crm.get("on_crm") else "")
-                            _ec_email  = st.session_state.get(_ec_em_k) or _ec_mon_em or _ecc.get("email","")
-                            _ec_phone  = st.session_state.get(_ec_ph_k) or _ec_mon_ph or _ecc.get("phone","")
-                            _ec_fit    = _ecc.get("crs_fit", 0)
-                            _ec_name   = (st.session_state.get(f"eu_nm_{_ei}_{_eci2}")
-                                          or _ecc.get("name") or f"Contact {_eci2+1}")
-                            _ec_badge  = "🟢" if _ec_fit >= 70 else "🟡" if _ec_fit >= 45 else "🔴"
-                            with st.container(border=True):
-                                _eca2, _ecb2 = st.columns([3, 2])
-                                with _eca2:
-                                    _ech = f"**{_ec_badge} {_ec_name}**"
-                                    if _ec_crm and _ec_crm.get("on_crm"):
-                                        _ech += "  `✓ CRM`"
-                                    st.markdown(_ech)
-                                    if _ecc.get("title"):
-                                        st.caption(_ecc["title"])
-                                    if _ecc.get("linkedin"):
-                                        st.markdown(f"[LinkedIn]({_ecc['linkedin']})")
-                                with _ecb2:
-                                    st.caption(f"Fit: {_ec_fit}%")
-                                    if _ec_email:
-                                        st.markdown(f"📧 `{_ec_email}`")
-                                    elif _ecc.get("has_email"):
-                                        st.caption("📧 available")
-                                    if _ec_phone:
-                                        st.markdown(f"📞 `{_ec_phone}`")
-                                    elif _ecc.get("has_phone"):
-                                        st.caption("📞 available")
-                                _ec1, _ec2, _ec3 = st.columns(3)
-                                with _ec1:
-                                    if not _ec_email and _ecc.get("id") and not st.session_state.get(_ec_em_k):
-                                        if st.button("💳 Enrich", key=f"eu_enrich_{_ei}_{_eci2}",
-                                                     use_container_width=True):
-                                            with st.spinner("Enriching…"):
-                                                try:
-                                                    _eenr = _enrich_contact(
-                                                        apollo_id=_ecc.get("id",""),
-                                                        name=_ec_name,
-                                                        linkedin=_ecc.get("linkedin",""),
-                                                        company=_ename,
-                                                    )
-                                                    if _eenr.get("name"):
-                                                        st.session_state[f"eu_nm_{_ei}_{_eci2}"] = _eenr["name"]
-                                                    st.session_state[_ec_em_k] = _eenr.get("email","")
-                                                    st.session_state[_ec_ph_k] = _eenr.get("phone","")
-                                                    st.rerun()
-                                                except Exception as _eee:
-                                                    st.error(f"Enrich failed: {_eee}")
-                                with _ec2:
-                                    if monday_active:
-                                        _ec_push_lbl = ("♻️ Update" if _ec_crm and _ec_crm.get("on_crm") else "📋 Push")
-                                        if st.button(_ec_push_lbl, key=f"eu_push_{_ei}_{_eci2}",
-                                                     use_container_width=True,
-                                                     type="secondary" if (_ec_crm and _ec_crm.get("on_crm")) else "primary"):
-                                            with st.spinner("Syncing…"):
-                                                try:
-                                                    _emr = sync_lead_to_monday({
-                                                        "name":           _ec_name,
-                                                        "title":          _ecc.get("title",""),
-                                                        "company":        _ename,
-                                                        "email":          _ec_email,
-                                                        "phone":          _ec_phone,
-                                                        "linkedin":       _ecc.get("linkedin",""),
-                                                        "accuracy_score": str(_ec_fit),
-                                                        "provider_chain": f"End-User Targets · {_eu_sol}",
-                                                    })
-                                                    st.success(f"{_emr.get('action','done').title()} · ID: {_emr.get('item_id')}")
-                                                    del st.session_state[_ec_crm_k]
-                                                except Exception as _epe:
-                                                    st.error(f"Push failed: {_epe}")
-                                with _ec3:
-                                    _copy_block(
-                                        "\n".join(l for l in [
-                                            f"NAME: {_ec_name}",
-                                            f"Title: {_ecc.get('title','')}",
-                                            f"Company: {_ename}",
-                                            f"Industry: {_eind}",
-                                            f"Email: {_ec_email}",
-                                            f"Phone: {_ec_phone}",
-                                            f"LinkedIn: {_ecc.get('linkedin','')}",
-                                            f"CRS Fit: {_ec_fit}%",
-                                            ("Tech signals: " + ", ".join(_etech)) if _etech else "",
-                                        ] if l),
-                                        key=f"eu_copy_{_ei}_{_eci2}",
-                                        flat=True,
-                                    )
+                            _dq_normed.append(_dqn)
+                        _dq_normed.sort(key=lambda x: -x.get("crs_fit", 0))
+                        st.session_state[_dq_res_key] = _dq_normed
+                        _dq_contacts = _dq_normed
+                    except Exception as _dqe:
+                        st.error(f"Apollo error: {_dqe}")
+                        st.session_state[_dq_res_key] = []
+                        _dq_contacts = []
+
+            if not _dm_has_apo:
+                st.warning("Apollo API key not configured.")
+            elif _dq_contacts is None:
+                st.caption("Searching…")
+            elif not _dq_contacts:
+                st.caption("No contacts found — try a different solution focus or re-search.")
+            else:
+                st.caption(f"**{len(_dq_contacts)} contacts found**")
+                for _dci, _dcc in enumerate(_dq_contacts):
+                    _dc_apo_id = _dcc.get("id","")
+                    _dc_nm_sk  = f"dm_nm_{_dq_key}_{_dci}"
+                    _dc_em_sk  = f"dm_em_{_dq_key}_{_dci}"
+                    _dc_ph_sk  = f"dm_ph_{_dq_key}_{_dci}"
+                    _dc_crm_sk = f"dm_crm_{_dq_key}_{_dci}"
+
+                    _dc_name = st.session_state.get(_dc_nm_sk) or _dcc.get("name") or f"Contact {_dci+1}"
+                    _dc_em   = (st.session_state.get(_dc_em_sk) or {}).get("email") or _dcc.get("email","")
+                    _dc_ph   = (st.session_state.get(_dc_ph_sk) or {}).get("phone") or _dcc.get("phone","")
+                    _dc_fit  = _dcc.get("crs_fit", 0)
+                    _dc_badge = "🟢" if _dc_fit >= 70 else "🟡" if _dc_fit >= 40 else "🔵"
+
+                    _dc_crm = _auto_crm_check(_dcc.get("name",""), _dcc.get("email",""),
+                                              _dcc.get("linkedin",""), _dc_crm_sk)
+                    _dc_mon_em = (_dc_crm.get("crm_email","") if _dc_crm and _dc_crm.get("on_crm") else "")
+                    _dc_mon_ph = (_dc_crm.get("crm_phone","") if _dc_crm and _dc_crm.get("on_crm") else "")
+                    _dc_em = _dc_em or _dc_mon_em
+                    _dc_ph = _dc_ph or _dc_mon_ph
+
+                    with st.container(border=True):
+                        _dca, _dcb = st.columns([4, 2])
+                        with _dca:
+                            _dc_hdr = f"**{_dc_badge} {_dc_name}**"
+                            if _dc_crm and _dc_crm.get("on_crm"):
+                                _dc_hdr += "  `✓ CRM`"
+                            st.markdown(_dc_hdr)
+                            if _dcc.get("title"):  st.caption(f"🎯 {_dcc['title']}")
+                            if _dcc.get("linkedin"): st.markdown(f"[LinkedIn →]({_dcc['linkedin']})")
+                            if _dc_em:  st.caption(f"📧 {_dc_em}")
+                            if _dc_ph:  st.caption(f"📞 {_dc_ph}")
+                            if not _dc_em:
+                                st.caption("📧 Available · ⚡ 1 credit" if _dcc.get("has_email") else "📧 Not flagged")
+                            if not _dc_ph:
+                                _hp = _dcc.get("has_phone","")
+                                if _hp == "yes":   st.caption("📞 Direct dial available")
+                                elif _hp == "maybe": st.caption("📞 May be available")
+                        with _dcb:
+                            st.caption(f"CRS fit: {_dc_fit}/100")
+
+                            # Enrich button
+                            if _dm_has_apo and _dc_apo_id and not (_dc_em and _dc_ph):
+                                _enr_lbl = "💳 Enrich — email + phone" if not _dc_em else "💳 Find phone"
+                                if st.button(_enr_lbl, key=f"dm_enrich_{_dq_key}_{_dci}",
+                                             use_container_width=True):
+                                    with st.spinner("Enriching…"):
+                                        _enr = _enrich_contact(
+                                            apollo_id=_dc_apo_id,
+                                            name=_dcc.get("name",""),
+                                            linkedin=_dcc.get("linkedin",""),
+                                            company=_dq_company,
+                                        )
+                                    if _enr.get("name"):
+                                        st.session_state[_dc_nm_sk] = _enr["name"]
+                                        st.session_state[_dq_res_key][_dci]["name"] = _enr["name"]
+                                    if _enr.get("email"):
+                                        st.session_state[_dc_em_sk] = {"email": _enr["email"], "source": "Apollo"}
+                                    if _enr.get("phone"):
+                                        st.session_state[_dc_ph_sk] = {"phone": _enr["phone"], "source": "Apollo"}
+                                    if not _enr.get("email") and not _enr.get("phone"):
+                                        st.toast("Nothing found in Apollo DB")
+                                    st.rerun()
+
+                            # Push to Monday
+                            if monday_active:
+                                _dc_push_lbl = "♻️ Update" if (_dc_crm and _dc_crm.get("on_crm")) else "📋 Push to Monday"
+                                if st.button(_dc_push_lbl, key=f"dm_push_{_dq_key}_{_dci}",
+                                             use_container_width=True,
+                                             type="secondary" if (_dc_crm and _dc_crm.get("on_crm")) else "primary"):
+                                    with st.spinner("Syncing to Monday…"):
+                                        try:
+                                            _pmr = sync_lead_to_monday({
+                                                "name":           _dc_name,
+                                                "title":          _dcc.get("title",""),
+                                                "company":        _dq_company,
+                                                "email":          _dc_em,
+                                                "phone":          _dc_ph,
+                                                "linkedin":       _dcc.get("linkedin",""),
+                                                "accuracy_score": str(_dc_fit),
+                                                "provider_chain": f"Decision Makers · {_dq_solution}",
+                                                "source_context": f"from {_dq_source}",
+                                            })
+                                            st.success(f"{_pmr.get('action','done').title()} · ID: {_pmr.get('item_id')}")
+                                            del st.session_state[_dc_crm_sk]
+                                        except Exception as _dpe:
+                                            st.error(f"Push failed: {_dpe}")
+
+                        _copy_block(
+                            "\n".join(l for l in [
+                                f"NAME: {_dc_name}",
+                                f"Title: {_dcc.get('title','')}",
+                                f"Company: {_dq_company}",
+                                f"Email: {_dc_em}",
+                                f"Phone: {_dc_ph}",
+                                f"LinkedIn: {_dcc.get('linkedin','')}",
+                                f"CRS Fit: {_dc_fit}%",
+                                f"Source: {_dq_source}",
+                            ] if l),
+                            key=f"dm_copy_{_dq_key}_{_dci}",
+                            flat=True,
+                        )
