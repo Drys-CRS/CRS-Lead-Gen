@@ -39,7 +39,127 @@ try:
 except ImportError:
     _MONDAY_OK = False
 
+try:
+    from streamlit_extras.colored_header import colored_header as _colored_header
+    from streamlit_extras.metric_cards import style_metric_cards as _style_metric_cards
+    _EXTRAS_OK = True
+except ImportError:
+    _EXTRAS_OK = False
+    def _colored_header(label="", description="", color_name="blue-70", **_kw):
+        st.subheader(label)
+        if description:
+            st.caption(description)
+    def _style_metric_cards(**_kw):
+        pass
+
 st.set_page_config(page_title="CRS Intelligence", page_icon="🛡️", layout="wide")
+
+# ── Global UI polish ──────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+/* ── Cards — rounded corners + lift on hover ─────────────────────────── */
+div[data-testid="stVerticalBlockBorderWrapper"] {
+    border-radius: 12px !important;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.08) !important;
+    transition: box-shadow 0.2s ease, transform 0.15s ease !important;
+}
+div[data-testid="stVerticalBlockBorderWrapper"]:hover {
+    box-shadow: 0 4px 16px rgba(0,0,0,0.14) !important;
+    transform: translateY(-1px) !important;
+}
+
+/* ── Metric containers ───────────────────────────────────────────────── */
+div[data-testid="metric-container"] {
+    border-radius: 10px !important;
+    padding: 0.75rem 1rem !important;
+    background: rgba(99, 102, 241, 0.06) !important;
+    border: 1px solid rgba(99, 102, 241, 0.15) !important;
+}
+div[data-testid="metric-container"] label {
+    font-size: 0.75rem !important;
+    letter-spacing: 0.04em !important;
+    text-transform: uppercase !important;
+}
+
+/* ── Buttons — rounder + smooth hover ───────────────────────────────── */
+div.stButton > button {
+    border-radius: 8px !important;
+    font-weight: 500 !important;
+    transition: all 0.15s ease !important;
+}
+div.stButton > button:hover {
+    transform: translateY(-1px) !important;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.18) !important;
+}
+div.stButton > button[kind="primary"] {
+    background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%) !important;
+    border: none !important;
+    color: #fff !important;
+}
+div.stButton > button[kind="primary"]:hover {
+    background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%) !important;
+}
+
+/* ── Expanders — tighter radius ─────────────────────────────────────── */
+div[data-testid="stExpander"] > details {
+    border-radius: 10px !important;
+    overflow: hidden !important;
+}
+div[data-testid="stExpander"] > details > summary {
+    border-radius: 10px !important;
+    padding: 0.6rem 0.8rem !important;
+    font-weight: 500 !important;
+}
+
+/* ── Inputs / selects ────────────────────────────────────────────────── */
+div[data-testid="stTextInput"] > div > div > input,
+div[data-testid="stTextArea"] > div > div > textarea {
+    border-radius: 8px !important;
+}
+div[data-baseweb="select"] > div {
+    border-radius: 8px !important;
+}
+
+/* ── Sidebar — slightly deeper background ────────────────────────────── */
+section[data-testid="stSidebar"] {
+    border-right: 1px solid rgba(100, 116, 139, 0.18) !important;
+}
+section[data-testid="stSidebar"] .stButton > button {
+    border-radius: 8px !important;
+    text-align: left !important;
+    justify-content: flex-start !important;
+}
+
+/* ── Dataframe ───────────────────────────────────────────────────────── */
+div[data-testid="stDataFrame"] > div {
+    border-radius: 10px !important;
+    overflow: hidden !important;
+}
+
+/* ── Tabs (st.tabs) ─────────────────────────────────────────────────── */
+div[data-testid="stTabs"] > div > div[role="tablist"] {
+    gap: 4px !important;
+}
+button[role="tab"] {
+    border-radius: 8px 8px 0 0 !important;
+    font-weight: 500 !important;
+}
+
+/* ── Caption style ───────────────────────────────────────────────────── */
+div[data-testid="stCaptionContainer"] p {
+    font-size: 0.8rem !important;
+    opacity: 0.75 !important;
+}
+
+/* ── Code blocks (copy panels) ───────────────────────────────────────── */
+div[data-testid="stCode"] {
+    border-radius: 8px !important;
+}
+div[data-testid="stCode"] pre {
+    border-radius: 8px !important;
+}
+</style>
+""", unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CRS PROFILE
@@ -1474,7 +1594,7 @@ with st.sidebar:
 # PAGE — OPPORTUNITIES
 # ══════════════════════════════════════════════════════════════════════════════
 if _page == "📢 Opportunities":
-    st.subheader("Open Opportunities")
+    _colored_header(label="Open Opportunities", description="Live tenders scored for CRS portfolio fit — filter, review rationale, push to Monday.", color_name="orange-70")
 
     _df_all = _load_tenders()
     _unscored_n = int(_df_all["ai_score"].isna().sum()) if "ai_score" in _df_all.columns else len(_df_all)
@@ -1732,8 +1852,7 @@ if _page == "📢 Opportunities":
 # PAGE 3 — PARTNERS
 # ══════════════════════════════════════════════════════════════════════════════
 if _page == "🤝 Partners":
-    st.subheader("Partner Recommendations")
-    st.caption("Companies CRS should approach as channel partners, derived from awarded tender data.")
+    _colored_header(label="Partner Recommendations", description="Companies CRS should approach as channel partners, derived from awarded tender data.", color_name="green-70")
 
     df_p = _country(_load_partner_history())
     df_aw = _load_awarded()
@@ -2056,7 +2175,7 @@ if _page == "🤝 Partners":
 # PAGE 4 — LEAD VERIFICATION
 # ══════════════════════════════════════════════════════════════════════════════
 if _page == "✅ Lead Verification":
-    st.subheader("Lead Verification")
+    _colored_header(label="Lead Verification", description="Dork, enrich, and score B2B contacts — then push verified leads to Monday CRM.", color_name="blue-70")
 
     # ══════════════════════════════════════════════════════════════════════════
     # CONTACT LOOKUP — Apollo primary, Monday as tag
@@ -2553,11 +2672,7 @@ _CRS_INTENT_TOPICS: list[str] = [
 ]
 
 if _page == "🔥 Intent Leads":
-    st.subheader("Intent Leads")
-    st.caption(
-        "Apollo companies actively researching cybersecurity topics — "
-        "filtered by buying intent signal strength and topic relevance to the CRS portfolio."
-    )
+    _colored_header(label="Intent Leads", description="Apollo companies actively researching cybersecurity topics — filtered by Bombora signal strength and CRS portfolio relevance.", color_name="red-70")
 
     _has_apo_il = bool(st.secrets.get("APOLLO_API_KEY","") or os.getenv("APOLLO_API_KEY",""))
     if not _has_apo_il:
@@ -2784,12 +2899,7 @@ def _as_list(v) -> list:
     except Exception: return []
 
 if _page == "🔍 LinkedIn Dork":
-    st.subheader("LinkedIn Lead Discovery")
-    st.caption(
-        "Dork LinkedIn profiles, cache all enrichment in Supabase, "
-        "check Monday CRM automatically, find contact info via Apollo / Hunter / Lusha, "
-        "edit fields, then push or update the Monday Leads board."
-    )
+    _colored_header(label="LinkedIn Lead Discovery", description="Dork LinkedIn profiles, cache enrichment in Supabase, auto-check Monday CRM, find contact info via Apollo / Hunter / Lusha, edit fields, then push to Monday.", color_name="blue-30")
 
     _DORK_SOLUTIONS = {
         "Cybersecurity (general)":         "cybersecurity information security",
@@ -3713,11 +3823,7 @@ _INTEL_GOOGLE_TERMS = (
 if _page == "🛡️ Lead Intelligence":
     _rc = _get_region_config()
     _region_label = _rc["label"]
-    st.subheader(f"Cyber Event Lead Intelligence — {_region_label}")
-    st.caption(
-        f"Surface {_region_label} companies hit by ransomware, breaches, or dark-web exposure. "
-        "AI-rates each as a CRS lead, then lets you find the right contacts."
-    )
+    _colored_header(label=f"Cyber Event Lead Intelligence — {_region_label}", description=f"Surface {_region_label} companies hit by ransomware, breaches, or dark-web exposure. AI-rates each as a CRS lead, then lets you find the right contacts.", color_name="violet-70")
 
     _ii1, _ii2, _ii3, _ii4 = st.columns([3, 2, 1, 1])
     with _ii1:
@@ -4306,12 +4412,7 @@ if _page == "🛡️ Lead Intelligence":
 # PAGE 6 — WEEKLY LEADS
 # ══════════════════════════════════════════════════════════════════════════════
 if _page == "💡 Weekly Leads":
-    st.subheader("Weekly Lead Recommendations")
-    st.caption(
-        "Apollo-powered proactive pipeline: search by CRS solution and African sector, "
-        "scored for CRS-portfolio fit and auto-checked against Monday CRM. "
-        "Refresh manually — results are cached for the session."
-    )
+    _colored_header(label="Weekly Lead Recommendations", description="Apollo-powered proactive pipeline: search by CRS solution and African sector, scored for CRS-portfolio fit and auto-checked against Monday CRM.", color_name="green-30")
 
     _has_apo_wl = bool(st.secrets.get("APOLLO_API_KEY","") or os.getenv("APOLLO_API_KEY",""))
     if not _has_apo_wl:
@@ -4577,12 +4678,7 @@ if _page == "💡 Weekly Leads":
 # PAGE 7 — END-USER TARGETS
 # ══════════════════════════════════════════════════════════════════════════════
 if _page == "🎯 End-User Targets":
-    st.subheader("End-User Targets")
-    st.caption(
-        "Find African companies by sector and size, score them on CRS-portfolio fit using "
-        "their tech stack, then drill into decision-maker contacts. "
-        "Apollo org search + optional tech-stack enrichment."
-    )
+    _colored_header(label="End-User Targets", description="Find African companies by sector and size, score them on CRS-portfolio fit using their tech stack, then drill into decision-maker contacts.", color_name="orange-30")
 
     _eu_has_apo = bool(st.secrets.get("APOLLO_API_KEY","") or os.getenv("APOLLO_API_KEY",""))
     if not _eu_has_apo:

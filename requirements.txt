@@ -1,4 +1,5 @@
 streamlit==1.45.1
+streamlit-extras==0.4.7
 pandas==2.3.3
 supabase==2.15.3
 requests==2.34.2
