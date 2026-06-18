@@ -1,19 +1,32 @@
 name: Daily Tender Ingestion Pipeline
 
 on:
-  workflow_dispatch: {}        # manual "Run workflow" button
+  workflow_dispatch:
+    inputs:
+      years_back:
+        description: 'Years of OCDS history to fetch (1 = current year only)'
+        default: '1'
+      max_score:
+        description: 'Max tenders to AI-score'
+        default: '100'
+      include_non_ocds:
+        description: 'Include World Bank / UNDP non-OCDS countries'
+        default: 'true'
+      skip_state_publishers:
+        description: 'Skip sub-national publishers (Nigeria states etc.)'
+        default: 'true'
   schedule:
     - cron: '0 1 * * *'        # 01:00 UTC = 03:00 SAST, after free-tier daily reset
 
-# Never let two ingests overlap (a manual run won't collide with the scheduled one)
+# A new manual trigger cancels a stuck/slow scheduled run immediately.
 concurrency:
   group: daily-ingest
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   ingest:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 60        # hard cap — down from 120; tuned params finish in ~30 min
     env:
       ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true   # allow Node.js 20 actions until Sep 2026
     steps:
@@ -47,12 +60,17 @@ jobs:
           NVIDIA_API_KEY:     ${{ secrets.NVIDIA_API_KEY }}
           DEEPSEEK_API_KEY:   ${{ secrets.DEEPSEEK_API_KEY }}
           GEMINI_API_KEY:     ${{ secrets.GEMINI_API_KEY }}
-          # ── Tunables (optional — defaults shown) ──
-          YEARS_BACK:         '3'      # OCDS history per country per run
-          MAX_SCORE:          '300'    # max tenders AI-scored per run
-          SCORE_TIME_BUDGET:  '3000'   # hard wall-clock cap (s) on the scoring phase
-          DO_PARTNER:         'true'   # also refresh partner recommendations
-          RUN_TRIGGER:        'github_action'
+          # ── Tunables — manual dispatch overrides, otherwise use these defaults ──
+          # years_back=1 → current-year data only (3x fewer downloads than 3)
+          # max_score=100 → ~10-15 min of AI scoring vs 50+ min at 300
+          # skip_state_publishers=true → skip Nigeria state-level OCDS feeds
+          YEARS_BACK:              ${{ github.event.inputs.years_back || '1' }}
+          MAX_SCORE:               ${{ github.event.inputs.max_score || '100' }}
+          SCORE_TIME_BUDGET:       '1800'   # 30-min hard cap on scoring phase
+          DO_PARTNER:              'true'
+          INCLUDE_NON_OCDS:        ${{ github.event.inputs.include_non_ocds || 'true' }}
+          SKIP_STATE_PUBLISHERS:   ${{ github.event.inputs.skip_state_publishers || 'true' }}
+          RUN_TRIGGER:             'github_action'
         run: |
           set -eo pipefail
           python -u app/Daily_ingest.py

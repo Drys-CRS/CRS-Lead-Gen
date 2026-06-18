@@ -373,17 +373,29 @@ def _clean_ocds_date(s):
         return None
 
 
-def _download_ocds_year(pub_id: int, year: int):
+def _download_ocds_year(pub_id: int, year: int, timeout: int = 40):
+    """Download one year's JSONL.gz from the OCDS registry.
+
+    Uses a short timeout (default 40 s) so a single slow/hung publisher
+    can't block the whole pipeline. Retries once on connection failure.
+    """
     url = (f"https://data.open-contracting.org/en/publication/{pub_id}"
            f"/download?name={year}.jsonl.gz")
-    try:
-        r = requests.get(url, timeout=180, headers={"User-Agent": "Mozilla/5.0"})
-        if r.status_code != 200 or len(r.content) < 100:
+    for attempt in range(2):
+        try:
+            r = requests.get(url, timeout=timeout,
+                             headers={"User-Agent": "Mozilla/5.0"})
+            if r.status_code != 200 or len(r.content) < 100:
+                return None
+            with gzip.open(io.BytesIO(r.content), "rt", encoding="utf-8") as f:
+                return f.readlines()
+        except requests.exceptions.Timeout:
+            if attempt == 0:
+                continue   # one retry
             return None
-        with gzip.open(io.BytesIO(r.content), "rt", encoding="utf-8") as f:
-            return f.readlines()
-    except Exception:
-        return None
+        except Exception:
+            return None
+    return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1340,71 +1352,102 @@ def run_partner_analysis(log) -> int:
 # ═══════════════════════════════════════════════════════════════════════════
 # ORCHESTRATION
 # ═══════════════════════════════════════════════════════════════════════════
-def run_scrape(log, years_back: int = 3,
+def run_scrape(log, years_back: int = 1,
                countries_filter: list | None = None,
                include_non_ocds: bool = True,
+               skip_state_publishers: bool = True,
                parallel_workers: int = 4,
+               already_done: set | None = None,
+               checkpoint_cb=None,
                progress_cb=None) -> dict:
     """Full Africa scrape, preserving AI annotations across the open-delete.
 
     countries_filter: if provided, only scrape those country names.
     include_non_ocds: if False, skip the World Bank / UNDP pass.
+    skip_state_publishers: if True (default), skip sub-national publishers
+        like 'Nigeria (Abia)' whose names contain parentheses. These add
+        ~10 extra downloads with low incremental value.
     parallel_workers: number of concurrent country scrapers (default 4).
-    progress_cb: optional callable(fraction: float, country: str) for UI progress.
+    already_done: set of country names completed in a prior run today —
+        these are skipped so the run can resume after a timeout.
+    checkpoint_cb: optional callable(country: str) called after each
+        country succeeds — use to persist progress.
+    progress_cb: optional callable(fraction: float, country: str) for UI.
     """
     import threading as _th
-    _cf = set(countries_filter) if countries_filter else None
+    _cf   = set(countries_filter) if countries_filter else None
+    _done_set = set(already_done or [])
 
     before_open = _count_rows("sa_tenders", status="Open")
     before_awarded = _count_rows("awarded_tenders")
     log(f"📦 Start state — {before_open:,} open, {before_awarded:,} awarded in Supabase.")
+    if _done_set:
+        log(f"⏭️  Checkpoint: skipping {len(_done_set)} already-scraped source(s): "
+            f"{', '.join(sorted(_done_set))}")
 
     snap = _snapshot_open_annotations()
     if snap:
         log(f"💾 Saved AI scores/flags for {len(snap)} tender(s) to re-apply after scraping.")
 
-    # Build ordered work list
+    # Build ordered work list, honouring all filters
     _work: list = []
     if _cf is None or "South Africa" in _cf:
-        _work.append("South Africa")
+        if "South Africa" not in _done_set:
+            _work.append("South Africa")
     for _c in OCDS_REGISTRY:
         if _c == "South Africa":
             continue
-        if _cf is None or _c in _cf:
-            _work.append(_c)
-    if include_non_ocds:
+        if skip_state_publishers and "(" in _c:
+            continue                          # skip Nigeria (Abia) etc.
+        if _cf is not None and _c not in _cf:
+            continue
+        if _c in _done_set:
+            continue
+        _work.append(_c)
+    if include_non_ocds and "__non_ocds__" not in _done_set:
         _work.append("__non_ocds__")
 
-    _total  = len(_work)
-    _done   = [0]
-    _lock   = _th.Lock()
+    _total    = len(_work)
+    _n_done   = [0]
+    _lock     = _th.Lock()
 
     def _scrape_one(item: str) -> None:
+        ok = False
         try:
             if item == "South Africa":
                 try:
                     scrape_south_africa(log)
+                    ok = True
                 except Exception as _e:
                     log(f"  ⚠️ SA live API failed ({_e}) — falling back to OCDS registry…")
                     try:
                         scrape_ocds_country("South Africa", log, years_back)
+                        ok = True
                     except Exception as _e2:
                         log(f"  ❌ SA OCDS fallback also failed: {_e2}")
             elif item == "__non_ocds__":
                 log("🌍 Scraping non-OCDS countries via World Bank & UNDP…")
                 scrape_non_ocds_countries(log)
+                ok = True
             else:
                 scrape_ocds_country(item, log, years_back)
+                ok = True
         except Exception as _e:
             log(f"  ❌ {item} crashed: {_e}")
         finally:
             with _lock:
-                _done[0] += 1
+                _n_done[0] += 1
                 if progress_cb and _total > 0:
                     _label = "Non-OCDS" if item == "__non_ocds__" else item
-                    progress_cb(_done[0] / _total, _label)
+                    progress_cb(_n_done[0] / _total, _label)
+            if ok and checkpoint_cb:
+                try:
+                    checkpoint_cb(item)
+                except Exception:
+                    pass
 
-    log(f"🚀 Scraping {_total} source(s) with {parallel_workers} parallel worker(s)…")
+    log(f"🚀 Scraping {_total} source(s) with {parallel_workers} parallel worker(s) "
+        f"(years_back={years_back}, skip_state={skip_state_publishers})…")
     with _futures.ThreadPoolExecutor(max_workers=parallel_workers) as _ex:
         list(_ex.map(_scrape_one, _work))
 
@@ -1420,13 +1463,58 @@ def run_scrape(log, years_back: int = 3,
             "new_awarded": max(after_awarded - before_awarded, 0)}
 
 
-def run_all(years_back: int = 3, max_score: int = 300, do_partner: bool = True,
-            score_time_budget_s: int = 3000, trigger: str = "github_action",
+def _checkpoint_key() -> str:
+    """Supabase key used to store today's scrape checkpoint."""
+    return f"checkpoint:{_dt.date.today().isoformat()}"
+
+
+def _load_checkpoint(log) -> set:
+    """Return set of country names already scraped today (from pipeline_runs)."""
+    try:
+        today = _dt.date.today().isoformat()
+        rows = (supabase.table("pipeline_runs")
+                .select("error_log")
+                .like("trigger", f"checkpoint%")
+                .gte("run_at", today)
+                .execute().data)
+        for row in rows:
+            raw = row.get("error_log") or ""
+            if raw.startswith("{") and "done" in raw:
+                data = json.loads(raw)
+                done = set(data.get("done", []))
+                if done:
+                    log(f"⏭️  Resuming — {len(done)} source(s) already done today.")
+                    return done
+    except Exception:
+        pass
+    return set()
+
+
+def _save_checkpoint(run_id, done: set) -> None:
+    """Persist the set of completed country names into the current pipeline_runs row."""
+    if not run_id:
+        return
+    try:
+        payload = json.dumps({"done": sorted(done)})
+        supabase.table("pipeline_runs").update(
+            {"error_log": payload}
+        ).eq("id", run_id).execute()
+    except Exception:
+        pass
+
+
+def run_all(years_back: int = 1, max_score: int = 100, do_partner: bool = True,
+            score_time_budget_s: int = 1800, trigger: str = "github_action",
             countries_filter: list | None = None, include_non_ocds: bool = True,
+            skip_state_publishers: bool = True,
             parallel_workers: int = 4, progress_cb=None,
             log=_log_default) -> dict:
     """End-to-end nightly run: scrape → score → (optional) partner analysis.
-    Logs a pipeline_runs record so the dashboard's Tab 6 history shows it."""
+    Logs a pipeline_runs record so the dashboard's Tab 6 history shows it.
+
+    Checkpointing: completed countries are written to pipeline_runs.error_log
+    as {"done": [...]} so a re-run triggered after a timeout can skip them.
+    """
     t0 = time.time()
     run_id = None
     try:
@@ -1436,16 +1524,32 @@ def run_all(years_back: int = 3, max_score: int = 300, do_partner: bool = True,
     except Exception as e:
         log(f"Could not create pipeline_runs record: {e}")
 
+    # Load checkpoint from any prior run today so we can resume
+    already_done = _load_checkpoint(log)
+    _completed: set = set(already_done)
+
+    def _on_country_done(country: str):
+        _completed.add(country)
+        _save_checkpoint(run_id, _completed)
+
     counters = {"tenders_scraped": 0, "tenders_scored": 0, "partners_found": 0}
     log("════════ CRS daily ingest ════════")
+    log(f"Config — years_back={years_back} max_score={max_score} "
+        f"do_partner={do_partner} score_budget={score_time_budget_s}s "
+        f"skip_state={skip_state_publishers} non_ocds={include_non_ocds}")
 
     try:
         log("─ 1. Scrape ─")
-        scrape_res = run_scrape(log, years_back,
-                                countries_filter=countries_filter,
-                                include_non_ocds=include_non_ocds,
-                                parallel_workers=parallel_workers,
-                                progress_cb=progress_cb)
+        scrape_res = run_scrape(
+            log, years_back,
+            countries_filter=countries_filter,
+            include_non_ocds=include_non_ocds,
+            skip_state_publishers=skip_state_publishers,
+            parallel_workers=parallel_workers,
+            already_done=already_done,
+            checkpoint_cb=_on_country_done,
+            progress_cb=progress_cb,
+        )
         counters["tenders_scraped"] = scrape_res.get("open", 0)
 
         log("─ 2. AI scoring ─")

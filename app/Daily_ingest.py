@@ -42,14 +42,13 @@ def _bool_env(name: str, default: bool) -> bool:
 def main() -> int:
     log = print  # GitHub Actions captures stdout line-by-line
 
-    years_back = _int_env("YEARS_BACK", 3)
-    max_score = _int_env("MAX_SCORE", 300)
-    score_budget = _int_env("SCORE_TIME_BUDGET", 3000)  # seconds
-    do_partner = _bool_env("DO_PARTNER", True)
-    trigger = os.environ.get("RUN_TRIGGER", "github_action")
-
-    log(f"Config — years_back={years_back} max_score={max_score} "
-        f"do_partner={do_partner} score_budget={score_budget}s trigger={trigger}")
+    years_back          = _int_env("YEARS_BACK", 1)
+    max_score           = _int_env("MAX_SCORE", 100)
+    score_budget        = _int_env("SCORE_TIME_BUDGET", 1800)
+    do_partner          = _bool_env("DO_PARTNER", True)
+    include_non_ocds    = _bool_env("INCLUDE_NON_OCDS", True)
+    skip_state_pub      = _bool_env("SKIP_STATE_PUBLISHERS", True)
+    trigger             = os.environ.get("RUN_TRIGGER", "github_action")
 
     # 1. Supabase (required)
     try:
@@ -71,6 +70,8 @@ def main() -> int:
         max_score=max_score,
         do_partner=do_partner,
         score_time_budget_s=score_budget,
+        include_non_ocds=include_non_ocds,
+        skip_state_publishers=skip_state_pub,
         trigger=trigger,
         log=log,
     )
