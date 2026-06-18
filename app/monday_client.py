@@ -692,7 +692,17 @@ def push_verified_lead(contact: dict) -> dict:
     if existing:
         _add_monday_update(existing, LEADS_BOARD_ID, note)
         _link_company_to_contact(existing, LEADS_BOARD_ID, company)
-        return {"item_id": existing, "action": "updated", "name": name}
+        return {"item_id": existing, "action": "updated", "name": name, "board": "Leads"}
+
+    # Cross-board: check Contacts board before creating on Leads
+    try:
+        _co_existing = find_item_by_column(CONTACTS_BOARD_ID, "name", name)
+    except Exception:
+        _co_existing = None
+    if _co_existing:
+        _add_monday_update(_co_existing, CONTACTS_BOARD_ID, note)
+        _link_company_to_contact(_co_existing, CONTACTS_BOARD_ID, company)
+        return {"item_id": _co_existing, "action": "updated", "name": name, "board": "Contacts"}
 
     q = """
     mutation ($bid: ID!, $name: String!) {
@@ -702,7 +712,7 @@ def push_verified_lead(contact: dict) -> dict:
     new_id = data["data"]["create_item"]["id"]
     _add_monday_update(new_id, LEADS_BOARD_ID, note)
     _link_company_to_contact(new_id, LEADS_BOARD_ID, company)
-    return {"item_id": new_id, "action": "created", "name": name}
+    return {"item_id": new_id, "action": "created", "name": name, "board": "Leads"}
 
 
 # ── Rich Leads-board sync (dedupe → append Contact Notes → fill columns) ────────
@@ -776,12 +786,22 @@ def sync_lead_to_monday(contact: dict) -> dict:
     authority = (contact.get("authority") or "").strip()
     auth_label = _LEAD_AUTHORITY_MAP.get(authority.lower())
 
-    # Dedupe: try name, then email, then LinkedIn
+    # Dedupe: try name, then email, then LinkedIn on Leads board
     item_id = find_item_by_column(LEADS_BOARD_ID, "name", name)
     if not item_id and email:
         item_id = find_item_by_column(LEADS_BOARD_ID, _LEAD_COL_EMAIL, email)
     if not item_id and linkedin:
         item_id = find_item_by_column(LEADS_BOARD_ID, _LEAD_COL_LINKEDIN, linkedin)
+
+    # Cross-board: also check Contacts board so we don't create a Leads duplicate
+    # for someone who is already curated there.
+    _contacts_cross_id: str | None = None
+    if not item_id:
+        _contacts_cross_id = find_item_by_column(CONTACTS_BOARD_ID, "name", name)
+        if not _contacts_cross_id and email:
+            _contacts_cross_id = find_item_by_column(CONTACTS_BOARD_ID, "email", email)
+        if not _contacts_cross_id and linkedin:
+            _contacts_cross_id = find_item_by_column(CONTACTS_BOARD_ID, "link", linkedin)
 
     note_line = _contact_note_line({**contact, "source_context":
                     contact.get("source_context") or (f"CRS outreach: {opener}" if opener else "")})
@@ -817,15 +837,22 @@ def sync_lead_to_monday(contact: dict) -> dict:
             _update_item(LEADS_BOARD_ID, item_id, cv)
         _add_monday_update(item_id, LEADS_BOARD_ID, _lead_update_body(contact))
         _link_company_to_contact(item_id, LEADS_BOARD_ID, company)
-        return {"action": "updated", "item_id": item_id, "name": name,
+        return {"action": "updated", "item_id": item_id, "name": name, "board": "Leads",
                 "fields_set": [k for k in cv if k != _LEAD_COL_NOTES], "notes_appended": True}
+
+    # Person found on Contacts board — update there instead of creating on Leads
+    if _contacts_cross_id:
+        _add_monday_update(_contacts_cross_id, CONTACTS_BOARD_ID, _lead_update_body(contact))
+        _link_company_to_contact(_contacts_cross_id, CONTACTS_BOARD_ID, company)
+        return {"action": "updated", "item_id": _contacts_cross_id, "name": name,
+                "board": "Contacts", "notes_appended": True}
 
     cv = _fill({})
     cv[_LEAD_COL_NOTES] = note_line
     new_id = _create_item(LEADS_BOARD_ID, _LEAD_NEW_GROUP, name, cv)
     _add_monday_update(new_id, LEADS_BOARD_ID, _lead_update_body(contact))
     _link_company_to_contact(new_id, LEADS_BOARD_ID, company)
-    return {"action": "created", "item_id": new_id, "name": name,
+    return {"action": "created", "item_id": new_id, "name": name, "board": "Leads",
             "fields_set": list(cv.keys()), "notes_appended": True}
 
 
@@ -962,6 +989,15 @@ def push_to_contacts_board(contact: dict) -> dict:
     if not item_id and linkedin:
         item_id = find_item_by_column(CONTACTS_BOARD_ID, "link", linkedin)
 
+    # Cross-board: also check Leads board to prevent creating a duplicate
+    _leads_cross_id: str | None = None
+    if not item_id:
+        _leads_cross_id = find_item_by_column(LEADS_BOARD_ID, "name", name)
+        if not _leads_cross_id and email:
+            _leads_cross_id = find_item_by_column(LEADS_BOARD_ID, _LEAD_COL_EMAIL, email)
+        if not _leads_cross_id and linkedin:
+            _leads_cross_id = find_item_by_column(LEADS_BOARD_ID, _LEAD_COL_LINKEDIN, linkedin)
+
     cv: dict = {}
     if title:
         cv["title"] = title
@@ -1005,13 +1041,19 @@ def push_to_contacts_board(contact: dict) -> dict:
         _update_item(CONTACTS_BOARD_ID, item_id, fill_cv)
         _add_monday_update(item_id, CONTACTS_BOARD_ID, _body)
         _link_company_to_contact(item_id, CONTACTS_BOARD_ID, company)
-        return {"action": "updated", "item_id": item_id, "name": name}
+        return {"action": "updated", "item_id": item_id, "name": name, "board": "Contacts"}
+
+    # Person found on Leads board — update there instead of creating on Contacts
+    if _leads_cross_id:
+        _add_monday_update(_leads_cross_id, LEADS_BOARD_ID, _body)
+        _link_company_to_contact(_leads_cross_id, LEADS_BOARD_ID, company)
+        return {"action": "updated", "item_id": _leads_cross_id, "name": name, "board": "Leads"}
 
     cv[_CONTACTS_NOTES_COL] = note_line[:2000]
     new_id = _create_item(CONTACTS_BOARD_ID, CONTACTS_ACTIVE_GRP, name, cv)
     _add_monday_update(new_id, CONTACTS_BOARD_ID, _body)
     _link_company_to_contact(new_id, CONTACTS_BOARD_ID, company)
-    return {"action": "created", "item_id": new_id, "name": name}
+    return {"action": "created", "item_id": new_id, "name": name, "board": "Contacts"}
 
 
 def _sched_dt_str() -> str:

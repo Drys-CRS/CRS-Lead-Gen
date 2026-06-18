@@ -5226,7 +5226,10 @@ if _page == "👥 Decision Makers":
 
             # ── Run search (auto on first visit, or on refresh) ──────────────
             _dq_contacts = st.session_state.get(_dq_res_key)
-            if (_dq_contacts is None or _dq_refresh) and _dm_has_apo:
+            if _dq_refresh:
+                st.session_state.pop(_dq_res_key, None)
+                _dq_contacts = None
+            if (_dq_contacts is None) and _dm_has_apo:
                 with st.spinner(f"Apollo: {_dq_solution} contacts at {_dq_company}…"):
                     try:
                         _dq_raw = _apollo_search_people(
@@ -5286,8 +5289,10 @@ if _page == "👥 Decision Makers":
                         with _dca:
                             _dc_hdr = f"**{_dc_badge} {_dc_name}**"
                             if _dc_crm and _dc_crm.get("on_crm"):
-                                _dc_hdr += "  `✓ CRM`"
+                                _dc_hdr += f"  `✓ {_dc_crm.get('crm_board', 'CRM')}`"
                             st.markdown(_dc_hdr)
+                            if _dc_crm and _dc_crm.get("on_crm") and _dc_crm.get("crm_url"):
+                                st.caption(f"[→ View on {_dc_crm.get('crm_board','CRM')} board]({_dc_crm['crm_url']})")
                             if _dcc.get("title"):  st.caption(f"🎯 {_dcc['title']}")
                             if _dcc.get("linkedin"): st.markdown(f"[LinkedIn →]({_dcc['linkedin']})")
                             if _dc_em:  st.caption(f"📧 {_dc_em}")
@@ -5343,7 +5348,8 @@ if _page == "👥 Decision Makers":
                                                 "provider_chain": f"Decision Makers · {_dq_solution}",
                                                 "source_context": f"from {_dq_source}",
                                             })
-                                            st.success(f"{_pmr.get('action','done').title()} · ID: {_pmr.get('item_id')}")
+                                            _pmr_board = _pmr.get("board", "Leads")
+                                            st.success(f"{_pmr.get('action','done').title()} on {_pmr_board} · ID: {_pmr.get('item_id')}")
                                             del st.session_state[_dc_crm_sk]
                                         except Exception as _dpe:
                                             st.error(f"Push failed: {_dpe}")
