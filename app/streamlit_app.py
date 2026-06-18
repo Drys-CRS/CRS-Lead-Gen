@@ -841,11 +841,22 @@ def _lusha_lookup(linkedin_url: str) -> dict:
 
 def _apollo_search_people(name: str = "", company: str = "",
                            num: int = 5, titles: list = None,
-                           locations: list = None) -> list:
-    """Search Apollo REST API for people. Returns list of raw people dicts."""
-    kw = " ".join(p for p in [name, company] if p)
-    payload: dict = {"per_page": num, "page": 1}
-    if kw:        payload["q_keywords"]       = kw
+                           locations: list = None,
+                           org_id: str = "", domain: str = "") -> list:
+    """Search Apollo people. Uses org ID > domain > company keyword, in that order."""
+    payload: dict = {"per_page": min(num, 25), "page": 1}
+    # Company scoping — use the most precise filter available
+    if org_id:
+        payload["organization_ids"] = [org_id]
+    elif domain:
+        _d = domain.replace("https://", "").replace("http://", "").split("/")[0].strip()
+        if _d:
+            payload["q_organization_domains_list"] = [_d]
+    elif company:
+        payload["q_keywords"] = company[:120]
+    # Name keyword (on top of company filter)
+    if name:
+        payload["q_keywords"] = (payload.get("q_keywords", "") + " " + name).strip()
     if titles:    payload["person_titles"]    = titles
     if locations: payload["person_locations"] = locations
     return _apollo_post("mixed_people/api_search", payload).get("people") or []
@@ -3052,6 +3063,8 @@ if _page == "🔥 Intent Leads":
                                         company=_il_name,
                                         titles=_il_dm_titles[:5],
                                         num=5,
+                                        org_id=_il_org_id,
+                                        domain=_il_domain,
                                     )
                                     st.session_state[_il_dm_key] = _il_contacts
                                 except Exception as _ile2:
@@ -5120,6 +5133,8 @@ if _page == "🎯 End-User Targets":
                                     num=int(_eu_cn),
                                     titles=_eu_sol_titles,
                                     locations=[_eu_loc_override] if _eu_loc_override else None,
+                                    org_id=_ec.get("id", ""),
+                                    domain=_ec.get("domain", ""),
                                 )
                                 _eu_pnorm = []
                                 for _epp in _eu_praw:
