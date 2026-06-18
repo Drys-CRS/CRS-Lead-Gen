@@ -609,8 +609,7 @@ def _apollo_post(endpoint: str, payload: dict) -> dict:
 def _apollo_match(name: str = "", linkedin_url: str = "",
                   company: str = "", email: str = "",
                   apollo_id: str = "") -> dict:
-    """People enrichment — 1 credit per matched person. reveal_phone_number omitted
-    (requires async webhook; emails are returned synchronously)."""
+    """People enrichment — 1 credit per matched person."""
     payload: dict = {"reveal_personal_emails": True}
     if apollo_id:    payload["id"]               = apollo_id
     if name:         payload["name"]              = name
@@ -618,6 +617,84 @@ def _apollo_match(name: str = "", linkedin_url: str = "",
     if company:      payload["organization_name"] = company
     if email:        payload["email"]             = email
     return _apollo_post("people/match", payload).get("person") or {}
+
+
+def _enrich_contact(apollo_id: str = "", name: str = "",
+                    linkedin: str = "", company: str = "") -> dict:
+    """Unified enrich: Apollo match (email + any phone in DB) then Lusha phone fallback.
+    Returns {name, email, phone, sources: list[str]}."""
+    result: dict = {"name": "", "email": "", "phone": "", "sources": []}
+
+    # Step 1: Apollo people/match — always attempted first (1 export credit)
+    try:
+        raw = _apollo_match(apollo_id=apollo_id, name=name,
+                            linkedin_url=linkedin, company=company)
+        n = _norm_apollo(raw)
+        revealed = n.get("name", "")
+        if revealed and "***" not in revealed:
+            result["name"] = revealed
+        if n.get("email"):
+            result["email"] = n["email"]
+            result["sources"].append("Apollo")
+        if n.get("phone"):
+            result["phone"] = n["phone"]
+            result["sources"].append("Apollo (phone)")
+    except Exception as _ae:
+        result["_apollo_err"] = str(_ae)
+
+    # Step 2: Lusha phone fallback (uses its own credit, only if LinkedIn URL known)
+    if not result["phone"] and linkedin:
+        try:
+            _lk = st.secrets.get("LUSHA_API_KEY", "") or os.getenv("LUSHA_API_KEY", "")
+            if _lk:
+                _lr = _lusha_lookup(linkedin)
+                _lph = (_lr.get("phone_numbers") or [])
+                if _lph:
+                    _lpv = (_lph[0].get("international_number")
+                            or _lph[0].get("sanitized_number")
+                            or _lph[0].get("raw_number", ""))
+                    if _lpv:
+                        result["phone"] = _lpv
+                        result["sources"].append("Lusha")
+        except Exception:
+            pass
+
+    return result
+
+
+@st.cache_data(ttl=300)
+def _apollo_credits() -> dict:
+    """Fetch Apollo credit balance from /users/api_profile. Cached 5 min."""
+    key = _apollo_key()
+    if not key:
+        return {}
+    req = _urlreq.Request(
+        "https://api.apollo.io/api/v1/users/api_profile",
+        headers={"X-Api-Key": key, "Cache-Control": "no-cache",
+                 "Content-Type": "application/json"},
+        method="GET",
+    )
+    try:
+        with _urlreq.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read())
+    except Exception:
+        return {}
+    u = data.get("user") or {}
+    # Apollo uses different field names across plan tiers — try them all
+    left  = (u.get("email_credits_left")
+             or u.get("credits_left")
+             or u.get("export_credits_remaining")
+             or max(0, (u.get("credits_limit") or 0) - (u.get("credits_used") or 0))
+             or 0)
+    used  = (u.get("email_credits_used")
+             or u.get("credits_used")
+             or u.get("export_credits_used")
+             or 0)
+    total = (u.get("email_credits_limit")
+             or u.get("credits_limit")
+             or u.get("export_credits_limit")
+             or 0)
+    return {"left": int(left), "used": int(used), "total": int(total)}
 
 
 def _hunter_find(first: str, last: str, domain: str) -> dict:
@@ -1186,6 +1263,23 @@ with st.sidebar:
             st.rerun()
     _page = st.session_state["_active_page"]
     st.divider()
+
+    # ── Apollo credit meter ───────────────────────────────────────────────────
+    if bool(st.secrets.get("APOLLO_API_KEY","") or os.getenv("APOLLO_API_KEY","")):
+        _cr = _apollo_credits()
+        if _cr:
+            _cr_left  = _cr.get("left", 0)
+            _cr_total = _cr.get("total", 0)
+            _cr_pct   = (_cr_left / _cr_total) if _cr_total else 0
+            _cr_icon  = "🟢" if _cr_pct > 0.3 else "🟡" if _cr_pct > 0.1 else "🔴"
+            st.caption(
+                f"{_cr_icon} Apollo: **{_cr_left:,}** credits left"
+                + (f" / {_cr_total:,}" if _cr_total else "")
+                + f"  ≈ **{_cr_left:,}** contacts can be enriched"
+            )
+        else:
+            st.caption("⚪ Apollo credits unavailable")
+        st.divider()
 
     # ── Pipeline status ───────────────────────────────────────────────────────
     _gh_running = False
@@ -1868,11 +1962,14 @@ if _page == "🤝 Partners":
                                                          use_container_width=True):
                                                 with st.spinner("Enriching…"):
                                                     try:
-                                                        _pe = _apollo_post("people/match", {
-                                                            "id": _pcc["id"],
-                                                            "reveal_personal_emails": True,
-                                                        }).get("person") or {}
-                                                        _pen = _norm_apollo(_pe)
+                                                        _pen = _enrich_contact(
+                                                            apollo_id=_pcc.get("id",""),
+                                                            name=_pc_name,
+                                                            linkedin=_pcc.get("linkedin",""),
+                                                            company=company,
+                                                        )
+                                                        if _pen.get("name"):
+                                                            st.session_state[f"p_nm_{card_idx}_{_pci}"] = _pen["name"]
                                                         st.session_state[_pc_em_k] = _pen.get("email","")
                                                         st.session_state[_pc_ph_k] = _pen.get("phone","")
                                                         st.rerun()
@@ -2098,8 +2195,11 @@ if _page == "✅ Lead Verification":
                 _crm_sk  = f"lk_crm_{key_prefix}_{_ci}"
                 _ph_sk   = f"lk_phone_{key_prefix}_{_ci}"
                 _em_sk   = f"lk_email_{key_prefix}_{_ci}"
+                _nm_sk   = f"lk_name_{key_prefix}_{_ci}"
                 _xref_sk = f"lk_xref_{key_prefix}_{_ci}"
-                _disp_name = _cc.get("name") or f"Contact {_ci+1}"
+                # Revealed name overrides obfuscated search result
+                _disp_name = (st.session_state.get(_nm_sk)
+                              or _cc.get("name") or f"Contact {_ci+1}")
 
                 # ── Auto CRM check (fires once, cached in session state) ──
                 _crm_r = _auto_crm_check(
@@ -2131,90 +2231,78 @@ if _page == "✅ Lead Verification":
                                 st.caption("📋 Not in CRM")
 
                     # ── Email + Phone row ─────────────────────────────────
+                    _em_val = (_cc.get("email") or _mon_email
+                               or st.session_state.get(_em_sk, {}).get("email",""))
+                    _em_src = ("Apollo" if _cc.get("email")
+                               else "Monday" if _mon_email
+                               else st.session_state.get(_em_sk, {}).get("source",""))
+                    _ph_val = (_cc.get("phone") or _mon_phone
+                               or st.session_state.get(_ph_sk, {}).get("phone",""))
+                    _ph_src = ("Apollo" if _cc.get("phone")
+                               else "Monday" if _mon_phone
+                               else st.session_state.get(_ph_sk, {}).get("source",""))
+
                     _fA, _fB = st.columns(2)
                     with _fA:
-                        # Monday free → Apollo search result → Apollo enrichment
-                        _em_val = (_cc.get("email") or _mon_email
-                                   or st.session_state.get(_em_sk, {}).get("email",""))
-                        _em_src = ("Apollo" if _cc.get("email")
-                                   else "Monday" if _mon_email
-                                   else st.session_state.get(_em_sk, {}).get("source",""))
                         if _em_val:
                             _ev = " ✓" if (_cc.get("email_status") == "verified"
                                            or _em_src == "Monday") else ""
                             st.markdown(f"📧 **{_em_val}**{_ev}")
-                            if _em_src:
-                                st.caption(f"via {_em_src}")
+                            if _em_src: st.caption(f"via {_em_src}")
                         else:
-                            if _cc.get("has_email"):
-                                st.caption("📧 Available · ⚡ 1 credit")
-                            if _has_apo and st.button("📧 Get Email",
-                                    key=f"lk_em_btn_{key_prefix}_{_ci}",
-                                    use_container_width=True):
-                                with st.spinner("Apollo enrichment…"):
-                                    try:
-                                        _em_raw = _apollo_match(
-                                            apollo_id=_apo_id,
-                                            name=_cc.get("name",""),
-                                            linkedin_url=_cc.get("linkedin",""),
-                                            company=_cc.get("company",""),
-                                        )
-                                        _em_e = (_em_raw.get("email") or
-                                                 ((_em_raw.get("personal_emails") or [""])[0]))
-                                        if _em_e:
-                                            st.session_state[_em_sk] = {"email": _em_e, "source": "Apollo"}
-                                            st.session_state["lk_results" if key_prefix == "main" else "lk_dm"][_ci]["email"] = _em_e
-                                        else:
-                                            st.toast("No email found via Apollo")
-                                    except Exception as _ee:
-                                        st.toast(f"Apollo: {str(_ee)[:80]}")
-                                st.rerun()
+                            _hp_em = _cc.get("has_email")
+                            st.caption("📧 Available · ⚡ 1 credit" if _hp_em else "📧 Not flagged")
                     with _fB:
-                        # Monday free → Apollo search result → Apollo enrichment
-                        _ph_val = (_cc.get("phone") or _mon_phone
-                                   or st.session_state.get(_ph_sk, {}).get("phone",""))
-                        _ph_src = ("Apollo" if _cc.get("phone")
-                                   else "Monday" if _mon_phone
-                                   else st.session_state.get(_ph_sk, {}).get("source",""))
                         if _ph_val:
                             st.markdown(f"📞 **{_ph_val}**")
-                            if _ph_src:
-                                st.caption(f"via {_ph_src}")
+                            if _ph_src: st.caption(f"via {_ph_src}")
                         else:
                             _hp = _cc.get("has_phone","")
                             if _hp == "yes":
-                                st.caption("📞 Direct dial · ⚡ 1 credit")
+                                st.caption("📞 Direct dial available")
                             elif _hp == "maybe":
-                                st.caption("📞 May be available · ⚡ 1 credit")
-                            if _has_apo and st.button("📞 Get Phone",
-                                    key=f"lk_ph_btn_{key_prefix}_{_ci}",
-                                    use_container_width=True):
-                                _fp: dict = {}
-                                with st.spinner("Apollo…"):
-                                    try:
-                                        _fp_r = _apollo_match(
-                                            apollo_id=_apo_id,
-                                            name=_cc.get("name",""),
-                                            linkedin_url=_cc.get("linkedin",""),
-                                            company=_cc.get("company",""),
-                                            email=_cc.get("email","") or _mon_email,
-                                        )
-                                        _fp_phs = _fp_r.get("phone_numbers") or []
-                                        if _fp_phs:
-                                            _p0 = _fp_phs[0]
-                                            _fp = {
-                                                "phone": ((_p0.get("sanitized_number") or _p0.get("raw_number"))
-                                                          if isinstance(_p0,dict) else str(_p0)),
-                                                "source": "Apollo"
-                                            }
-                                    except Exception: pass
-                                if _fp.get("phone"):
-                                    st.session_state[_ph_sk] = _fp
-                                    st.rerun()
-                                else:
-                                    st.toast("No phone found via Apollo")
+                                st.caption("📞 May be available")
+                            else:
+                                st.caption("📞 Not flagged")
                         if _cc.get("company_phone"):
                             st.markdown(f"🏢 **{_cc['company_phone']}** (company)")
+
+                    # Single combined enrich button — always shown if Apollo ID known
+                    _enrich_done = bool(_em_val and _ph_val)
+                    if _has_apo and _apo_id and not _enrich_done:
+                        _enr_lbl = (
+                            "💳 Enrich — reveal email + phone"
+                            if not _em_val
+                            else "💳 Enrich — find phone number"
+                        )
+                        if st.button(_enr_lbl, key=f"lk_enrich_{key_prefix}_{_ci}",
+                                     use_container_width=True):
+                            with st.spinner("Enriching via Apollo…"):
+                                _enr = _enrich_contact(
+                                    apollo_id=_apo_id,
+                                    name=_cc.get("name",""),
+                                    linkedin=_cc.get("linkedin",""),
+                                    company=_cc.get("company",""),
+                                )
+                            _card_list_key = "lk_results" if key_prefix == "main" else "lk_dm"
+                            # Reveal full name
+                            if _enr.get("name"):
+                                st.session_state[_nm_sk] = _enr["name"]
+                                if _card_list_key in st.session_state:
+                                    st.session_state[_card_list_key][_ci]["name"] = _enr["name"]
+                            # Store email
+                            if _enr.get("email"):
+                                _src_str = " / ".join(_enr.get("sources", ["Apollo"]))
+                                st.session_state[_em_sk] = {"email": _enr["email"], "source": _src_str}
+                                if _card_list_key in st.session_state:
+                                    st.session_state[_card_list_key][_ci]["email"] = _enr["email"]
+                            # Store phone
+                            if _enr.get("phone"):
+                                _src_str = " / ".join(_enr.get("sources", ["Apollo"]))
+                                st.session_state[_ph_sk] = {"phone": _enr["phone"], "source": _src_str}
+                            if not _enr.get("email") and not _enr.get("phone"):
+                                st.toast("Nothing found — contact may not be in Apollo DB")
+                            st.rerun()
 
                     # ── Monday CRM expanded data ───────────────────────────
                     if _crm_r and _crm_r.get("on_crm"):
@@ -4140,7 +4228,8 @@ if _page == "💡 Weekly Leads":
             _wcrm_sk = f"wl_crm_{_wi}"
             _wph_sk  = f"wl_ph_{_wi}"
             _wem_sk  = f"wl_em_{_wi}"
-            _wname   = _wc.get("name") or f"Contact {_wi+1}"
+            _wname   = (st.session_state.get(f"wl_nm_{_wi}")
+                        or _wc.get("name") or f"Contact {_wi+1}")
             _wfit    = _wc.get("crs_fit", 0)
 
             # Auto CRM check
@@ -4195,17 +4284,21 @@ if _page == "💡 Weekly Leads":
                 _wact1, _wact2, _wact3 = st.columns(3)
                 with _wact1:
                     if not _we_disp and _wc.get("id") and not st.session_state.get(_wem_sk):
-                        if st.button("💳 Enrich (1 credit)", key=f"wl_enrich_{_wi}",
+                        if st.button("💳 Enrich (email + phone)", key=f"wl_enrich_{_wi}",
                                      use_container_width=True):
                             with st.spinner("Apollo enrichment…"):
                                 try:
-                                    _wenr = _apollo_post("people/match", {
-                                        "id": _wc["id"],
-                                        "reveal_personal_emails": True,
-                                    }).get("person") or {}
-                                    _wenr_n = _norm_apollo(_wenr)
-                                    st.session_state[_wem_sk] = _wenr_n.get("email", "")
-                                    st.session_state[_wph_sk] = _wenr_n.get("phone", "")
+                                    _wenr = _enrich_contact(
+                                        apollo_id=_wc.get("id",""),
+                                        name=_wname,
+                                        linkedin=_wc.get("linkedin",""),
+                                        company=_wc.get("company",""),
+                                    )
+                                    if _wenr.get("name"):
+                                        st.session_state[f"wl_nm_{_wi}"] = _wenr["name"]
+                                        _wl_results[_wi]["name"] = _wenr["name"]
+                                    st.session_state[_wem_sk] = _wenr.get("email", "")
+                                    st.session_state[_wph_sk] = _wenr.get("phone", "")
                                     st.rerun()
                                 except Exception as _wee:
                                     st.error(f"Enrichment failed: {_wee}")
@@ -4499,7 +4592,8 @@ if _page == "🎯 End-User Targets":
                             _ec_email  = st.session_state.get(_ec_em_k) or _ec_mon_em or _ecc.get("email","")
                             _ec_phone  = st.session_state.get(_ec_ph_k) or _ec_mon_ph or _ecc.get("phone","")
                             _ec_fit    = _ecc.get("crs_fit", 0)
-                            _ec_name   = _ecc.get("name") or f"Contact {_eci2+1}"
+                            _ec_name   = (st.session_state.get(f"eu_nm_{_ei}_{_eci2}")
+                                          or _ecc.get("name") or f"Contact {_eci2+1}")
                             _ec_badge  = "🟢" if _ec_fit >= 70 else "🟡" if _ec_fit >= 45 else "🔴"
                             with st.container(border=True):
                                 _eca2, _ecb2 = st.columns([3, 2])
@@ -4529,13 +4623,16 @@ if _page == "🎯 End-User Targets":
                                                      use_container_width=True):
                                             with st.spinner("Enriching…"):
                                                 try:
-                                                    _eenr = _apollo_post("people/match", {
-                                                        "id": _ecc["id"],
-                                                        "reveal_personal_emails": True,
-                                                    }).get("person") or {}
-                                                    _eenrn = _norm_apollo(_eenr)
-                                                    st.session_state[_ec_em_k] = _eenrn.get("email","")
-                                                    st.session_state[_ec_ph_k] = _eenrn.get("phone","")
+                                                    _eenr = _enrich_contact(
+                                                        apollo_id=_ecc.get("id",""),
+                                                        name=_ec_name,
+                                                        linkedin=_ecc.get("linkedin",""),
+                                                        company=_ename,
+                                                    )
+                                                    if _eenr.get("name"):
+                                                        st.session_state[f"eu_nm_{_ei}_{_eci2}"] = _eenr["name"]
+                                                    st.session_state[_ec_em_k] = _eenr.get("email","")
+                                                    st.session_state[_ec_ph_k] = _eenr.get("phone","")
                                                     st.rerun()
                                                 except Exception as _eee:
                                                     st.error(f"Enrich failed: {_eee}")
