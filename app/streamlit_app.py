@@ -790,7 +790,7 @@ def _apollo_match(name: str = "", linkedin_url: str = "",
                   company: str = "", email: str = "",
                   apollo_id: str = "") -> dict:
     """People enrichment — 1 credit per matched person."""
-    payload: dict = {"reveal_personal_emails": True}
+    payload: dict = {"reveal_personal_emails": True, "reveal_phone_number": True}
     if apollo_id:    payload["id"]               = apollo_id
     if name:         payload["name"]              = name
     if linkedin_url: payload["linkedin_url"]      = linkedin_url
@@ -1139,6 +1139,9 @@ def _norm_apollo(p: dict) -> dict:
         ph0   = phones[0]
         phone = ((ph0.get("sanitized_number") or ph0.get("raw_number"))
                  if isinstance(ph0, dict) else str(ph0))
+    # people/match with reveal_phone_number returns mobile_phone directly
+    if not phone:
+        phone = p.get("mobile_phone") or p.get("direct_dial_number") or ""
     personal_emails = p.get("personal_emails") or []
     email = (personal_emails[0] if personal_emails else p.get("email", ""))
     email_status = ("verified" if personal_emails else p.get("email_status", ""))
