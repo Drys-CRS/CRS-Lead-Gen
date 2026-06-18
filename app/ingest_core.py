@@ -54,6 +54,7 @@ github_ai = None
 nvidia_ai = None
 deepseek_ai = None
 gemini_client = None     # google.genai Client
+hf_client = None         # HuggingFace InferenceClient (embeddings, translation)
 
 _GENAI_NEW = False       # True if the new google.genai SDK is available
 
@@ -168,10 +169,21 @@ def init_ai(log=_log_default):
     except Exception as e:
         log(f"  ⚠️ Gemini init failed: {e}")
 
+    # HuggingFace (embeddings, translation, dedup)
+    global hf_client
+    try:
+        k = _env("HF_TOKEN")
+        if k:
+            from huggingface_hub import InferenceClient
+            hf_client = InferenceClient(token=k)
+            log("  ✅ HuggingFace InferenceClient ready")
+    except Exception as e:
+        log(f"  ⚠️ HuggingFace init failed: {e}")
+
     available = [n for n, c in [
         ("Groq", groq_ai), ("Cerebras", cerebras_ai), ("OpenRouter", openrouter_ai),
         ("GitHub", github_ai), ("NVIDIA", nvidia_ai), ("DeepSeek", deepseek_ai),
-        ("Gemini", gemini_client),
+        ("Gemini", gemini_client), ("HF", hf_client),
     ] if c]
     return available
 
@@ -247,6 +259,14 @@ def _is_relevant(text: str) -> bool:
 def _upsert(records: list, country: str, label: str, log) -> int:
     if not records:
         return 0
+    # Within-batch title dedup before hitting the DB
+    before = len(records)
+    records = _dedup_records_in_batch(records)
+    if len(records) < before:
+        log(f"    🗂️  Dedup: removed {before - len(records)} title duplicates within batch")
+    # Translate non-English records (French/Portuguese/Arabic/Swahili)
+    if hf_client and _LANG_DETECT_AVAILABLE:
+        records = [_translate_record_if_needed(r, log) for r in records]
     ok, failed, first_err = 0, 0, None
     for r in records:
         try:
@@ -549,6 +569,20 @@ def scrape_ocds_country(country: str, log, years_back: int = 3):
                     _ph = str(cp.get("telephone") or "")[:50]
                     break
 
+            # Extract PDF document URL if present in OCDS documents array
+            _doc_url = ""
+            _pdf_text = ""
+            for _doc in (tender.get("documents") or []):
+                _durl = _doc.get("url") or ""
+                if _durl.lower().endswith(".pdf"):
+                    _doc_url = _durl
+                    # Only attempt PDF fetch if description is thin
+                    if len(desc) < 100 and hf_client:
+                        _pdf_text = _extract_pdf_text(_durl)
+                        if _pdf_text and len(_pdf_text) > len(desc):
+                            desc = _pdf_text
+                    break
+
             base = {
                 "tender_number":   str(tender_id)[:100],
                 "department_name": str(buyer)[:200],
@@ -556,6 +590,7 @@ def scrape_ocds_country(country: str, log, years_back: int = 3):
                 "description":     str(desc),
                 "category":        str(category),
                 "portal_link":     f"https://data.open-contracting.org/en/publication/{pub_id}",
+                "document_url":    _doc_url,
                 "country":         country,
                 "contact_person":  _cp, "contact_email": _ce, "contact_phone": _ph,
             }
@@ -986,9 +1021,190 @@ def _call_gemini(prompt, max_tokens=2000, retries=3):
     raise RuntimeError("Gemini quota exceeded after retries.")
 
 
+def _call_hf(prompt, max_tokens=1024):
+    r = hf_client.chat_completion(
+        model="Qwen/Qwen2.5-7B-Instruct",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=max_tokens,
+    )
+    return _clean(r.choices[0].message.content)
+
+
 def any_ai_available() -> bool:
     return any([groq_ai, cerebras_ai, openrouter_ai, github_ai,
-                nvidia_ai, deepseek_ai, gemini_client])
+                nvidia_ai, deepseek_ai, gemini_client, hf_client])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# HF SCRAPABILITY UTILITIES
+# (embeddings · PDF extraction · language detection & translation · dedup)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _embed_text_hf(text: str) -> list:
+    """384-dim embedding via all-MiniLM-L6-v2. Returns [] on failure."""
+    if not hf_client:
+        return []
+    try:
+        resp = hf_client.feature_extraction(
+            text[:2000], model="sentence-transformers/all-MiniLM-L6-v2"
+        )
+        flat = resp[0] if (resp and isinstance(resp[0], (list, float))) else resp
+        if isinstance(flat, list) and flat and isinstance(flat[0], list):
+            flat = flat[0]
+        return [float(x) for x in flat[:384]]
+    except Exception:
+        return []
+
+
+def _extract_pdf_text(url: str, timeout: int = 15) -> str:
+    """Download a PDF and extract text with pdfminer. Returns '' on failure."""
+    if not url or not url.lower().endswith(".pdf"):
+        return ""
+    try:
+        from pdfminer.high_level import extract_text_to_fp
+        from pdfminer.layout import LAParams
+        resp = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
+        if resp.status_code != 200:
+            return ""
+        ct = resp.headers.get("content-type", "")
+        if "pdf" not in ct.lower() and not url.lower().endswith(".pdf"):
+            return ""
+        buf = io.StringIO()
+        extract_text_to_fp(io.BytesIO(resp.content), buf, laparams=LAParams())
+        return buf.getvalue()[:3000].strip()
+    except Exception:
+        return ""
+
+
+_LANG_DETECT_AVAILABLE = False
+try:
+    from langdetect import detect as _langdetect
+    _LANG_DETECT_AVAILABLE = True
+except ImportError:
+    def _langdetect(t): return "en"  # noqa: E731
+
+
+def _detect_language(text: str) -> str:
+    """Returns ISO 639-1 code; defaults to 'en' on failure."""
+    try:
+        return _langdetect(text[:500]) or "en"
+    except Exception:
+        return "en"
+
+
+_HF_TRANSLATION_MODELS = {
+    "fr": "Helsinki-NLP/opus-mt-fr-en",
+    "pt": "Helsinki-NLP/opus-mt-mul-en",
+    "ar": "Helsinki-NLP/opus-mt-ar-en",
+    "sw": "Helsinki-NLP/opus-mt-swc-en",
+    "am": "Helsinki-NLP/opus-mt-mul-en",   # Amharic (Ethiopia)
+    "ha": "Helsinki-NLP/opus-mt-mul-en",   # Hausa (Nigeria)
+}
+
+
+def _translate_field(text: str, src_lang: str, log=_log_default) -> str:
+    """Translate a single text field to English via HF. Returns original on failure."""
+    if not hf_client or not text or len(text) < 15:
+        return text
+    model = _HF_TRANSLATION_MODELS.get(src_lang)
+    if not model:
+        return text
+    try:
+        result = hf_client.translation(text[:1000], model=model)
+        translated = getattr(result, "translation_text", None) or str(result)
+        return translated.strip() or text
+    except Exception as _te:
+        log(f"    ⚠️ Translation ({src_lang}→en): {str(_te)[:60]}")
+        return text
+
+
+def _translate_record_if_needed(record: dict, log=_log_default) -> dict:
+    """Detect language; if non-English, translate title + description in place."""
+    sample = f"{record.get('title', '')} {record.get('description', '')}".strip()
+    if not sample:
+        return record
+    lang = _detect_language(sample)
+    if lang == "en" or lang not in _HF_TRANSLATION_MODELS:
+        return record
+    record = dict(record)
+    for field in ("title", "description"):
+        orig = record.get(field, "")
+        if orig:
+            translated = _translate_field(orig, lang, log)
+            if translated and translated != orig:
+                record[field] = (translated[:200] if field == "title" else translated)
+    return record
+
+
+def _dedup_records_in_batch(records: list) -> list:
+    """Remove near-duplicates within a batch using normalised title matching."""
+    seen, unique = set(), []
+    for r in records:
+        key = re.sub(r"\W+", " ", (r.get("title") or "").lower()).strip()
+        if len(key) < 10:
+            unique.append(r)
+        elif key not in seen:
+            seen.add(key)
+            unique.append(r)
+    return unique
+
+
+def _embedding_dedup_pass(log=_log_default, lookback_days: int = 14) -> int:
+    """Post-run: embed newly ingested tenders, store vectors, mark near-dupes.
+
+    1. Fetches tenders without embeddings from the last `lookback_days` days.
+    2. Generates embeddings and stores them.
+    3. Queries match_tenders RPC for each — similarity > 0.92 → mark duplicate.
+    Returns count of duplicates found.
+    """
+    if not hf_client or not supabase:
+        return 0
+    cutoff = (_dt.date.today() - _dt.timedelta(days=lookback_days)).isoformat()
+    try:
+        rows = (supabase.table("sa_tenders")
+                .select("id,title,description")
+                .is_("embedding", "null")
+                .gte("created_at", cutoff)
+                .limit(200).execute()).data or []
+    except Exception as e:
+        log(f"  ⚠️ Dedup fetch failed: {e}")
+        return 0
+
+    if not rows:
+        return 0
+
+    log(f"🔍 Embedding {len(rows)} new tenders for dedup…")
+    embedded: list[tuple] = []
+    for r in rows:
+        vec = _embed_text_hf(f"{r.get('title','')} {r.get('description','')}"[:1500])
+        if vec:
+            try:
+                supabase.table("sa_tenders").update({"embedding": vec}).eq("id", r["id"]).execute()
+                embedded.append((r["id"], vec))
+            except Exception:
+                pass
+
+    log(f"  Stored {len(embedded)} embeddings. Checking for near-duplicates…")
+    dups = 0
+    for tid, vec in embedded:
+        try:
+            matches = supabase.rpc("match_tenders", {
+                "query_embedding": vec,
+                "match_threshold": 0.92,
+                "match_count": 2,
+                "exclude_id": tid,
+            }).execute().data or []
+            if matches:
+                supabase.table("sa_tenders").update({
+                    "is_irrelevant": True,
+                    "ai_rationale": json.dumps({"rationale": f"Near-duplicate of {matches[0]['id']}", "dedup": True}),
+                }).eq("id", tid).execute()
+                dups += 1
+        except Exception:
+            pass
+
+    log(f"  ✅ Dedup: {dups} near-duplicate(s) marked from {len(embedded)} new embeddings.")
+    return dups
 
 
 def _call_ai(prompt: str, max_tokens: int = 2000, log=_log_default) -> str:
@@ -1008,6 +1224,8 @@ def _call_ai(prompt: str, max_tokens: int = 2000, log=_log_default) -> str:
         providers.append(("DeepSeek", _call_deepseek))
     if gemini_client and _provider_budget_ok("Gemini"):
         providers.append(("Gemini", _call_gemini))
+    if hf_client and _provider_budget_ok("HF"):
+        providers.append(("HF", _call_hf))
 
     if not providers:
         raise RuntimeError("All AI providers have hit their daily limits or have no key.")
@@ -1558,6 +1776,10 @@ def run_all(years_back: int = 1, max_score: int = 100, do_partner: bool = True,
         if do_partner:
             log("─ 3. Partner analysis ─")
             counters["partners_found"] = run_partner_analysis(log)
+
+        if hf_client:
+            log("─ 4. Embedding dedup pass ─")
+            counters["dups_removed"] = _embedding_dedup_pass(log)
 
         status = "success"
         err_log = None
