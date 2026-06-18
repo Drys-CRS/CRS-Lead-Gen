@@ -734,14 +734,21 @@ def _apollo_search_people(name: str = "", company: str = "",
 def _apollo_search_companies(keywords: str = "", locations: list = None,
                               employee_ranges: list = None,
                               industries: list = None,
-                              num: int = 10) -> list:
-    """Search Apollo for organizations. Returns list of raw org dicts."""
-    payload: dict = {"per_page": min(num, 25), "page": 1}
-    if keywords:        payload["q_keywords"]                     = keywords
-    if locations:       payload["organization_locations"]         = locations
+                              intent_topics: list = None,
+                              intent_scores: list = None,
+                              page: int = 1,
+                              num: int = 25) -> tuple[list, int]:
+    """Search Apollo for organizations. Returns (orgs list, total_count)."""
+    payload: dict = {"per_page": min(num, 25), "page": page}
+    if keywords:        payload["q_keywords"]                        = keywords
+    if locations:       payload["organization_locations"]            = locations
     if employee_ranges: payload["organization_num_employees_ranges"] = employee_ranges
-    if industries:      payload["q_organization_keyword_tags"]    = industries
-    return _apollo_post("mixed_companies/search", payload).get("organizations") or []
+    if industries:      payload["q_organization_keyword_tags"]       = industries
+    if intent_topics:   payload["q_organization_intent_topics"]      = intent_topics
+    if intent_scores:   payload["organization_intent_scores"]        = intent_scores
+    resp = _apollo_post("mixed_companies/search", payload)
+    total = int(resp.get("pagination", {}).get("total_entries", 0) or 0)
+    return (resp.get("organizations") or []), total
 
 
 def _norm_org(o: dict) -> dict:
@@ -1220,6 +1227,7 @@ def _crs_fit_score(title: str, company_sector: str,
 
 _NAV_PAGES = [
     "✅ Lead Verification",
+    "🔥 Intent Leads",
     "📢 Opportunities",
     "🤝 Partners",
     "🔍 LinkedIn Dork",
@@ -2507,6 +2515,264 @@ if _page == "✅ Lead Verification":
                                 st.warning("Not found in Monday CRM.")
                 else:
                     st.info("Add MONDAY_API_KEY to enable push.")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB — INTENT LEADS
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Apollo Bombora intent topics relevant to the CRS portfolio
+_CRS_INTENT_TOPICS: list[str] = [
+    "Certified Information Systems Security Professional (CISSP)",
+    "Active Cyber Defense",
+    "Cyber & Intelligence",
+    "Career Training Program",
+    "Chief Information Security Officer (CISO)",
+    "Cyber Essentials (CE)",
+    "Cybersecurity",
+    "Network Security",
+    "Information Security",
+    "Endpoint Security",
+    "Cloud Security",
+    "Vulnerability Management",
+    "Penetration Testing",
+    "Security Operations",
+    "Threat Intelligence",
+    "Data Loss Prevention",
+    "Security Awareness Training",
+    "Compliance Management",
+    "Identity and Access Management",
+    "Zero Trust Security",
+    "Managed Security Services",
+    "Incident Response",
+    "GRC",
+    "POPIA",
+    "IBM Training",
+    "CompTIA",
+    "Red Hat",
+    "SUSE Linux",
+]
+
+if _page == "🔥 Intent Leads":
+    st.subheader("Intent Leads")
+    st.caption(
+        "Apollo companies actively researching cybersecurity topics — "
+        "filtered by buying intent signal strength and topic relevance to the CRS portfolio."
+    )
+
+    _has_apo_il = bool(st.secrets.get("APOLLO_API_KEY","") or os.getenv("APOLLO_API_KEY",""))
+    if not _has_apo_il:
+        st.warning("APOLLO_API_KEY not configured.")
+        st.stop()
+
+    # ── Filters ───────────────────────────────────────────────────────────────
+    with st.expander("🔧 Search Filters", expanded=True):
+        _ilc1, _ilc2 = st.columns(2)
+        with _ilc1:
+            _il_scores = st.multiselect(
+                "Intent Score",
+                ["HIGH", "MEDIUM", "LOW"],
+                default=["HIGH", "MEDIUM"],
+                key="il_scores",
+                help="Minimum Bombora intent signal strength for the selected topics",
+            )
+            _il_topics = st.multiselect(
+                "Intent Topics",
+                _CRS_INTENT_TOPICS,
+                default=_CRS_INTENT_TOPICS[:6],
+                key="il_topics",
+                help="Companies actively researching these topics will surface",
+            )
+        with _ilc2:
+            _il_locations = st.text_input(
+                "Location (comma-separated)",
+                value="africa",
+                key="il_locations",
+                help="e.g. 'South Africa, Kenya, Nigeria' or just 'africa'",
+            )
+            _il_emp = st.multiselect(
+                "Employee Size",
+                ["1,10", "11,50", "51,200", "201,500", "501,1000", "1001,5000", "5001,10000"],
+                default=[],
+                key="il_emp",
+                help="Leave blank for all sizes",
+            )
+            _il_keywords = st.text_input(
+                "Additional keywords",
+                value="",
+                key="il_keywords",
+                placeholder="e.g. cybersecurity, SOC, cloud",
+            )
+            _il_num = st.slider("Results per search", 10, 100, 25, 5, key="il_num")
+
+        _il_run = st.button("🔍 Search", type="primary", key="il_run")
+
+    # ── Search ────────────────────────────────────────────────────────────────
+    if _il_run or st.session_state.get("il_results"):
+        if _il_run:
+            _loc_list = [x.strip() for x in _il_locations.split(",") if x.strip()]
+            try:
+                with st.spinner("Searching Apollo for intent-qualified companies…"):
+                    _il_raw, _il_total = _apollo_search_companies(
+                        keywords=_il_keywords.strip() or "",
+                        locations=_loc_list or None,
+                        employee_ranges=_il_emp or None,
+                        intent_topics=_il_topics or None,
+                        intent_scores=_il_scores or None,
+                        num=_il_num,
+                    )
+                _il_normed = [_norm_org(o) for o in _il_raw]
+                st.session_state["il_results"]  = _il_normed
+                st.session_state["il_total"]    = _il_total
+            except Exception as _ile:
+                st.error(f"Apollo error: {_ile}")
+                st.stop()
+
+        _il_results = st.session_state.get("il_results", [])
+        _il_total   = st.session_state.get("il_total", 0)
+
+        if not _il_results:
+            st.info("No results — try broadening the intent topics or score range.")
+        else:
+            st.caption(f"Showing **{len(_il_results)}** companies · {_il_total:,} total matching")
+            st.divider()
+
+            for _ili, _ilorg in enumerate(_il_results):
+                _il_name     = _ilorg.get("name", "Unknown")
+                _il_domain   = _ilorg.get("domain", "")
+                _il_industry = _ilorg.get("industry", "")
+                _il_emp_cnt  = _ilorg.get("employees")
+                _il_city     = _ilorg.get("city", "")
+                _il_country  = _ilorg.get("country", "")
+                _il_loc_str  = ", ".join(x for x in [_il_city, _il_country] if x)
+                _il_kws      = _ilorg.get("keywords", [])[:6]
+                _il_tech     = _ilorg.get("tech", [])
+                _il_org_id   = _ilorg.get("id", "")
+
+                # CRS fit score using tech stack
+                _il_score, _il_matched, _il_angles = _score_org_for_crs(
+                    _il_industry, _il_country, _il_emp_cnt, _il_tech
+                )
+                _il_badge = (
+                    "🟢 Excellent" if _il_score >= 60 else
+                    "🟡 Good"      if _il_score >= 40 else
+                    "🔵 Fair"      if _il_score >= 20 else "⚪ Low"
+                )
+
+                with st.container(border=True):
+                    _ilh1, _ilh2, _ilh3 = st.columns([4, 2, 1])
+                    with _ilh1:
+                        _domain_link = (f"[{_il_domain}](https://{_il_domain})"
+                                        if _il_domain else "")
+                        st.markdown(f"**{_il_name}**" +
+                                    (f"  ·  {_domain_link}" if _domain_link else ""))
+                        st.caption(
+                            ("🏭 " + _il_industry if _il_industry else "") +
+                            ("  ·  📍 " + _il_loc_str if _il_loc_str else "") +
+                            ("  ·  👥 " + f"{_il_emp_cnt:,}" if _il_emp_cnt else "")
+                        )
+                        if _il_kws:
+                            st.caption("🏷️ " + "  ·  ".join(_il_kws))
+                    with _ilh2:
+                        if _il_matched:
+                            st.caption("🔧 **Tech signals:**")
+                            for _ilm in _il_matched[:3]:
+                                _opp = _TECH_OPP.get(_ilm, {})
+                                st.caption(f"• {_ilm} → {_opp.get('sol','')}")
+                        elif _il_industry:
+                            st.caption(f"📋 {_il_industry}")
+                    with _ilh3:
+                        st.metric("CRS Fit", f"{_il_score}/100")
+                        st.caption(_il_badge)
+
+                    if _il_angles:
+                        st.caption("💡 " + " · ".join(_il_angles[:2]))
+
+                    # ── Find contacts expander ────────────────────────────────
+                    with st.expander("👥 Find contacts at this company", expanded=False):
+                        _il_dm_key = f"il_dm_{_ili}"
+                        _il_titles_key = f"il_titles_{_ili}"
+
+                        _il_sol_pick = st.selectbox(
+                            "CRS solution focus",
+                            list(_CRS_DM_TITLES.keys()),
+                            key=f"il_sol_{_ili}",
+                        )
+                        _il_dm_titles = _CRS_DM_TITLES[_il_sol_pick]
+
+                        if st.button("Find decision makers", key=f"il_find_{_ili}",
+                                     type="primary"):
+                            with st.spinner("Searching Apollo…"):
+                                try:
+                                    _il_contacts = _apollo_search_people(
+                                        company=_il_name,
+                                        titles=_il_dm_titles[:5],
+                                        num=5,
+                                    )
+                                    st.session_state[_il_dm_key] = _il_contacts
+                                except Exception as _ile2:
+                                    st.error(str(_ile2))
+                                    st.session_state[_il_dm_key] = []
+
+                        _il_dms = st.session_state.get(_il_dm_key, [])
+                        if _il_dms:
+                            st.caption(f"Found **{len(_il_dms)}** contacts")
+                            for _ilci, _ilc in enumerate(_il_dms):
+                                _iln  = (st.session_state.get(f"il_nm_{_ili}_{_ilci}")
+                                         or _ilc.get("name") or f"Contact {_ilci+1}")
+                                _ilt  = _ilc.get("title", "")
+                                _ile2 = _ilc.get("email", "")
+                                _ilph = _ilc.get("phone", "")
+                                _ilem_sk = f"il_em_{_ili}_{_ilci}"
+                                _ilph_sk = f"il_ph_{_ili}_{_ilci}"
+                                _ilnm_sk = f"il_nm_{_ili}_{_ilci}"
+                                _ilem_val = (st.session_state.get(_ilem_sk) or {}).get("email", _ile2)
+                                _ilph_val = (st.session_state.get(_ilph_sk) or {}).get("phone", _ilph)
+
+                                _ilfit = _crs_fit_score(
+                                    _ilt, _il_industry, _il_country,
+                                    bool(_ilem_val), bool(_ilph_val)
+                                )
+                                _ilfit_str = ("🟢" if _ilfit >= 70 else "🟡" if _ilfit >= 40 else "🔵")
+
+                                with st.container(border=True):
+                                    _ilcc1, _ilcc2 = st.columns([3, 1])
+                                    with _ilcc1:
+                                        st.markdown(f"**{_iln}**")
+                                        if _ilt: st.caption(f"🎯 {_ilt}")
+                                        if _ilem_val: st.caption(f"📧 {_ilem_val}")
+                                        if _ilph_val: st.caption(f"📞 {_ilph_val}")
+                                    with _ilcc2:
+                                        st.caption(f"{_ilfit_str} {_ilfit}/100")
+                                        _ilapo_id = _ilc.get("id", "")
+                                        _il_enriched = bool(_ilem_val and _ilph_val)
+                                        if _ilapo_id and not _il_enriched:
+                                            _il_enr_lbl = ("💳 Enrich" if not _ilem_val
+                                                           else "💳 Find phone")
+                                            if st.button(_il_enr_lbl,
+                                                         key=f"il_enrich_{_ili}_{_ilci}",
+                                                         use_container_width=True):
+                                                with st.spinner("Enriching…"):
+                                                    _ile_r = _enrich_contact(
+                                                        apollo_id=_ilapo_id,
+                                                        name=_ilc.get("name",""),
+                                                        linkedin=_ilc.get("linkedin",""),
+                                                        company=_il_name,
+                                                    )
+                                                if _ile_r.get("name"):
+                                                    st.session_state[_ilnm_sk] = _ile_r["name"]
+                                                if _ile_r.get("email"):
+                                                    st.session_state[_ilem_sk] = {
+                                                        "email": _ile_r["email"],
+                                                        "source": "/".join(_ile_r.get("sources",["Apollo"])),
+                                                    }
+                                                if _ile_r.get("phone"):
+                                                    st.session_state[_ilph_sk] = {
+                                                        "phone": _ile_r["phone"],
+                                                        "source": "/".join(_ile_r.get("sources",["Apollo"])),
+                                                    }
+                                                if not _ile_r.get("email") and not _ile_r.get("phone"):
+                                                    st.toast("Nothing found in Apollo DB")
+                                                st.rerun()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 5 — LINKEDIN DORK
@@ -4393,7 +4659,7 @@ if _page == "🎯 End-User Targets":
                 for _eu_ctr in (_eu_countries or ["South Africa"]):
                     try:
                         kw_parts = [p for p in [_eu_ind, _eu_keyword] if p]
-                        _eu_orgs = _apollo_search_companies(
+                        _eu_orgs, _ = _apollo_search_companies(
                             keywords=" ".join(kw_parts),
                             locations=[_eu_ctr],
                             employee_ranges=_eu_emp_ranges or None,
