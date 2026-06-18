@@ -669,7 +669,7 @@ def _apollo_credits() -> dict:
     if not key:
         return {}
     req = _urlreq.Request(
-        "https://api.apollo.io/api/v1/users/api_profile",
+        "https://api.apollo.io/api/v1/users/api_profile?include_credit_usage=true",
         headers={"X-Api-Key": key, "Cache-Control": "no-cache",
                  "Content-Type": "application/json"},
         method="GET",
@@ -679,22 +679,20 @@ def _apollo_credits() -> dict:
             data = json.loads(r.read())
     except Exception:
         return {}
-    u = data.get("user") or {}
-    # Apollo uses different field names across plan tiers — try them all
-    left  = (u.get("email_credits_left")
-             or u.get("credits_left")
-             or u.get("export_credits_remaining")
-             or max(0, (u.get("credits_limit") or 0) - (u.get("credits_used") or 0))
-             or 0)
-    used  = (u.get("email_credits_used")
-             or u.get("credits_used")
-             or u.get("export_credits_used")
-             or 0)
-    total = (u.get("email_credits_limit")
-             or u.get("credits_limit")
-             or u.get("export_credits_limit")
-             or 0)
-    return {"left": int(left), "used": int(used), "total": int(total)}
+    # API returns data at top level (no "user" wrapper).
+    # Actual field names from the v1 API:
+    lead_left  = int(data.get("num_credits_remaining") or 0)
+    lead_total = int(data.get("effective_num_lead_credits") or 0)
+    lead_used  = int(data.get("num_lead_credits_used") or 0)
+    dial_left  = int(data.get("effective_num_direct_dial_credits") or 0)
+    dial_used  = int(data.get("num_direct_dial_credits_used") or 0)
+    return {
+        "lead_left":  lead_left,
+        "lead_total": lead_total,
+        "lead_used":  lead_used,
+        "dial_left":  dial_left,
+        "dial_used":  dial_used,
+    }
 
 
 def _hunter_find(first: str, last: str, domain: str) -> dict:
@@ -1238,16 +1236,6 @@ with st.sidebar:
     st.caption("v2 · scrape on-demand or via nightly schedule")
     st.divider()
 
-    # ── Region toggle ─────────────────────────────────────────────────────────
-    _region_na = st.toggle(
-        "🇺🇸 North America mode",
-        key="region_na",
-        help="Switch Lead Intelligence data feeds and country lists between Africa and North America",
-    )
-    if _region_na:
-        st.caption("🗺️ North America feeds active")
-    st.divider()
-
     # ── Navigation (menu-style buttons) ──────────────────────────────────────
     if "_active_page" not in st.session_state:
         st.session_state["_active_page"] = _NAV_PAGES[0]
@@ -1268,14 +1256,14 @@ with st.sidebar:
     if bool(st.secrets.get("APOLLO_API_KEY","") or os.getenv("APOLLO_API_KEY","")):
         _cr = _apollo_credits()
         if _cr:
-            _cr_left  = _cr.get("left", 0)
-            _cr_total = _cr.get("total", 0)
-            _cr_pct   = (_cr_left / _cr_total) if _cr_total else 0
-            _cr_icon  = "🟢" if _cr_pct > 0.3 else "🟡" if _cr_pct > 0.1 else "🔴"
+            _ll = _cr.get("lead_left", 0)
+            _lt = _cr.get("lead_total", 0)
+            _dl = _cr.get("dial_left", 0)
+            _pct = (_ll / _lt) if _lt else 0
+            _ico = "🟢" if _pct > 0.3 else "🟡" if _pct > 0.1 else "🔴"
             st.caption(
-                f"{_cr_icon} Apollo: **{_cr_left:,}** credits left"
-                + (f" / {_cr_total:,}" if _cr_total else "")
-                + f"  ≈ **{_cr_left:,}** contacts can be enriched"
+                f"{_ico} Apollo leads: **{_ll:,}** / {_lt:,}"
+                + (f"  •  📞 **{_dl:,}** dials" if _dl else "")
             )
         else:
             st.caption("⚪ Apollo credits unavailable")
@@ -3424,42 +3412,15 @@ _AFRICAN_SITES_GOOGLE = (
     "OR site:techpoint.africa OR site:dailymaverick.co.za"
 )
 
-# North-America feeds and countries (used when region_na toggle is on)
-_NA_FEEDS: dict = {
-    "BleepingComputer":     "https://www.bleepingcomputer.com/feed/",
-    "SecurityWeek":         "https://feeds.feedburner.com/Securityweek",
-    "Dark Reading":         "https://www.darkreading.com/rss/all.xml",
-    "CyberScoop":           "https://cyberscoop.com/feed/",
-    "KrebsOnSecurity":      "https://krebsonsecurity.com/feed/",
-    "Threatpost":           "https://threatpost.com/feed/",
-    "SC Magazine":          "https://www.scmagazine.com/rss.xml",
-    "Ars Technica Security":"https://feeds.arstechnica.com/arstechnica/security",
-}
-
-_NA_SITES_GOOGLE = (
-    "site:bleepingcomputer.com OR site:securityweek.com OR site:darkreading.com "
-    "OR site:cyberscoop.com OR site:krebsonsecurity.com OR site:threatpost.com "
-    "OR site:scmagazine.com OR site:arstechnica.com"
-)
-
-_NA_COUNTRIES = [
-    "United States", "Canada", "Mexico",
-]
-
-_NA_DEFAULT_COUNTRIES = ["United States", "Canada"]
-
-
 def _get_region_config() -> dict:
-    """Return feed/country/search config based on the sidebar region toggle."""
-    na = st.session_state.get("region_na", False)
+    """Return Africa-focused feed/country/search config."""
     return {
-        "na":               na,
-        "label":            "North America" if na else "Africa",
-        "countries":        _NA_COUNTRIES if na else _INTEL_COUNTRIES,
-        "default_countries":_NA_DEFAULT_COUNTRIES if na else ["South Africa","Kenya","Nigeria","Ghana"],
-        "feeds":            _NA_FEEDS if na else _AFRICAN_FEEDS,
-        "sites_google":     _NA_SITES_GOOGLE if na else _AFRICAN_SITES_GOOGLE,
-        "geo_qualifier":    "" if na else "Africa",
+        "label":            "Africa",
+        "countries":        _INTEL_COUNTRIES,
+        "default_countries":["South Africa", "Kenya", "Nigeria", "Ghana"],
+        "feeds":            _AFRICAN_FEEDS,
+        "sites_google":     _AFRICAN_SITES_GOOGLE,
+        "geo_qualifier":    "Africa",
     }
 
 
