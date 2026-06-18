@@ -577,7 +577,14 @@ def _apollo_post(endpoint: str, payload: dict) -> dict:
     key = _apollo_key()
     if not key:
         raise RuntimeError("APOLLO_API_KEY not configured")
-    body_with_key = {**payload, "api_key": key}
+    # Truncate any company/keyword strings that can trigger Cloudflare 520
+    _clean = {}
+    for k, v in payload.items():
+        if isinstance(v, str) and len(v) > 120:
+            _clean[k] = v[:120]
+        else:
+            _clean[k] = v
+    body_with_key = {**_clean, "api_key": key}
     req = _urlreq.Request(
         f"https://api.apollo.io/api/v1/{endpoint}",
         data=json.dumps(body_with_key).encode(),
@@ -592,13 +599,18 @@ def _apollo_post(endpoint: str, payload: dict) -> dict:
         body = ""
         try: body = e.read().decode("utf-8", errors="ignore")[:300]
         except Exception: pass
+        if e.code == 520:
+            raise RuntimeError(
+                "Apollo 520: Cloudflare error — try a shorter or simpler company name"
+            ) from e
         raise RuntimeError(f"Apollo {e.code}: {body or e.reason}") from e
 
 
 def _apollo_match(name: str = "", linkedin_url: str = "",
                   company: str = "", email: str = "",
                   apollo_id: str = "") -> dict:
-    """People enrichment — 1 credit per matched person."""
+    """People enrichment — 1 credit per matched person. reveal_phone_number omitted
+    (requires async webhook; emails are returned synchronously)."""
     payload: dict = {"reveal_personal_emails": True}
     if apollo_id:    payload["id"]               = apollo_id
     if name:         payload["name"]              = name
@@ -1859,7 +1871,6 @@ if _page == "🤝 Partners":
                                                         _pe = _apollo_post("people/match", {
                                                             "id": _pcc["id"],
                                                             "reveal_personal_emails": True,
-                                                            "reveal_phone_number": True,
                                                         }).get("person") or {}
                                                         _pen = _norm_apollo(_pe)
                                                         st.session_state[_pc_em_k] = _pen.get("email","")
@@ -3371,16 +3382,12 @@ _INTEL_COUNTRIES = [
     "Sierra Leone", "The Gambia", "Liberia", "Cameroon", "Senegal",
 ]
 
-# Flare v4 enum values — confirmed valid from API validation errors:
-# 'attachment', 'listing', 'ransomleak' and likely: 'chat', 'credential', 'paste', 'stealer_log'
+# Flare v4 enum values — ONLY these three are confirmed valid by the API.
+# Any other value causes HTTP 422 REQUEST_VALIDATION_ERROR.
 _INTEL_EVENT_TYPES = {
-    "Ransomware":         "ransomleak",    # ✓ confirmed
-    "Credential Leak":    "credential",    # was "leaked-credential" — invalid
-    "Dark Web Chat":      "chat",          # was "chat-message" — invalid
-    "Paste / Dump":       "paste",
-    "Stealer Log":        "stealer_log",   # was "stealer-log" (hyphen invalid)
-    "Market Listing":     "listing",       # ✓ confirmed
-    "Forum Attachment":   "attachment",    # ✓ confirmed
+    "Ransomware / Leak":  "ransomleak",
+    "Market Listing":     "listing",
+    "Forum Attachment":   "attachment",
 }
 
 _INTEL_GOOGLE_TERMS = (
@@ -3415,7 +3422,7 @@ if _page == "🛡️ Lead Intelligence":
             st.session_state["intel_evt_types"] = list(_INTEL_EVENT_TYPES.keys())
         elif not st.session_state.get("intel_evt_all"):
             st.session_state.setdefault("intel_evt_types",
-                                        ["Ransomware", "Credential Leak", "Dark Web Chat"])
+                                        ["Ransomware / Leak", "Market Listing", "Forum Attachment"])
         _i_evt_labels = st.multiselect("Event types", list(_INTEL_EVENT_TYPES.keys()),
                                        key="intel_evt_types")
 
@@ -4195,7 +4202,6 @@ if _page == "💡 Weekly Leads":
                                     _wenr = _apollo_post("people/match", {
                                         "id": _wc["id"],
                                         "reveal_personal_emails": True,
-                                        "reveal_phone_number": True,
                                     }).get("person") or {}
                                     _wenr_n = _norm_apollo(_wenr)
                                     st.session_state[_wem_sk] = _wenr_n.get("email", "")
@@ -4526,7 +4532,6 @@ if _page == "🎯 End-User Targets":
                                                     _eenr = _apollo_post("people/match", {
                                                         "id": _ecc["id"],
                                                         "reveal_personal_emails": True,
-                                                        "reveal_phone_number": True,
                                                     }).get("person") or {}
                                                     _eenrn = _norm_apollo(_eenr)
                                                     st.session_state[_ec_em_k] = _eenrn.get("email","")
