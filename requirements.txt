@@ -11,3 +11,4 @@ openai==2.41.1
 httpx==0.28.1
 dnspython==2.7.0
 mcp==1.9.4
+huggingface_hub==0.30.2

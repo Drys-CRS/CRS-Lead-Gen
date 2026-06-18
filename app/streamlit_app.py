@@ -212,7 +212,7 @@ supabase = _get_supabase()
 # ─────────────────────────────────────────────────────────────────────────────
 _AI_DAILY_LIMITS = {
     "Groq": 14400, "Cerebras": 10000, "OpenRouter": 9999,
-    "GitHub": 150, "NVIDIA": 40, "DeepSeek": 500, "Gemini": 20,
+    "GitHub": 150, "NVIDIA": 40, "DeepSeek": 500, "Gemini": 20, "HF": 1000,
 }
 
 @st.cache_resource
@@ -297,6 +297,17 @@ def _init_deepseek():
     except Exception:
         return None
 
+@st.cache_resource
+def _init_hf():
+    token = st.secrets.get("HF_TOKEN", "") or os.getenv("HF_TOKEN", "")
+    if not token:
+        return None
+    try:
+        from huggingface_hub import InferenceClient
+        return InferenceClient(token=token)
+    except ImportError:
+        return None
+
 gemini_ai     = _init_gemini()
 groq_ai       = _init_groq()
 cerebras_ai   = _init_cerebras()
@@ -304,6 +315,7 @@ openrouter_ai = _init_openrouter()
 github_ai     = _init_github()
 nvidia_ai     = _init_nvidia()
 deepseek_ai   = _init_deepseek()
+hf_ai         = _init_hf()
 
 _GITHUB_MODELS    = ["Llama-3.3-70B-Instruct", "gpt-4o-mini", "Mistral-Large-2411", "Phi-4"]
 _OPENROUTER_MODELS = ["openrouter/free", "deepseek/deepseek-r1:free",
@@ -321,6 +333,52 @@ def _clean(raw):
     return re.sub(r"^```json[\s]*|^```[\s]*|```$", "", (raw or "").strip(), flags=re.MULTILINE).strip()
 
 def _rl(e): return any(x in str(e).lower() for x in ["429", "quota", "rate limit", "too many", "throttl"])
+
+def _call_hf(prompt: str) -> str:
+    r = hf_ai.chat_completion(
+        model="Qwen/Qwen2.5-7B-Instruct",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=1024,
+    )
+    return _clean(r.choices[0].message.content)
+
+def _hf_embed(text: str) -> list:
+    """Generate 384-dim embedding using all-MiniLM-L6-v2. Returns [] on failure."""
+    if not hf_ai:
+        return []
+    try:
+        resp = hf_ai.feature_extraction(
+            text[:2000],
+            model="sentence-transformers/all-MiniLM-L6-v2",
+        )
+        # resp may be nested list (batch) or flat list
+        flat = resp[0] if (resp and isinstance(resp[0], (list, float))) else resp
+        if isinstance(flat[0], list):
+            flat = flat[0]
+        return [float(x) for x in flat[:384]]
+    except Exception:
+        return []
+
+_TENDER_CATEGORIES = [
+    "IT security software", "cybersecurity training", "IT hardware",
+    "networking & connectivity", "cloud services", "managed services",
+    "compliance & audit", "software development", "other IT & telecoms",
+]
+
+def _hf_classify_tender(text: str) -> str:
+    """Zero-shot classify a tender into a CRS-relevant category. Returns '' on failure."""
+    if not hf_ai:
+        return ""
+    try:
+        result = hf_ai.zero_shot_classification(
+            text[:512],
+            labels=_TENDER_CATEGORIES,
+            model="facebook/bart-large-mnli",
+        )
+        labels = result.get("labels") if isinstance(result, dict) else getattr(result, "labels", [])
+        return labels[0] if labels else ""
+    except Exception:
+        return ""
 
 def _call_groq(p):
     r = groq_ai.chat.completions.create(model="llama-3.3-70b-versatile",
@@ -400,6 +458,7 @@ def _call_ai(prompt: str) -> str:
     if nvidia_ai     and _ok("NVIDIA"):     providers.append(("NVIDIA",     _call_nvidia))
     if deepseek_ai   and _ok("DeepSeek"):   providers.append(("DeepSeek",   _call_deepseek))
     if gemini_ai     and _ok("Gemini"):     providers.append(("Gemini",     _call_gemini))
+    if hf_ai         and _ok("HF"):         providers.append(("HF",         _call_hf))
     if not providers: raise RuntimeError("All AI providers at daily limits.")
     last = None
     for name, fn in providers:
@@ -420,6 +479,7 @@ def _provider_status():
         "🟢 NVIDIA"     if nvidia_ai      else "⚪ NVIDIA",
         "🟢 DeepSeek"   if deepseek_ai   else "⚪ DeepSeek",
         "🟢 Gemini"     if gemini_ai      else "⚪ Gemini",
+        "🟢 HF"         if hf_ai          else "⚪ HF",
     ])
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1898,6 +1958,32 @@ if _page == "📢 Opportunities":
 
             st.divider()
 
+            # ── Category badge (HF zero-shot) ─────────────────────────────────
+            _cat = str(_row.get("category") or "").strip()
+            if not _cat or _cat in ("nan", "None"):
+                if hf_ai:
+                    _cat_key = f"opp_cat_{_row.get('id', _idx)}"
+                    if _cat_key not in st.session_state:
+                        _cat_text = f"{_row.get('title','')} {str(_row.get('description',''))[:300]}"
+                        with st.spinner("Classifying…"):
+                            _cat_result = _hf_classify_tender(_cat_text)
+                        st.session_state[_cat_key] = _cat_result
+                        if _cat_result:
+                            try:
+                                supabase.table("sa_tenders").update(
+                                    {"category": _cat_result}
+                                ).eq("id", str(_row["id"])).execute()
+                            except Exception:
+                                pass
+                    _cat = st.session_state.get(_cat_key, "")
+            if _cat and _cat not in ("nan", "None"):
+                st.markdown(
+                    f"<span style='background:#1565c0;color:#fff;padding:2px 10px;"
+                    f"border-radius:10px;font-size:0.8rem'>🏷️ {_cat}</span>",
+                    unsafe_allow_html=True,
+                )
+                st.write("")
+
             # Action buttons
             _a1, _a2, _a3 = st.columns(3)
             with _a1:
@@ -1937,6 +2023,53 @@ if _page == "📢 Opportunities":
                             st.rerun()
                         except Exception as _se:
                             st.error(f"Scoring failed: {_se}")
+
+            # ── Semantic similarity search ─────────────────────────────────────
+            if hf_ai:
+                _sim_key = f"opp_sim_{_row.get('id', _idx)}"
+                if st.button("🔍 Find similar tenders", key=f"opp_sim_btn_{_idx}",
+                             use_container_width=True):
+                    _embed_text = f"{_row.get('title','')} {str(_row.get('description',''))[:800]}"
+                    with st.spinner("Generating embedding…"):
+                        _qvec = _hf_embed(_embed_text)
+                    if _qvec:
+                        # Store embedding on this tender if missing
+                        try:
+                            if not _row.get("embedding"):
+                                supabase.table("sa_tenders").update(
+                                    {"embedding": _qvec}
+                                ).eq("id", str(_row["id"])).execute()
+                        except Exception:
+                            pass
+                        # Query similar tenders via pgvector RPC
+                        with st.spinner("Searching…"):
+                            try:
+                                _sim_rows = supabase.rpc("match_tenders", {
+                                    "query_embedding": _qvec,
+                                    "match_threshold": 0.4,
+                                    "match_count": 5,
+                                    "exclude_id": str(_row["id"]),
+                                }).execute().data or []
+                                st.session_state[_sim_key] = _sim_rows
+                            except Exception as _se2:
+                                st.error(f"Similarity search: {_se2}")
+                                st.session_state[_sim_key] = []
+                    else:
+                        st.warning("HF embedding failed — check HF_TOKEN.")
+
+                _sim_results = st.session_state.get(_sim_key, [])
+                if _sim_results:
+                    st.markdown("**Similar tenders**")
+                    for _sr in _sim_results:
+                        _sscore = int(_sr.get("ai_score") or 0)
+                        _ssim   = float(_sr.get("similarity") or 0)
+                        st.caption(
+                            f"{'🔴' if _sscore >= 8 else '🟡' if _sscore >= 5 else '⚪'} "
+                            f"**{_sr.get('title','?')}**  ·  {_sr.get('country','?')}"
+                            f"  ·  score {_sscore}  ·  {_ssim:.0%} similar"
+                        )
+                elif _sim_key in st.session_state and not _sim_results:
+                    st.caption("No similar tenders found yet — embed more tenders first.")
 
             # ── Copy ──────────────────────────────────────────────────────────
             _opp_copy_lines = [

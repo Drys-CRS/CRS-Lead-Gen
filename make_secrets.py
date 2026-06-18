@@ -22,7 +22,7 @@ ALLOWED_KEYS = [
     "MONDAY_API_KEY",
     # AI providers (cascade)
     "GEMINI_API_KEY", "GROQ_API_KEY", "CEREBRAS_API_KEY", "OPENROUTER_API_KEY",
-    "GITHUB_TOKEN", "GH_PAT", "NVIDIA_API_KEY", "DEEPSEEK_API_KEY",
+    "GITHUB_TOKEN", "GH_PAT", "NVIDIA_API_KEY", "DEEPSEEK_API_KEY", "HF_TOKEN",
     # Lead enrichment / verification
     "APOLLO_API_KEY", "APOLLO_MCP_TOKEN", "LUSHA_API_KEY", "HUNTER_API_KEY",
     # Threat intel / news
