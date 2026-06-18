@@ -2521,24 +2521,6 @@ if _page == "✅ Lead Verification":
         else:
             st.markdown(f"**{len(_lk_results)} contacts found**")
 
-            # ── Decision-maker search → routes to dedicated DM tab ──────────
-            if _has_apo and _lk_c_val.strip():
-                _lv_sol_col, _lv_btn_col = st.columns([3, 2])
-                with _lv_sol_col:
-                    _lv_dm_sol = st.selectbox(
-                        "CRS solution focus",
-                        list(_CRS_DM_TITLES.keys()),
-                        key="lv_dm_sol",
-                    )
-                with _lv_btn_col:
-                    st.write(""); st.write("")
-                    if st.button("👥 Find decision makers →", key="lv_dm_go",
-                                 type="primary", use_container_width=True):
-                        _queue_dm_and_go(
-                            company=_lk_c_val, solution=_lv_dm_sol,
-                            num=10, source="✅ Lead Verification",
-                        )
-
         def _render_lk_cards(cards: list, key_prefix: str) -> None:
             for _ci, _cc in enumerate(cards):
                 _apo_id  = _cc.get("id", "")
@@ -2761,6 +2743,26 @@ if _page == "✅ Lead Verification":
 
         if _lk_results:
             _render_lk_cards(_lk_results, "main")
+
+        # ── Decision-maker search — separate section below contact results ──
+        if _has_apo and _lk_c_val.strip():
+            st.divider()
+            st.markdown("#### 👥 Find Decision Makers")
+            _lv_sol_col, _lv_btn_col = st.columns([3, 2])
+            with _lv_sol_col:
+                _lv_dm_sol = st.selectbox(
+                    "CRS solution focus",
+                    list(_CRS_DM_TITLES.keys()),
+                    key="lv_dm_sol",
+                )
+            with _lv_btn_col:
+                st.write(""); st.write("")
+                if st.button("👥 Find decision makers →", key="lv_dm_go",
+                             type="primary", use_container_width=True):
+                    _queue_dm_and_go(
+                        company=_lk_c_val, solution=_lv_dm_sol,
+                        num=10, source="✅ Lead Verification",
+                    )
 
     # ══════════════════════════════════════════════════════════════════════════
     # PIPELINE VERIFICATION LOG
