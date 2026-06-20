@@ -364,6 +364,13 @@ OCDS_REGISTRY = {
     "Nigeria (Plateau)":      (125, "🇳🇬"),
 }
 
+# Countries that have live OCDS REST APIs — preferred over stale annual batch
+# downloads from the registry. _scrape_ocds_live_api() handles these.
+LIVE_OCDS_APIS = {
+    "Rwanda":   ("https://ocds.umucyo.gov.rw/core/api", "🇷🇼"),
+    "Tanzania": ("https://data.nest.go.tz/api",          "🇹🇿"),
+}
+
 NON_OCDS_COUNTRIES = {
     "Angola": ("🇦🇴", "Southern Africa"), "Botswana": ("🇧🇼", "Southern Africa"),
     "Egypt": ("🇪🇬", "North Africa"), "Eritrea": ("🇪🇷", "East Africa"),
@@ -747,6 +754,360 @@ def scrape_non_ocds_countries(log):
             pass
 
     log(f"  🌍 Non-OCDS countries: {total_open} open + {total_awarded} awarded tenders collected")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# LIVE OCDS REST API + NEW SOURCES
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _scrape_ocds_live_api(country: str, api_base: str, flag: str, log,
+                           months_back: int = 18) -> dict:
+    """Generic live OCDS REST API scraper for DRF-based portals (Rwanda, Tanzania).
+
+    Paginates GET {api_base}/releases/?format=json&page_size=100&page=N ordered
+    by date descending, stops when releases fall outside months_back window.
+    Raises on page-1 failure so the caller can fall back to OCDS registry.
+    """
+    today  = _dt.datetime.now(_dt.timezone.utc).date().isoformat()
+    cutoff = (_dt.datetime.now(_dt.timezone.utc)
+              - _dt.timedelta(days=months_back * 30)).date().isoformat()
+
+    open_records: list    = []
+    awarded_records: list = []
+    seen_awarded: set     = set()
+    page = total_scanned = relevant_hits = 0
+
+    log(f"{flag} {country}: live OCDS API → {api_base}/releases/…")
+
+    while True:
+        page += 1
+        try:
+            data = _get_json(f"{api_base}/releases/", params={
+                "format": "json", "page_size": 100, "page": page,
+                "ordering": "-date",
+            }, timeout=40)
+        except Exception as e:
+            if page == 1:
+                raise   # let caller trigger OCDS fallback
+            log(f"  ⚠️ {country} API page {page} failed ({e}) — stopping")
+            break
+
+        releases = (data.get("results") if isinstance(data, dict) else data) or []
+        if not releases:
+            break
+
+        stop_early = False
+        for rel in releases:
+            total_scanned += 1
+            tender   = rel.get("tender") or {}
+            title    = tender.get("title") or ""
+            desc     = tender.get("description") or title
+            category = tender.get("mainProcurementCategory") or ""
+            rel_date = (rel.get("date") or "")[:10]
+
+            if rel_date and rel_date < cutoff:
+                stop_early = True
+                break
+
+            if not _is_relevant(f"{title} {desc} {category}"):
+                continue
+            relevant_hits += 1
+
+            buyer = ((rel.get("buyer") or {}).get("name")
+                     or (tender.get("procuringEntity") or {}).get("name", ""))
+            ocid      = rel.get("ocid", "")
+            tender_id = tender.get("id") or ocid
+            period    = tender.get("tenderPeriod") or {}
+            end_date  = _clean_ocds_date(period.get("endDate")) or ""
+            start_date = _clean_ocds_date(
+                period.get("startDate") or rel_date) or ""
+
+            _cp = _ce = _ph = ""
+            for party in (rel.get("parties") or []):
+                if any(r in ["buyer", "procuringEntity"]
+                       for r in (party.get("roles") or [])):
+                    cp  = party.get("contactPoint") or {}
+                    _cp = str(cp.get("name")      or "")[:200]
+                    _ce = str(cp.get("email")      or "")[:200]
+                    _ph = str(cp.get("telephone")  or "")[:50]
+                    break
+
+            portal = api_base.split("/api")[0].split("/core")[0]
+            base = {
+                "tender_number":   str(tender_id)[:100],
+                "department_name": str(buyer)[:200],
+                "title":           str(title or desc)[:200],
+                "description":     str(desc),
+                "category":        str(category),
+                "portal_link":     portal,
+                "country":         country,
+                "contact_person":  _cp,
+                "contact_email":   _ce,
+                "contact_phone":   _ph,
+            }
+
+            status = (tender.get("status") or "").lower()
+            if (end_date >= today
+                    and status not in ("cancelled", "unsuccessful", "withdrawn")):
+                open_records.append({
+                    **base,
+                    "compliance_requirements": (
+                        tender.get("submissionMethodDetails") or "See portal"),
+                    "issue_date":  start_date or None,
+                    "closing_date": end_date,
+                    "status": "Open", "award_status": "Published",
+                })
+
+            for aw in (rel.get("awards") or []):
+                award_date = _clean_ocds_date(aw.get("date") or rel_date) or ""
+                suppliers  = aw.get("suppliers") or []
+                winner = (suppliers[0].get("name", "Unknown")
+                          if suppliers else "Not Disclosed")
+                val    = aw.get("value") or {}
+                amount = (f"{val.get('currency','')} {val.get('amount','')}".strip()
+                          if val else "Not Disclosed")
+                key = f"{tender_id}|{winner}"
+                if key in seen_awarded:
+                    continue
+                seen_awarded.add(key)
+                awarded_records.append({
+                    **base, "status": "Awarded",
+                    "winning_bidder": str(winner)[:200],
+                    "award_value":    amount or "Not Disclosed",
+                    "issue_date":     award_date or None,
+                })
+
+        if stop_early or not (isinstance(data, dict) and data.get("next")):
+            break
+        if page >= 100:   # safety cap — 10 000 releases max
+            break
+
+    supabase.table("sa_tenders").delete().eq("status", "Open").eq("country", country).execute()
+    n_open    = _upsert(open_records,    country, "Open (live API)",    log)
+    n_awarded = _upsert_awarded(awarded_records, country, "Awarded (live API)", log)
+    log(f"  📊 {country}: {total_scanned:,} releases · {relevant_hits:,} relevant · "
+        f"{n_open} open + {n_awarded} awarded")
+    return {"open": n_open, "awarded": n_awarded}
+
+
+def scrape_nigeria_nocopo(log, years_back: int = 1) -> dict:
+    """Nigeria NOCOPO (National Open Contracting Portal) — 700+ MDAs.
+
+    Tries NOCOPO's public API endpoints first; falls back to OCDS registry.
+    """
+    country, flag = "Nigeria", "🇳🇬"
+    for api_url in [
+        "https://nocopo.bpp.gov.ng/api/tenders",
+        "https://nocopo.bpp.gov.ng/api/v1/tenders",
+        "https://nocopo.bpp.gov.ng/tenders.json",
+    ]:
+        try:
+            raw  = _get_json(api_url, params={"status": "open", "limit": 500}, timeout=20)
+            items = (raw if isinstance(raw, list)
+                     else raw.get("data") or raw.get("tenders") or [])
+            if not items:
+                continue
+            today = _dt.datetime.now(_dt.timezone.utc).date().isoformat()
+            open_records, awarded_records = [], []
+            for t in items:
+                title = str(t.get("title") or t.get("name") or "")[:200]
+                if not _is_relevant(f"{title} {t.get('category', '')}"):
+                    continue
+                deadline = str(t.get("deadline") or t.get("closing_date") or "")[:10]
+                stat     = str(t.get("status") or "").lower()
+                ref      = str(t.get("id") or t.get("ref") or "")[:100]
+                base = {
+                    "tender_number":   ref,
+                    "department_name": str(t.get("entity") or t.get("buyer") or "")[:200],
+                    "title": title, "description": title,
+                    "category": str(t.get("category") or "")[:100],
+                    "portal_link": "https://nocopo.bpp.gov.ng",
+                    "country": country,
+                    "contact_person": "", "contact_email": "", "contact_phone": "",
+                }
+                if stat == "awarded":
+                    awarded_records.append({
+                        **base, "status": "Awarded",
+                        "winning_bidder": str(
+                            t.get("winner") or t.get("supplier") or "Unknown")[:200],
+                        "award_value": str(t.get("amount") or "Not Disclosed"),
+                        "issue_date": deadline or None,
+                    })
+                elif not deadline or deadline >= today:
+                    open_records.append({
+                        **base,
+                        "compliance_requirements": "See NOCOPO portal",
+                        "closing_date": deadline or None,
+                        "status": "Open", "award_status": "Published",
+                    })
+            supabase.table("sa_tenders").delete().eq("status", "Open").eq("country", country).execute()
+            n_open    = _upsert(open_records,    country, "Open (NOCOPO)",    log)
+            n_awarded = _upsert_awarded(awarded_records, country, "Awarded (NOCOPO)", log)
+            log(f"  {flag} {country}: NOCOPO API → {n_open} open + {n_awarded} awarded")
+            return {"open": n_open, "awarded": n_awarded}
+        except Exception:
+            continue
+
+    log(f"  {flag} {country}: NOCOPO not reachable — falling back to OCDS registry…")
+    return scrape_ocds_country(country, log, years_back)
+
+
+def scrape_ungm_africa(log) -> dict:
+    """UN Global Marketplace — open procurement notices from UN agencies in Africa.
+
+    Posts to the UNGM public notice search per African country code, filtering
+    for notices with a future deadline. Good source for ICT/cyber/training
+    tenders funded by the UN system.
+    """
+    today = _dt.datetime.now(_dt.timezone.utc).date().isoformat()
+
+    AFRICA_CC = {
+        "ZA": "South Africa", "KE": "Kenya",    "NG": "Nigeria",    "GH": "Ghana",
+        "TZ": "Tanzania",     "UG": "Uganda",    "ZM": "Zambia",     "RW": "Rwanda",
+        "MZ": "Mozambique",   "NA": "Namibia",   "BW": "Botswana",   "ZW": "Zimbabwe",
+        "EG": "Egypt",        "ET": "Ethiopia",  "MW": "Malawi",     "AO": "Angola",
+        "SZ": "Eswatini",     "LS": "Lesotho",   "MU": "Mauritius",  "SN": "Senegal",
+        "CI": "Côte d'Ivoire","CM": "Cameroon",  "SL": "Sierra Leone","LR": "Liberia",
+    }
+
+    open_records: list = []
+    total_found = relevant_found = 0
+    log("🌐 UNGM: fetching UN procurement notices for Africa…")
+
+    for cc, country in AFRICA_CC.items():
+        try:
+            r = requests.post(
+                "https://www.ungm.org/Public/Notice/Search",
+                json={"DeadlineFrom": today, "Countries": [cc],
+                      "pageSize": 50, "pageIndex": 0},
+                headers={"Accept": "application/json",
+                         "Content-Type": "application/json",
+                         "User-Agent": "Mozilla/5.0"},
+                timeout=20,
+            )
+            if not r.ok:
+                continue
+            payload  = r.json()
+            notices  = (payload if isinstance(payload, list)
+                        else payload.get("notices") or payload.get("data") or [])
+            for n in notices:
+                total_found += 1
+                title = str(n.get("title") or n.get("Title") or "")[:200]
+                if not _is_relevant(title):
+                    continue
+                relevant_found += 1
+                deadline  = str(n.get("deadline")        or n.get("Deadline")        or "")[:10]
+                ref       = str(n.get("reference")       or n.get("ReferenceNumber") or "")
+                notice_id = str(n.get("id")              or n.get("noticeId")        or ref)
+                agency    = str(n.get("agencyName")      or n.get("Agency")          or "UN")[:200]
+                portal    = (f"https://www.ungm.org/Public/Notice/{notice_id}"
+                             if notice_id else "https://www.ungm.org/Public/Notice")
+                open_records.append({
+                    "tender_number":           f"UNGM-{ref or notice_id}"[:100],
+                    "department_name":         agency,
+                    "title":                   title,
+                    "description":             str(n.get("description") or title),
+                    "category":                str(n.get("noticeType") or n.get("type") or "")[:100],
+                    "portal_link":             portal,
+                    "country":                 country,
+                    "compliance_requirements": "See UNGM portal",
+                    "closing_date":            deadline or None,
+                    "status":                  "Open",
+                    "award_status":            "Published",
+                    "contact_person":          "",
+                    "contact_email":           "",
+                    "contact_phone":           "",
+                })
+        except Exception:
+            continue
+
+    n_open = 0
+    if open_records:
+        supabase.table("sa_tenders").delete().like("tender_number", "UNGM-%").execute()
+        n_open = _upsert(open_records, "Africa (UN)", "Open (UNGM)", log)
+    log(f"  🌐 UNGM: {total_found} notices · {relevant_found} relevant · {n_open} saved")
+    return {"open": n_open, "awarded": 0}
+
+
+def scrape_afdb(log) -> dict:
+    """African Development Bank — procurement notices + contract awards.
+
+    Hits the AfDB public procurement search for open notices and contract awards
+    in ICT/cyber/training categories across all African member countries.
+    """
+    log("🏦 AfDB: fetching procurement notices and contract awards…")
+    open_records, awarded_records = [], []
+    today = _dt.datetime.now(_dt.timezone.utc).date().isoformat()
+
+    # AfDB procurement notices are served through their public search API
+    for notice_type, is_award in [("REQUEST_FOR_PROPOSALS", False),
+                                   ("INVITATION_FOR_BIDS",  False),
+                                   ("CONTRACT_AWARD",       True)]:
+        try:
+            r = requests.get(
+                "https://www.afdb.org/api/project-procurement",
+                params={"noticeType": notice_type, "language": "en",
+                        "page": 0, "size": 200},
+                headers={"User-Agent": "Mozilla/5.0",
+                         "Accept": "application/json"},
+                timeout=30,
+            )
+            if not r.ok:
+                continue
+            data  = r.json()
+            items = data.get("content") or data.get("results") or []
+            for item in items:
+                title   = str(item.get("title")        or item.get("projectTitle") or "")[:200]
+                if not _is_relevant(title):
+                    continue
+                country = str(item.get("country")      or item.get("countries")    or "Africa")[:100]
+                ref     = str(item.get("referenceNumber") or item.get("id")        or "")
+                entity  = str(item.get("entity")       or "AfDB")[:200]
+                sector  = str(item.get("sector")       or item.get("category")     or "")[:100]
+                base = {
+                    "tender_number":   f"AfDB-{ref}"[:100],
+                    "department_name": entity,
+                    "title":           title,
+                    "description":     str(item.get("description") or title),
+                    "category":        sector,
+                    "portal_link":     "https://www.afdb.org/en/documents/project-related-procurement",
+                    "country":         country,
+                    "contact_person":  "", "contact_email": "", "contact_phone": "",
+                }
+                if is_award:
+                    winner = str(item.get("supplierName") or item.get("awardee")
+                                 or "Not Disclosed")[:200]
+                    amt    = str(item.get("contractAmount") or item.get("amount")
+                                 or "Not Disclosed")
+                    cur    = str(item.get("currency") or "")
+                    if cur and not amt.startswith(cur):
+                        amt = f"{cur} {amt}"
+                    awarded_records.append({
+                        **base, "status": "Awarded",
+                        "winning_bidder": winner,
+                        "award_value":    amt,
+                        "issue_date":     str(item.get("awardDate") or "")[:10] or None,
+                    })
+                else:
+                    deadline = str(item.get("deadline") or item.get("closingDate") or "")[:10]
+                    if deadline and deadline < today:
+                        continue
+                    open_records.append({
+                        **base,
+                        "compliance_requirements": "See AfDB portal",
+                        "closing_date": deadline or None,
+                        "status": "Open", "award_status": "Published",
+                    })
+        except Exception:
+            continue
+
+    n_open = 0
+    if open_records:
+        supabase.table("sa_tenders").delete().like("tender_number", "AfDB-%").execute()
+        n_open = _upsert(open_records, "Africa (AfDB)", "Open (AfDB)", log)
+    n_awarded = _upsert_awarded(awarded_records, "Africa (AfDB)", "Awards (AfDB)", log)
+    log(f"  🏦 AfDB: {n_open} open notices + {n_awarded} contract awards saved")
+    return {"open": n_open, "awarded": n_awarded}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1624,6 +1985,10 @@ def run_scrape(log, years_back: int = 1,
         _work.append(_c)
     if include_non_ocds and "__non_ocds__" not in _done_set:
         _work.append("__non_ocds__")
+    if include_non_ocds and "__ungm__" not in _done_set:
+        _work.append("__ungm__")
+    if include_non_ocds and "__afdb__" not in _done_set:
+        _work.append("__afdb__")
 
     _total    = len(_work)
     _n_done   = [0]
@@ -1647,6 +2012,35 @@ def run_scrape(log, years_back: int = 1,
                 log("🌍 Scraping non-OCDS countries via World Bank & UNDP…")
                 scrape_non_ocds_countries(log)
                 ok = True
+            elif item == "__ungm__":
+                scrape_ungm_africa(log)
+                ok = True
+            elif item == "__afdb__":
+                scrape_afdb(log)
+                ok = True
+            elif item == "Nigeria":
+                try:
+                    scrape_nigeria_nocopo(log, years_back)
+                    ok = True
+                except Exception as _e:
+                    log(f"  ⚠️ Nigeria NOCOPO failed ({_e}) — falling back to OCDS registry…")
+                    try:
+                        scrape_ocds_country("Nigeria", log, years_back)
+                        ok = True
+                    except Exception as _e2:
+                        log(f"  ❌ Nigeria OCDS fallback also failed: {_e2}")
+            elif item in LIVE_OCDS_APIS:
+                api_base, flag = LIVE_OCDS_APIS[item]
+                try:
+                    _scrape_ocds_live_api(item, api_base, flag, log)
+                    ok = True
+                except Exception as _e:
+                    log(f"  ⚠️ {item} live API failed ({_e}) — falling back to OCDS registry…")
+                    try:
+                        scrape_ocds_country(item, log, years_back)
+                        ok = True
+                    except Exception as _e2:
+                        log(f"  ❌ {item} OCDS fallback also failed: {_e2}")
             else:
                 scrape_ocds_country(item, log, years_back)
                 ok = True
@@ -1656,7 +2050,10 @@ def run_scrape(log, years_back: int = 1,
             with _lock:
                 _n_done[0] += 1
                 if progress_cb and _total > 0:
-                    _label = "Non-OCDS" if item == "__non_ocds__" else item
+                    _label = ("Non-OCDS" if item == "__non_ocds__"
+                              else "UNGM"  if item == "__ungm__"
+                              else "AfDB"  if item == "__afdb__"
+                              else item)
                     progress_cb(_n_done[0] / _total, _label)
             if ok and checkpoint_cb:
                 try:
