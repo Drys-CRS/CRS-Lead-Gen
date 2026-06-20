@@ -1219,15 +1219,14 @@ def _cascade_find_contact(name: str, linkedin_url: str,
     if st.secrets.get("APOLLO_API_KEY", "") or os.getenv("APOLLO_API_KEY", ""):
         try:
             apo = _apollo_match(name, linkedin_url)
-            if apo.get("email"):
-                email = apo["email"]; email_srcs.append("Apollo")
-            _aph = apo.get("phone_numbers") or []
-            if _aph:
-                phone = _aph[0]; phone_srcs.append("Apollo")
-            title  = apo.get("title") or None
-            _org   = apo.get("organization") or {}
-            comp   = _org.get("name") or apo.get("organization_name") or None
-            domain = _org.get("primary_domain") or None
+            n   = _norm_apollo(apo)
+            if n.get("email"):
+                email = n["email"]; email_srcs.append("Apollo")
+            if n.get("phone"):
+                phone = n["phone"]; phone_srcs.append("Apollo")
+            title  = n.get("title") or None
+            comp   = n.get("company") or None
+            domain = n.get("domain") or None
         except Exception:
             pass
 
