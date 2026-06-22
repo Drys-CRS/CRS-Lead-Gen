@@ -802,7 +802,10 @@ def _apollo_match(name: str = "", linkedin_url: str = "",
                   company: str = "", email: str = "",
                   apollo_id: str = "") -> dict:
     """People enrichment — 1 credit per matched person."""
-    payload: dict = {"reveal_personal_emails": True, "reveal_phone_number": True}
+    # reveal_phone_number requires a webhook URL (async delivery) — not usable
+    # in a synchronous Streamlit call, so we omit it and extract whatever phone
+    # data Apollo returns naturally in phone_numbers / mobile_phone.
+    payload: dict = {"reveal_personal_emails": True}
     if apollo_id:
         # Apollo ID is sufficient — don't also send potentially obfuscated
         # name/company strings, which cause a 400 Bad Request.
