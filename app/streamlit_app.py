@@ -857,27 +857,46 @@ def _apollo_phone_cache_lookup(apollo_id: str) -> str:
         return ""
 
 
-def _apollo_request_phone_reveal(apollo_id: str) -> bool:
+def _apollo_request_phone_reveal(apollo_id: str) -> dict:
     """POST people/match with reveal_phone_number=True + our Supabase webhook URL.
-    Apollo processes asynchronously and POSTs back to the Edge Function.
-    Returns True if the request was dispatched without error."""
+    Returns {"ok": bool, "phone": str, "error": str}.
+    - If Apollo has the number already, it returns it inline → "phone" is set.
+    - If async lookup is triggered, Apollo will POST to the Edge Function later.
+    - "error" is set (non-empty) if the request itself failed."""
+    import datetime as _dt
     sup_url = st.secrets.get("SUPABASE_URL", "")
-    if not sup_url or not apollo_id:
-        return False
+    if not sup_url:
+        return {"ok": False, "phone": "", "error": "SUPABASE_URL secret not set"}
+    if not apollo_id:
+        return {"ok": False, "phone": "", "error": "No Apollo ID for this contact"}
     webhook_url = f"{sup_url}/functions/v1/apollo-phone-webhook"
     secret = st.secrets.get("APOLLO_WEBHOOK_SECRET", "")
     if secret:
         webhook_url += f"?secret={_urlparse.quote(secret)}"
     try:
-        _apollo_post("people/match", {
-            "id":                   apollo_id,
-            "reveal_phone_number":  True,
+        raw  = _apollo_post("people/match", {
+            "id":                    apollo_id,
+            "reveal_phone_number":   True,
             "reveal_personal_emails": False,
-            "webhook_url":          webhook_url,
+            "webhook_url":           webhook_url,
         })
-        return True
-    except Exception:
-        return False
+        person = raw.get("person") or {}
+        n      = _norm_apollo(person)
+        phone  = n.get("phone", "")
+        if phone:
+            # Apollo returned the number inline — write to cache immediately
+            try:
+                _supabase.table("apollo_phone_cache").upsert({
+                    "apollo_id":    apollo_id,
+                    "phone":        phone,
+                    "raw_number":   phone,
+                    "retrieved_at": _dt.datetime.utcnow().isoformat(),
+                }).execute()
+            except Exception:
+                pass
+        return {"ok": True, "phone": phone, "error": ""}
+    except Exception as _e:
+        return {"ok": False, "phone": "", "error": str(_e)}
 
 
 @st.cache_data(ttl=300)
@@ -2669,11 +2688,18 @@ if _page == "✅ Lead Verification":
                                        else "📞 Unknown")
                             if st.button("📞 Reveal phone number", key=f"lk_ph_reveal_{key_prefix}_{_ci}",
                                          use_container_width=True):
-                                if _apollo_request_phone_reveal(_apo_id):
-                                    st.session_state[_ph_pending_sk] = True
+                                with st.spinner("Requesting from Apollo…"):
+                                    _rv = _apollo_request_phone_reveal(_apo_id)
+                                if _rv["error"]:
+                                    st.warning(f"Apollo error: {_rv['error'][:120]}")
+                                elif _rv["phone"]:
+                                    # Returned inline — show immediately
+                                    st.session_state[_ph_sk] = {"phone": _rv["phone"], "source": "Apollo"}
                                     st.rerun()
                                 else:
-                                    st.warning("Phone reveal failed — check SUPABASE_URL secret")
+                                    # Async — Apollo will POST to webhook
+                                    st.session_state[_ph_pending_sk] = True
+                                    st.rerun()
                         else:
                             st.caption("📞 No Apollo ID — can't reveal")
                         _cph = _cc.get("company_phone") or _enr_data.get("company_phone","")
