@@ -813,7 +813,7 @@ def _apollo_match(name: str = "", linkedin_url: str = "",
 
 def _enrich_contact(apollo_id: str = "", name: str = "",
                     linkedin: str = "", company: str = "") -> dict:
-    """Unified enrich: Apollo match (email + any phone in DB) then Lusha phone fallback.
+    """Enrich via Apollo people/match (reveals email + phone).
     Returns {name, email, phone, sources: list[str]}."""
     result: dict = {"name": "", "email": "", "phone": "", "sources": []}
 
@@ -833,23 +833,6 @@ def _enrich_contact(apollo_id: str = "", name: str = "",
             result["sources"].append("Apollo (phone)")
     except Exception as _ae:
         result["_apollo_err"] = str(_ae)
-
-    # Step 2: Lusha phone fallback (uses its own credit, only if LinkedIn URL known)
-    if not result["phone"] and linkedin:
-        try:
-            _lk = st.secrets.get("LUSHA_API_KEY", "") or os.getenv("LUSHA_API_KEY", "")
-            if _lk:
-                _lr = _lusha_lookup(linkedin)
-                # Lusha v2 API returns camelCase: phoneNumbers[].internationalNumber
-                _lph = (_lr.get("phoneNumbers") or [])
-                if _lph:
-                    _lpv = (_lph[0].get("internationalNumber")
-                            or _lph[0].get("localNumber", ""))
-                    if _lpv:
-                        result["phone"] = _lpv
-                        result["sources"].append("Lusha")
-        except Exception:
-            pass
 
     return result
 
@@ -897,16 +880,6 @@ def _hunter_find(first: str, last: str, domain: str) -> dict:
            f"&api_key={key}")
     with _urlreq.urlopen(url, timeout=15) as r:
         return json.loads(r.read()).get("data") or {}
-
-
-def _lusha_lookup(linkedin_url: str) -> dict:
-    key = st.secrets.get("LUSHA_API_KEY", "") or os.getenv("LUSHA_API_KEY", "")
-    if not key:
-        return {}
-    url = f"https://api.lusha.com/v2/person?linkedInUrl={_urlparse.quote(linkedin_url)}"
-    req = _urlreq.Request(url, headers={"Api-Key": key})
-    with _urlreq.urlopen(req, timeout=15) as r:
-        return json.loads(r.read()) or {}
 
 
 # ── Contact lookup helpers ────────────────────────────────────────────────────
@@ -1194,7 +1167,7 @@ def _calc_contact_confidence(email: str, email_sources: list, phone: str) -> int
             m = re.search(r"Hunter.*?(\d+)%", str(email_sources))
             if m:
                 score += max(20, int(int(m.group(1)) * 0.85))
-            elif any(s in str(email_sources) for s in ("Apollo", "Lusha")):
+            elif "Apollo" in str(email_sources):
                 score += 65
             else:
                 score += 20
@@ -1222,7 +1195,7 @@ def _auto_crm_check(name: str, email: str, linkedin: str, state_key: str) -> dic
 
 def _cascade_find_contact(name: str, linkedin_url: str,
                            company: str = "", domain_hint: str = "") -> dict:
-    """Apollo → Hunter → Lusha → pattern-guess. Returns aggregated contact data + confidence."""
+    """Apollo → Hunter → pattern-guess. Returns aggregated contact data + confidence."""
     email = phone = title = comp = domain = None
     email_srcs: list = []
     phone_srcs: list = []
@@ -1258,25 +1231,6 @@ def _cascade_find_contact(name: str, linkedin_url: str,
                     email_srcs.append(label)
                     if h_score > 85:
                         email = h_email
-        except Exception:
-            pass
-
-    # ── Lusha ───────────────────────────────────────────────────────────────
-    if st.secrets.get("LUSHA_API_KEY", "") or os.getenv("LUSHA_API_KEY", ""):
-        try:
-            ldata = _lusha_lookup(linkedin_url)
-            _le = ldata.get("emailAddresses") or []
-            _lp = ldata.get("phoneNumbers") or []
-            if _le:
-                _lem = _le[0] if isinstance(_le[0], str) else _le[0].get("validatedEmail", "")
-                if _lem:
-                    email_srcs.append("Lusha")
-                    if not email:
-                        email = _lem
-            if _lp and not phone:
-                _lph = _lp[0] if isinstance(_lp[0], str) else _lp[0].get("internationalNumber", "")
-                if _lph:
-                    phone = _lph; phone_srcs.append("Lusha")
         except Exception:
             pass
 
@@ -3198,7 +3152,7 @@ def _as_list(v) -> list:
     except Exception: return []
 
 if _page == "🔍 LinkedIn Dork":
-    _colored_header(label="LinkedIn Lead Discovery", description="Dork LinkedIn profiles, cache enrichment in Supabase, auto-check Monday CRM, find contact info via Apollo / Hunter / Lusha, edit fields, then push to Monday.", color_name="blue-30")
+    _colored_header(label="LinkedIn Lead Discovery", description="Dork LinkedIn profiles, cache enrichment in Supabase, auto-check Monday CRM, find contact info via Apollo / Hunter, edit fields, then push to Monday.", color_name="blue-30")
 
     _DORK_SOLUTIONS = {
         "Cybersecurity (general)":         "cybersecurity information security",
@@ -3272,14 +3226,11 @@ if _page == "🔍 LinkedIn Dork":
     _has_serper = bool(st.secrets.get("SERPAPI_API_KEY", "") or os.getenv("SERPAPI_API_KEY", ""))
     _has_apollo = bool(st.secrets.get("APOLLO_API_KEY", "") or os.getenv("APOLLO_API_KEY", ""))
     _has_hunter = bool(st.secrets.get("HUNTER_API_KEY", "") or os.getenv("HUNTER_API_KEY", ""))
-    _has_lusha  = bool(st.secrets.get("LUSHA_API_KEY",  "") or os.getenv("LUSHA_API_KEY",  ""))
-
     st.caption(" · ".join([
         "🟢 Google CSE" if _has_google else "⚪ Google CSE (need GOOGLE_API_KEY+GOOGLE_CSE_ID)",
         "🟢 SerpAPI"    if _has_serper else "⚪ SerpAPI",
         "🟢 Apollo"     if _has_apollo else "⚪ Apollo",
         "🟢 Hunter"     if _has_hunter else "⚪ Hunter",
-        "🟢 Lusha"      if _has_lusha  else "⚪ Lusha",
     ]))
 
     # ── Execute search ────────────────────────────────────────────────────────
