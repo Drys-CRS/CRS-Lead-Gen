@@ -803,11 +803,15 @@ def _apollo_match(name: str = "", linkedin_url: str = "",
                   apollo_id: str = "") -> dict:
     """People enrichment — 1 credit per matched person."""
     payload: dict = {"reveal_personal_emails": True, "reveal_phone_number": True}
-    if apollo_id:    payload["id"]               = apollo_id
-    if name:         payload["name"]              = name
-    if linkedin_url: payload["linkedin_url"]      = linkedin_url
-    if company:      payload["organization_name"] = company
-    if email:        payload["email"]             = email
+    if apollo_id:
+        # Apollo ID is sufficient — don't also send potentially obfuscated
+        # name/company strings, which cause a 400 Bad Request.
+        payload["id"] = apollo_id
+    else:
+        if name:         payload["name"]              = name
+        if linkedin_url: payload["linkedin_url"]      = linkedin_url
+        if company:      payload["organization_name"] = company
+        if email:        payload["email"]             = email
     return _apollo_post("people/match", payload).get("person") or {}
 
 
@@ -1141,13 +1145,13 @@ def _norm_apollo(p: dict) -> dict:
     email_status = p.get("email_status", "")
 
     # ── Name ─────────────────────────────────────────────────────────────────
+    # Show the best available form, even if partially obfuscated (e.g. "Wedlock C***").
+    # _enrich_contact will overwrite session state with the fully revealed name.
     name = p.get("name") or ""
-    if not name or "***" in name:
+    if not name:
         fn = p.get("first_name", "")
         ln = p.get("last_name") or p.get("last_name_obfuscated", "")
-        cand = f"{fn} {ln}".strip()
-        if cand and "***" not in cand:
-            name = cand
+        name = f"{fn} {ln}".strip()
 
     has_phone_raw = p.get("has_direct_phone", "")
     has_phone = ("yes"   if str(has_phone_raw).lower().startswith("yes")
