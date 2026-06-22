@@ -814,26 +814,22 @@ def _apollo_match(name: str = "", linkedin_url: str = "",
 def _enrich_contact(apollo_id: str = "", name: str = "",
                     linkedin: str = "", company: str = "") -> dict:
     """Enrich via Apollo people/match (reveals email + phone).
-    Returns {name, email, phone, sources: list[str]}."""
-    result: dict = {"name": "", "email": "", "phone": "", "sources": []}
-
-    # Step 1: Apollo people/match — always attempted first (1 export credit)
+    Returns full _norm_apollo dict plus sources list and optional _apollo_err."""
+    result: dict = {"name": "", "email": "", "work_email": "", "personal_email": "",
+                    "phone": "", "sources": []}
     try:
         raw = _apollo_match(apollo_id=apollo_id, name=name,
                             linkedin_url=linkedin, company=company)
         n = _norm_apollo(raw)
-        revealed = n.get("name", "")
-        if revealed and "***" not in revealed:
-            result["name"] = revealed
+        result.update(n)   # carry through all org/company fields
+        if n.get("name") and "***" not in n["name"]:
+            result["name"] = n["name"]
         if n.get("email"):
-            result["email"] = n["email"]
             result["sources"].append("Apollo")
         if n.get("phone"):
-            result["phone"] = n["phone"]
             result["sources"].append("Apollo (phone)")
     except Exception as _ae:
         result["_apollo_err"] = str(_ae)
-
     return result
 
 
@@ -1114,46 +1110,88 @@ def _score_org_for_crs(
 
 
 def _norm_apollo(p: dict) -> dict:
-    """Flatten an Apollo search or enrichment result into a standard contact dict.
-    Search results return first_name + last_name_obfuscated (no combined name field).
-    Enrichment results return name + email + phone_numbers."""
-    org    = p.get("organization") or {}
-    phones = p.get("phone_numbers") or []
-    phone  = ""
-    if phones:
-        ph0   = phones[0]
-        phone = ((ph0.get("sanitized_number") or ph0.get("raw_number"))
-                 if isinstance(ph0, dict) else str(ph0))
-    # people/match with reveal_phone_number returns mobile_phone directly
+    """Flatten an Apollo search or enrichment result into a standard contact dict."""
+    org = p.get("organization") or {}
+
+    # ── Phone — try every field Apollo uses ──────────────────────────────────
+    phone = ""
+    for ph in (p.get("phone_numbers") or []):
+        if isinstance(ph, dict):
+            phone = ph.get("sanitized_number") or ph.get("raw_number") or ph.get("number", "")
+        else:
+            phone = str(ph)
+        if phone:
+            break
     if not phone:
-        phone = p.get("mobile_phone") or p.get("direct_dial_number") or ""
+        phone = (p.get("mobile_phone") or p.get("direct_dial_number")
+                 or p.get("sanitized_phone") or p.get("phone") or "")
+
+    # ── Email — prefer business/work email; keep personal separately ─────────
+    # p["email"] is Apollo's primary (usually work) email.
+    # p["personal_emails"] are revealed personal emails (e.g. Gmail).
+    work_email     = p.get("email") or ""
     personal_emails = p.get("personal_emails") or []
-    email = (personal_emails[0] if personal_emails else p.get("email", ""))
-    email_status = ("verified" if personal_emails else p.get("email_status", ""))
+    personal_email  = personal_emails[0] if personal_emails else ""
+    # Strip obfuscated placeholder that Apollo returns before credit is spent
+    if work_email and "***" in work_email:
+        work_email = ""
+    if personal_email and "***" in personal_email:
+        personal_email = ""
+    email = work_email or personal_email
+    email_status = p.get("email_status", "")
+
+    # ── Name ─────────────────────────────────────────────────────────────────
     name = p.get("name") or ""
-    if not name:
+    if not name or "***" in name:
         fn = p.get("first_name", "")
         ln = p.get("last_name") or p.get("last_name_obfuscated", "")
-        name = f"{fn} {ln}".strip()
+        cand = f"{fn} {ln}".strip()
+        if cand and "***" not in cand:
+            name = cand
+
     has_phone_raw = p.get("has_direct_phone", "")
-    has_phone = ("yes" if str(has_phone_raw).lower().startswith("yes")
+    has_phone = ("yes"   if str(has_phone_raw).lower().startswith("yes")
                  else "maybe" if str(has_phone_raw).lower().startswith("maybe")
                  else "")
+
+    # ── Company / org enrichment ─────────────────────────────────────────────
+    tech_raw   = org.get("technologies") or []
+    tech_names = [t.get("name") or t.get("uid", "") for t in tech_raw
+                  if isinstance(t, dict)][:10]
+    keywords   = (org.get("keywords") or [])[:8]
+
     return {
-        "id":            p.get("id", ""),
-        "name":          name,
-        "title":         p.get("title", ""),
-        "email":         email,
-        "email_status":  email_status,
-        "has_email":     bool(p.get("has_email")),
-        "phone":         phone or "",
-        "has_phone":     has_phone,
-        "linkedin":      p.get("linkedin_url", ""),
-        "company":       org.get("name") or p.get("organization_name", ""),
-        "company_phone": org.get("phone", ""),
-        "domain":        org.get("primary_domain", ""),
-        "twitter":       p.get("twitter_url", ""),
-        "source":        "Apollo",
+        "id":             p.get("id", ""),
+        "name":           name,
+        "title":          p.get("title", ""),
+        # emails
+        "email":          email,
+        "work_email":     work_email,
+        "personal_email": personal_email,
+        "email_status":   email_status,
+        "has_email":      bool(p.get("has_email")),
+        # phone
+        "phone":          phone or "",
+        "has_phone":      has_phone,
+        # social
+        "linkedin":       p.get("linkedin_url", ""),
+        "twitter":        p.get("twitter_url", ""),
+        # company
+        "company":        org.get("name") or p.get("organization_name", ""),
+        "company_phone":  org.get("phone", ""),
+        "company_linkedin": org.get("linkedin_url", ""),
+        "domain":         org.get("primary_domain", ""),
+        "description":    org.get("short_description", ""),
+        "employees":      org.get("estimated_num_employees"),
+        "revenue":        org.get("annual_revenue_printed") or "",
+        "industry":       org.get("industry", ""),
+        "city":           org.get("city", ""),
+        "country":        org.get("country", ""),
+        "founded_year":   org.get("founded_year"),
+        "keywords":       keywords,
+        "tech_count":     len(tech_raw),
+        "tech_names":     tech_names,
+        "source":         "Apollo",
     }
 
 
@@ -2530,32 +2568,40 @@ if _page == "✅ Lead Verification":
                             else:
                                 st.caption("📋 Not in CRM")
 
-                    # ── Email + Phone row ─────────────────────────────────
-                    _em_val = (_cc.get("email") or _mon_email
+                    # ── Email + Phone ──────────────────────────────────────
+                    _enr_sk  = f"lk_enriched_{key_prefix}_{_ci}"
+                    _enr_data = st.session_state.get(_enr_sk, {})
+
+                    # Business email — prefer work_email, fall back to email
+                    _em_val = (_cc.get("work_email") or _cc.get("email") or _mon_email
+                               or _enr_data.get("work_email") or _enr_data.get("email")
                                or st.session_state.get(_em_sk, {}).get("email",""))
-                    _em_src = ("Apollo" if _cc.get("email")
-                               else "Monday" if _mon_email
-                               else st.session_state.get(_em_sk, {}).get("source",""))
+                    _em_src = ("Apollo" if (_cc.get("work_email") or _cc.get("email"))
+                               else "Monday" if _mon_email else "Apollo")
+                    # Personal email (secondary, shown if different from business)
+                    _em_personal = (_cc.get("personal_email") or _enr_data.get("personal_email",""))
+
                     _ph_val = (_cc.get("phone") or _mon_phone
+                               or _enr_data.get("phone")
                                or st.session_state.get(_ph_sk, {}).get("phone",""))
-                    _ph_src = ("Apollo" if _cc.get("phone")
-                               else "Monday" if _mon_phone
-                               else st.session_state.get(_ph_sk, {}).get("source",""))
+                    _ph_src = ("Apollo" if (_cc.get("phone") or _enr_data.get("phone"))
+                               else "Monday" if _mon_phone else "")
 
                     _fA, _fB = st.columns(2)
                     with _fA:
                         if _em_val:
-                            _ev = " ✓" if (_cc.get("email_status") == "verified"
-                                           or _em_src == "Monday") else ""
-                            st.markdown(f"📧 **{_em_val}**{_ev}")
-                            if _em_src: st.caption(f"via {_em_src}")
+                            st.markdown(f"📧 **{_em_val}**")
+                            st.caption(f"Business · via {_em_src}")
+                            if _em_personal and _em_personal != _em_val:
+                                st.markdown(f"📧 `{_em_personal}`")
+                                st.caption("Personal · via Apollo")
                         else:
                             _hp_em = _cc.get("has_email")
                             st.caption("📧 Available · ⚡ 1 credit" if _hp_em else "📧 Not flagged")
                     with _fB:
                         if _ph_val:
                             st.markdown(f"📞 **{_ph_val}**")
-                            if _ph_src: st.caption(f"via {_ph_src}")
+                            st.caption(f"Mobile · via {_ph_src}" if _ph_src else "Mobile · via Apollo")
                         else:
                             _hp = _cc.get("has_phone","")
                             if _hp == "yes":
@@ -2564,10 +2610,11 @@ if _page == "✅ Lead Verification":
                                 st.caption("📞 May be available")
                             else:
                                 st.caption("📞 Not flagged")
-                        if _cc.get("company_phone"):
-                            st.markdown(f"🏢 **{_cc['company_phone']}** (company)")
+                        _cph = _cc.get("company_phone") or _enr_data.get("company_phone","")
+                        if _cph:
+                            st.markdown(f"🏢 **{_cph}** (company)")
 
-                    # Single combined enrich button — always shown if Apollo ID known
+                    # ── Enrich button ──────────────────────────────────────
                     _enrich_done = bool(_em_val and _ph_val)
                     if _has_apo and _apo_id and not _enrich_done:
                         _enr_lbl = (
@@ -2584,25 +2631,56 @@ if _page == "✅ Lead Verification":
                                     linkedin=_cc.get("linkedin",""),
                                     company=_cc.get("company",""),
                                 )
+                            if _enr.get("_apollo_err"):
+                                st.warning(f"Apollo: {_enr['_apollo_err'][:120]}")
                             _card_list_key = "lk_results" if key_prefix == "main" else "lk_dm"
-                            # Reveal full name
                             if _enr.get("name"):
                                 st.session_state[_nm_sk] = _enr["name"]
                                 if _card_list_key in st.session_state:
                                     st.session_state[_card_list_key][_ci]["name"] = _enr["name"]
-                            # Store email
-                            if _enr.get("email"):
+                            if _enr.get("email") or _enr.get("work_email"):
+                                _best = _enr.get("work_email") or _enr.get("email")
                                 _src_str = " / ".join(_enr.get("sources", ["Apollo"]))
-                                st.session_state[_em_sk] = {"email": _enr["email"], "source": _src_str}
+                                st.session_state[_em_sk] = {"email": _best, "source": _src_str}
                                 if _card_list_key in st.session_state:
-                                    st.session_state[_card_list_key][_ci]["email"] = _enr["email"]
-                            # Store phone
+                                    st.session_state[_card_list_key][_ci]["work_email"] = _best
+                                    st.session_state[_card_list_key][_ci]["email"] = _best
+                                    if _enr.get("personal_email"):
+                                        st.session_state[_card_list_key][_ci]["personal_email"] = _enr["personal_email"]
                             if _enr.get("phone"):
-                                _src_str = " / ".join(_enr.get("sources", ["Apollo"]))
-                                st.session_state[_ph_sk] = {"phone": _enr["phone"], "source": _src_str}
-                            if not _enr.get("email") and not _enr.get("phone"):
-                                st.toast("Nothing found — contact may not be in Apollo DB")
+                                st.session_state[_ph_sk] = {"phone": _enr["phone"], "source": "Apollo"}
+                            # Store full enriched data (company insights etc.)
+                            st.session_state[_enr_sk] = _enr
+                            if not _enr.get("email") and not _enr.get("work_email") and not _enr.get("phone"):
+                                st.toast("Nothing revealed — contact may lack Apollo data")
                             st.rerun()
+
+                    # ── Company insights ───────────────────────────────────
+                    _co_src = _enr_data if _enr_data.get("description") else _cc
+                    _co_desc = _co_src.get("description","")
+                    _co_rev  = _co_src.get("revenue","")
+                    _co_emp  = _co_src.get("employees")
+                    _co_ind  = _co_src.get("industry","")
+                    _co_kw   = _co_src.get("keywords") or []
+                    _co_tech = _co_src.get("tech_count", 0)
+                    _co_yr   = _co_src.get("founded_year")
+                    _co_cph  = _co_src.get("company_phone","")
+                    _co_city = _co_src.get("city","")
+                    _co_ctry = _co_src.get("country","")
+                    if any([_co_desc, _co_rev, _co_emp, _co_ind, _co_kw, _co_tech]):
+                        with st.expander("🏢 Company insights"):
+                            if _co_desc:
+                                st.caption(_co_desc[:300] + ("…" if len(_co_desc) > 300 else ""))
+                            _ci1, _ci2, _ci3 = st.columns(3)
+                            if _co_rev:   _ci1.metric("Revenue", _co_rev)
+                            if _co_emp:   _ci2.metric("Employees", f"{_co_emp:,}" if isinstance(_co_emp, int) else _co_emp)
+                            if _co_yr:    _ci3.metric("Founded", _co_yr)
+                            if _co_ind:   st.caption(f"**Industry:** {_co_ind}")
+                            loc_parts = [x for x in [_co_city, _co_ctry] if x]
+                            if loc_parts: st.caption(f"**Location:** {', '.join(loc_parts)}")
+                            if _co_cph:   st.caption(f"**Office:** {_co_cph}")
+                            if _co_kw:    st.caption("**Keywords:** " + " · ".join(_co_kw))
+                            if _co_tech:  st.caption(f"**Technologies tracked:** {_co_tech}")
 
                     # ── Monday CRM expanded data ───────────────────────────
                     if _crm_r and _crm_r.get("on_crm"):
