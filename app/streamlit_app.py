@@ -840,6 +840,46 @@ def _enrich_contact(apollo_id: str = "", name: str = "",
     return result
 
 
+def _apollo_phone_cache_lookup(apollo_id: str) -> str:
+    """Read a previously-revealed phone from the webhook cache table. Returns '' if not found."""
+    if not apollo_id:
+        return ""
+    try:
+        r = _sb_execute(
+            _supabase.table("apollo_phone_cache")
+            .select("phone")
+            .eq("apollo_id", apollo_id)
+            .limit(1)
+        )
+        rows = r.data or []
+        return (rows[0].get("phone") or "") if rows else ""
+    except Exception:
+        return ""
+
+
+def _apollo_request_phone_reveal(apollo_id: str) -> bool:
+    """POST people/match with reveal_phone_number=True + our Supabase webhook URL.
+    Apollo processes asynchronously and POSTs back to the Edge Function.
+    Returns True if the request was dispatched without error."""
+    sup_url = st.secrets.get("SUPABASE_URL", "")
+    if not sup_url or not apollo_id:
+        return False
+    webhook_url = f"{sup_url}/functions/v1/apollo-phone-webhook"
+    secret = st.secrets.get("APOLLO_WEBHOOK_SECRET", "")
+    if secret:
+        webhook_url += f"?secret={_urlparse.quote(secret)}"
+    try:
+        _apollo_post("people/match", {
+            "id":                   apollo_id,
+            "reveal_phone_number":  True,
+            "reveal_personal_emails": False,
+            "webhook_url":          webhook_url,
+        })
+        return True
+    except Exception:
+        return False
+
+
 @st.cache_data(ttl=300)
 def _apollo_credits() -> dict:
     """Fetch Apollo credit balance from /users/api_profile. Cached 5 min."""
@@ -2605,18 +2645,37 @@ if _page == "✅ Lead Verification":
                         else:
                             _hp_em = _cc.get("has_email")
                             st.caption("📧 Available · ⚡ 1 credit" if _hp_em else "📧 Not flagged")
+                    _ph_pending_sk = f"lk_ph_pending_{key_prefix}_{_ci}"
+                    _ph_pending    = st.session_state.get(_ph_pending_sk, False)
                     with _fB:
                         if _ph_val:
                             st.markdown(f"📞 **{_ph_val}**")
                             st.caption(f"Mobile · via {_ph_src}" if _ph_src else "Mobile · via Apollo")
-                        else:
+                        elif _ph_pending:
+                            st.caption("⏳ Apollo is looking up the number…")
+                            if st.button("🔄 Check for phone", key=f"lk_ph_check_{key_prefix}_{_ci}",
+                                         use_container_width=True):
+                                _cached = _apollo_phone_cache_lookup(_apo_id)
+                                if _cached:
+                                    st.session_state[_ph_sk] = {"phone": _cached, "source": "Apollo"}
+                                    st.session_state[_ph_pending_sk] = False
+                                    st.rerun()
+                                else:
+                                    st.toast("Not ready yet — try again in a moment")
+                        elif _apo_id:
                             _hp = _cc.get("has_phone","")
-                            if _hp == "yes":
-                                st.caption("📞 Direct dial available")
-                            elif _hp == "maybe":
-                                st.caption("📞 May be available")
-                            else:
-                                st.caption("📞 Not flagged")
+                            st.caption("📞 Direct dial available" if _hp == "yes"
+                                       else "📞 May be available" if _hp == "maybe"
+                                       else "📞 Unknown")
+                            if st.button("📞 Reveal phone number", key=f"lk_ph_reveal_{key_prefix}_{_ci}",
+                                         use_container_width=True):
+                                if _apollo_request_phone_reveal(_apo_id):
+                                    st.session_state[_ph_pending_sk] = True
+                                    st.rerun()
+                                else:
+                                    st.warning("Phone reveal failed — check SUPABASE_URL secret")
+                        else:
+                            st.caption("📞 No Apollo ID — can't reveal")
                         _cph = _cc.get("company_phone") or _enr_data.get("company_phone","")
                         if _cph:
                             st.markdown(f"🏢 **{_cph}** (company)")
