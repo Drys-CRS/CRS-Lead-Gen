@@ -588,29 +588,41 @@ def ai_analyse_partners(awarded_df: pd.DataFrame) -> list:
 # ─────────────────────────────────────────────────────────────────────────────
 # DATA LOADERS  (defined before sidebar so sidebar buttons can call them)
 # ─────────────────────────────────────────────────────────────────────────────
+def _sb_execute(query, retries: int = 2):
+    """Execute a Supabase query with one retry on HTTP/2 connection drop."""
+    import time as _time
+    for attempt in range(retries):
+        try:
+            return query.execute()
+        except Exception as _e:
+            if attempt < retries - 1:
+                _time.sleep(1.5)
+            else:
+                raise
+
 @st.cache_data(ttl=300)
 def _load_tenders() -> pd.DataFrame:
-    r = (supabase.table("sa_tenders").select("*")
+    r = _sb_execute(supabase.table("sa_tenders").select("*")
          .neq("is_irrelevant", True)
-         .order("closing_date", desc=False).limit(1000).execute())
+         .order("closing_date", desc=False).limit(1000))
     return pd.DataFrame(r.data or [])
 
 @st.cache_data(ttl=300)
 def _load_awarded() -> pd.DataFrame:
-    r = (supabase.table("awarded_tenders").select("*")
-         .order("created_at", desc=True).limit(2000).execute())
+    r = _sb_execute(supabase.table("awarded_tenders").select("*")
+         .order("created_at", desc=True).limit(2000))
     return pd.DataFrame(r.data or [])
 
 @st.cache_data(ttl=300)
 def _load_partner_history() -> pd.DataFrame:
-    r = (supabase.table("partner_recommendation_history").select("*")
-         .order("run_at", desc=True).limit(500).execute())
+    r = _sb_execute(supabase.table("partner_recommendation_history").select("*")
+         .order("run_at", desc=True).limit(500))
     return pd.DataFrame(r.data or [])
 
 @st.cache_data(ttl=300)
 def _load_lead_verifications() -> pd.DataFrame:
-    r = (supabase.table("lead_verification_log").select("*")
-         .order("run_at", desc=True).limit(500).execute())
+    r = _sb_execute(supabase.table("lead_verification_log").select("*")
+         .order("run_at", desc=True).limit(500))
     return pd.DataFrame(r.data or [])
 
 @st.cache_data(ttl=30)
@@ -828,11 +840,11 @@ def _enrich_contact(apollo_id: str = "", name: str = "",
             _lk = st.secrets.get("LUSHA_API_KEY", "") or os.getenv("LUSHA_API_KEY", "")
             if _lk:
                 _lr = _lusha_lookup(linkedin)
-                _lph = (_lr.get("phone_numbers") or [])
+                # Lusha v2 API returns camelCase: phoneNumbers[].internationalNumber
+                _lph = (_lr.get("phoneNumbers") or [])
                 if _lph:
-                    _lpv = (_lph[0].get("international_number")
-                            or _lph[0].get("sanitized_number")
-                            or _lph[0].get("raw_number", ""))
+                    _lpv = (_lph[0].get("internationalNumber")
+                            or _lph[0].get("localNumber", ""))
                     if _lpv:
                         result["phone"] = _lpv
                         result["sources"].append("Lusha")
