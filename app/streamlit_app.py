@@ -2600,8 +2600,10 @@ if _page == "✅ Lead Verification":
             st.warning("Enter a name, company, or both.")
         else:
             for _k0 in list(st.session_state.keys()):
-                if _k0 in ("lk_results","lk_co","lk_dm") or \
-                   _k0.startswith(("lk_crm_","lk_phone_","lk_email_","lk_xref_")):
+                if _k0 in ("lk_results","lk_co","lk_dm",
+                            "lk_revealed_contacts","lk_revealed_total","lk_revealed_search") or \
+                   _k0.startswith(("lk_crm_","lk_phone_","lk_email_","lk_xref_",
+                                   "lk_rev_saved_","lk_reveal_all_","lk_enrich_")):
                     del st.session_state[_k0]
             _results: list = []
             with st.spinner("Searching Apollo…"):
