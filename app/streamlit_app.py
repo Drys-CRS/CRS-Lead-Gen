@@ -2560,6 +2560,9 @@ if _page == "✅ Lead Verification":
             if not _rl_list:
                 st.info("No contacts in the list yet — reveal a contact above to populate it.")
             else:
+                _rl_q = st.text_input("🔍 Filter by name, company, email or phone",
+                                      key="lk_revealed_search", placeholder="Search…")
+                _rl_q_lower = _rl_q.strip().lower()
                 for _rlc in _rl_list:
                     _rl_name  = (_rlc.get("name") or
                                  f"{_rlc.get('first_name','')} {_rlc.get('last_name','')}".strip()
@@ -2573,6 +2576,11 @@ if _page == "✅ Lead Verification":
                                  ((_rlc.get("phone_numbers") or [{}])[0]).get("sanitized_number",""))
                     _rl_li    = _rlc.get("linkedin_url","")
                     _rl_aid   = _rlc.get("id","")
+                    if _rl_q_lower and not any(
+                        _rl_q_lower in (s or "").lower()
+                        for s in [_rl_name, _rl_org, _rl_email, _rl_phone, _rl_title]
+                    ):
+                        continue
                     with st.container(border=True):
                         _rla, _rlb = st.columns([3, 2])
                         with _rla:
@@ -2752,18 +2760,29 @@ if _page == "✅ Lead Verification":
                                         st.session_state[_card_list_key][_ci]["email"] = _best
                                         if _rn.get("personal_email"):
                                             st.session_state[_card_list_key][_ci]["personal_email"] = _rn["personal_email"]
-                                if _rn.get("phone"):
-                                    st.session_state[_ph_sk] = {"phone": _rn["phone"], "source": "Apollo"}
+                                _rc = _rv2.get("contact") or {}
+                                # Phone: people/match only reveals phone with a
+                                # separate credit; fall back to whatever Apollo
+                                # already stores in the CRM contact record.
+                                _revealed_phone = (
+                                    _rn.get("phone") or
+                                    _rc.get("direct_phone") or
+                                    _rc.get("mobile_phone") or
+                                    ((_rc.get("phone_numbers") or [{}])[0]).get("sanitized_number","")
+                                )
+                                if _revealed_phone:
+                                    st.session_state[_ph_sk] = {"phone": _revealed_phone, "source": "Apollo"}
+                                    if _card_list_key in st.session_state:
+                                        st.session_state[_card_list_key][_ci]["phone"] = _revealed_phone
                                 st.session_state[_enr_sk] = _rn
                                 st.session_state[_reveal_saved_sk] = True
-                                _rc = _rv2.get("contact") or {}
                                 if _rv2["error"]:
                                     st.warning(f"Revealed — list save failed: {_rv2['error'][:80]}")
                                 elif _rc.get("id"):
                                     st.success(f"Saved to '{_APOLLO_REVEALED_LIST}' · Apollo ID: {_rc['id']}")
                                 else:
                                     st.success(f"Revealed · added to '{_APOLLO_REVEALED_LIST}' list")
-                                if not _rn.get("email") and not _rn.get("work_email") and not _rn.get("phone"):
+                                if not _rn.get("email") and not _rn.get("work_email") and not _revealed_phone:
                                     st.toast("Nothing revealed — contact may lack Apollo data")
                                 st.rerun()
 
