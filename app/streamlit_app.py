@@ -840,63 +840,64 @@ def _enrich_contact(apollo_id: str = "", name: str = "",
     return result
 
 
-def _apollo_phone_cache_lookup(apollo_id: str) -> str:
-    """Read a previously-revealed phone from the webhook cache table. Returns '' if not found."""
-    if not apollo_id:
-        return ""
-    try:
-        r = _sb_execute(
-            _supabase.table("apollo_phone_cache")
-            .select("phone")
-            .eq("apollo_id", apollo_id)
-            .limit(1)
-        )
-        rows = r.data or []
-        return (rows[0].get("phone") or "") if rows else ""
-    except Exception:
-        return ""
+_APOLLO_REVEALED_LIST = "CRS Revealed"
 
 
-def _apollo_request_phone_reveal(apollo_id: str) -> dict:
-    """POST people/match with reveal_phone_number=True + our Supabase webhook URL.
-    Returns {"ok": bool, "phone": str, "error": str}.
-    - If Apollo has the number already, it returns it inline → "phone" is set.
-    - If async lookup is triggered, Apollo will POST to the Edge Function later.
-    - "error" is set (non-empty) if the request itself failed."""
-    import datetime as _dt
-    sup_url = st.secrets.get("SUPABASE_URL", "")
-    if not sup_url:
-        return {"ok": False, "phone": "", "error": "SUPABASE_URL secret not set"}
+def _apollo_reveal_and_save(apollo_id: str) -> dict:
+    """Full reveal + save to Apollo CRM list.
+    people/match (email + inline phone) → POST /contacts with label 'CRS Revealed'.
+    Returns {"person": norm_dict, "contact": raw_dict, "error": str}"""
+    result: dict = {"person": {}, "contact": {}, "error": ""}
     if not apollo_id:
-        return {"ok": False, "phone": "", "error": "No Apollo ID for this contact"}
-    webhook_url = f"{sup_url}/functions/v1/apollo-phone-webhook"
-    secret = st.secrets.get("APOLLO_WEBHOOK_SECRET", "")
-    if secret:
-        webhook_url += f"?secret={_urlparse.quote(secret)}"
+        result["error"] = "No Apollo ID"
+        return result
+
+    # Reveal: people/match costs 1 export credit; gets work email + personal emails.
     try:
-        raw  = _apollo_post("people/match", {
-            "id":                    apollo_id,
-            "reveal_phone_number":   True,
-            "reveal_personal_emails": False,
-            "webhook_url":           webhook_url,
+        raw = _apollo_post("people/match", {
+            "id": apollo_id,
+            "reveal_personal_emails": True,
         })
-        person = raw.get("person") or {}
-        n      = _norm_apollo(person)
-        phone  = n.get("phone", "")
-        if phone:
-            # Apollo returned the number inline — write to cache immediately
-            try:
-                _supabase.table("apollo_phone_cache").upsert({
-                    "apollo_id":    apollo_id,
-                    "phone":        phone,
-                    "raw_number":   phone,
-                    "retrieved_at": _dt.datetime.utcnow().isoformat(),
-                }).execute()
-            except Exception:
-                pass
-        return {"ok": True, "phone": phone, "error": ""}
+        person_raw = raw.get("person") or {}
+        n = _norm_apollo(person_raw)
+        result["person"] = n
     except Exception as _e:
-        return {"ok": False, "phone": "", "error": str(_e)}
+        result["error"] = f"Reveal failed: {_e}"
+        return result
+
+    # Save to Apollo CRM contacts + label — no extra export credit.
+    try:
+        name_parts = (n.get("name") or "").split(" ", 1)
+        contact_payload: dict = {"label_names": [_APOLLO_REVEALED_LIST]}
+        if name_parts:             contact_payload["first_name"]        = name_parts[0]
+        if len(name_parts) > 1:    contact_payload["last_name"]         = name_parts[1]
+        em = n.get("work_email") or n.get("email") or ""
+        if em:                     contact_payload["email"]             = em
+        if n.get("company"):       contact_payload["organization_name"] = n["company"]
+        if n.get("title"):         contact_payload["title"]             = n["title"]
+        if n.get("linkedin"):      contact_payload["linkedin_url"]      = n["linkedin"]
+        if n.get("phone"):         contact_payload["direct_phone"]      = n["phone"]
+        resp = _apollo_post("contacts", contact_payload)
+        result["contact"] = resp.get("contact") or {}
+    except Exception as _e:
+        result["error"] = f"Saved reveal but list-save failed: {_e}"
+
+    return result
+
+
+def _apollo_list_contacts(list_name: str = _APOLLO_REVEALED_LIST,
+                           per_page: int = 25, page: int = 1) -> tuple:
+    """Return (contacts_list, total_count) for the named Apollo label/list."""
+    try:
+        resp = _apollo_post("contacts/search", {
+            "label_names": [list_name],
+            "per_page": per_page,
+            "page": page,
+        })
+        total = int((resp.get("pagination") or {}).get("total_entries", 0) or 0)
+        return (resp.get("contacts") or []), total
+    except Exception:
+        return [], 0
 
 
 @st.cache_data(ttl=300)
@@ -2542,6 +2543,48 @@ if _page == "✅ Lead Verification":
         _lk_run = st.button("🔍 Search", key="lk_run",
                              type="primary", use_container_width=True)
 
+    # ── CRS Revealed List (Apollo contacts saved via Reveal All) ───────────────
+    with st.expander(f"📋 '{_APOLLO_REVEALED_LIST}' — contacts saved to Apollo"):
+        _rl_col1, _rl_col2 = st.columns([1, 4])
+        with _rl_col1:
+            if st.button("Load list", key="lk_load_revealed", use_container_width=True):
+                with st.spinner("Fetching from Apollo…"):
+                    _rl_contacts, _rl_total = _apollo_list_contacts()
+                st.session_state["lk_revealed_contacts"] = _rl_contacts
+                st.session_state["lk_revealed_total"] = _rl_total
+        with _rl_col2:
+            if "lk_revealed_total" in st.session_state:
+                st.caption(f"{st.session_state['lk_revealed_total']} contacts in list")
+        _rl_list = st.session_state.get("lk_revealed_contacts")
+        if _rl_list is not None:
+            if not _rl_list:
+                st.info("No contacts in the list yet — reveal a contact above to populate it.")
+            else:
+                for _rlc in _rl_list:
+                    _rl_name  = (_rlc.get("name") or
+                                 f"{_rlc.get('first_name','')} {_rlc.get('last_name','')}".strip()
+                                 or "Unknown")
+                    _rl_title = _rlc.get("title") or ""
+                    _rl_org   = (_rlc.get("organization_name") or
+                                 (_rlc.get("organization") or {}).get("name",""))
+                    _rl_email = (_rlc.get("email") or
+                                 ((_rlc.get("contact_emails") or [{}])[0]).get("email",""))
+                    _rl_phone = (_rlc.get("direct_phone") or _rlc.get("mobile_phone") or
+                                 ((_rlc.get("phone_numbers") or [{}])[0]).get("sanitized_number",""))
+                    _rl_li    = _rlc.get("linkedin_url","")
+                    _rl_aid   = _rlc.get("id","")
+                    with st.container(border=True):
+                        _rla, _rlb = st.columns([3, 2])
+                        with _rla:
+                            st.markdown(f"**{_rl_name}**")
+                            _rl_sub = [x for x in [_rl_title, _rl_org] if x]
+                            if _rl_sub: st.caption("  ·  ".join(_rl_sub))
+                            if _rl_li: st.markdown(f"[LinkedIn →]({_rl_li})")
+                        with _rlb:
+                            if _rl_email: st.markdown(f"📧 `{_rl_email}`")
+                            if _rl_phone: st.markdown(f"📞 `{_rl_phone}`")
+                            if _rl_aid:   st.caption(f"Apollo ID: {_rl_aid}")
+
     if _lk_run:
         _n = st.session_state.get("lk_name", "").strip()
         _c = st.session_state.get("lk_company", "").strip()
@@ -2664,88 +2707,65 @@ if _page == "✅ Lead Verification":
                         else:
                             _hp_em = _cc.get("has_email")
                             st.caption("📧 Available · ⚡ 1 credit" if _hp_em else "📧 Not flagged")
-                    _ph_pending_sk = f"lk_ph_pending_{key_prefix}_{_ci}"
-                    _ph_pending    = st.session_state.get(_ph_pending_sk, False)
                     with _fB:
                         if _ph_val:
                             st.markdown(f"📞 **{_ph_val}**")
                             st.caption(f"Mobile · via {_ph_src}" if _ph_src else "Mobile · via Apollo")
-                        elif _ph_pending:
-                            st.caption("⏳ Apollo is looking up the number…")
-                            if st.button("🔄 Check for phone", key=f"lk_ph_check_{key_prefix}_{_ci}",
-                                         use_container_width=True):
-                                _cached = _apollo_phone_cache_lookup(_apo_id)
-                                if _cached:
-                                    st.session_state[_ph_sk] = {"phone": _cached, "source": "Apollo"}
-                                    st.session_state[_ph_pending_sk] = False
-                                    st.rerun()
-                                else:
-                                    st.toast("Not ready yet — try again in a moment")
                         elif _apo_id:
                             _hp = _cc.get("has_phone","")
                             st.caption("📞 Direct dial available" if _hp == "yes"
                                        else "📞 May be available" if _hp == "maybe"
-                                       else "📞 Unknown")
-                            if st.button("📞 Reveal phone number", key=f"lk_ph_reveal_{key_prefix}_{_ci}",
-                                         use_container_width=True):
-                                with st.spinner("Requesting from Apollo…"):
-                                    _rv = _apollo_request_phone_reveal(_apo_id)
-                                if _rv["error"]:
-                                    st.warning(f"Apollo error: {_rv['error'][:120]}")
-                                elif _rv["phone"]:
-                                    # Returned inline — show immediately
-                                    st.session_state[_ph_sk] = {"phone": _rv["phone"], "source": "Apollo"}
-                                    st.rerun()
-                                else:
-                                    # Async — Apollo will POST to webhook
-                                    st.session_state[_ph_pending_sk] = True
-                                    st.rerun()
+                                       else "📞 Use Reveal All below")
                         else:
-                            st.caption("📞 No Apollo ID — can't reveal")
+                            st.caption("📞 No Apollo ID")
                         _cph = _cc.get("company_phone") or _enr_data.get("company_phone","")
                         if _cph:
                             st.markdown(f"🏢 **{_cph}** (company)")
 
-                    # ── Enrich button ──────────────────────────────────────
+                    # ── Reveal All & Save to Apollo List ───────────────────
                     _enrich_done = bool(_em_val and _ph_val)
+                    _reveal_saved_sk = f"lk_rev_saved_{key_prefix}_{_ci}"
                     if _has_apo and _apo_id and not _enrich_done:
-                        _enr_lbl = (
-                            "💳 Enrich — reveal email + phone"
-                            if not _em_val
-                            else "💳 Enrich — find phone number"
+                        _rv_lbl = (
+                            "🔓 Reveal All & Save to Apollo List"
+                            if not st.session_state.get(_reveal_saved_sk)
+                            else "🔄 Re-reveal & Update List"
                         )
-                        if st.button(_enr_lbl, key=f"lk_enrich_{key_prefix}_{_ci}",
-                                     use_container_width=True):
-                            with st.spinner("Enriching via Apollo…"):
-                                _enr = _enrich_contact(
-                                    apollo_id=_apo_id,
-                                    name=_cc.get("name",""),
-                                    linkedin=_cc.get("linkedin",""),
-                                    company=_cc.get("company",""),
-                                )
-                            if _enr.get("_apollo_err"):
-                                st.warning(f"Apollo: {_enr['_apollo_err'][:120]}")
-                            _card_list_key = "lk_results" if key_prefix == "main" else "lk_dm"
-                            if _enr.get("name"):
-                                st.session_state[_nm_sk] = _enr["name"]
-                                if _card_list_key in st.session_state:
-                                    st.session_state[_card_list_key][_ci]["name"] = _enr["name"]
-                            if _enr.get("email") or _enr.get("work_email"):
-                                _best = _enr.get("work_email") or _enr.get("email")
-                                _src_str = " / ".join(_enr.get("sources", ["Apollo"]))
-                                st.session_state[_em_sk] = {"email": _best, "source": _src_str}
-                                if _card_list_key in st.session_state:
-                                    st.session_state[_card_list_key][_ci]["work_email"] = _best
-                                    st.session_state[_card_list_key][_ci]["email"] = _best
-                                    if _enr.get("personal_email"):
-                                        st.session_state[_card_list_key][_ci]["personal_email"] = _enr["personal_email"]
-                            if _enr.get("phone"):
-                                st.session_state[_ph_sk] = {"phone": _enr["phone"], "source": "Apollo"}
-                            # Store full enriched data (company insights etc.)
-                            st.session_state[_enr_sk] = _enr
-                            if not _enr.get("email") and not _enr.get("work_email") and not _enr.get("phone"):
-                                st.toast("Nothing revealed — contact may lack Apollo data")
-                            st.rerun()
+                        if st.button(_rv_lbl, key=f"lk_reveal_all_{key_prefix}_{_ci}",
+                                     use_container_width=True, type="primary"):
+                            with st.spinner(f"Revealing via Apollo — saving to '{_APOLLO_REVEALED_LIST}'…"):
+                                _rv2 = _apollo_reveal_and_save(_apo_id)
+                            if _rv2["error"] and not _rv2["person"]:
+                                st.error(f"Apollo: {_rv2['error'][:140]}")
+                            else:
+                                _rn = _rv2["person"]
+                                _card_list_key = "lk_results" if key_prefix == "main" else "lk_dm"
+                                if _rn.get("name") and "***" not in _rn["name"]:
+                                    st.session_state[_nm_sk] = _rn["name"]
+                                    if _card_list_key in st.session_state:
+                                        st.session_state[_card_list_key][_ci]["name"] = _rn["name"]
+                                if _rn.get("work_email") or _rn.get("email"):
+                                    _best = _rn.get("work_email") or _rn["email"]
+                                    st.session_state[_em_sk] = {"email": _best, "source": "Apollo"}
+                                    if _card_list_key in st.session_state:
+                                        st.session_state[_card_list_key][_ci]["work_email"] = _best
+                                        st.session_state[_card_list_key][_ci]["email"] = _best
+                                        if _rn.get("personal_email"):
+                                            st.session_state[_card_list_key][_ci]["personal_email"] = _rn["personal_email"]
+                                if _rn.get("phone"):
+                                    st.session_state[_ph_sk] = {"phone": _rn["phone"], "source": "Apollo"}
+                                st.session_state[_enr_sk] = _rn
+                                st.session_state[_reveal_saved_sk] = True
+                                _rc = _rv2.get("contact") or {}
+                                if _rv2["error"]:
+                                    st.warning(f"Revealed — list save failed: {_rv2['error'][:80]}")
+                                elif _rc.get("id"):
+                                    st.success(f"Saved to '{_APOLLO_REVEALED_LIST}' · Apollo ID: {_rc['id']}")
+                                else:
+                                    st.success(f"Revealed · added to '{_APOLLO_REVEALED_LIST}' list")
+                                if not _rn.get("email") and not _rn.get("work_email") and not _rn.get("phone"):
+                                    st.toast("Nothing revealed — contact may lack Apollo data")
+                                st.rerun()
 
                     # ── Company insights ───────────────────────────────────
                     _co_src = _enr_data if _enr_data.get("description") else _cc
