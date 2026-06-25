@@ -2776,6 +2776,9 @@ if _page == "✅ Lead Verification":
                                     st.session_state[_ph_sk] = {"phone": _revealed_phone, "source": "Apollo"}
                                     if _card_list_key in st.session_state:
                                         st.session_state[_card_list_key][_ci]["phone"] = _revealed_phone
+                                if _rn.get("linkedin"):
+                                    if _card_list_key in st.session_state:
+                                        st.session_state[_card_list_key][_ci]["linkedin"] = _rn["linkedin"]
                                 st.session_state[_enr_sk] = _rn
                                 st.session_state[_reveal_saved_sk] = True
                                 if _rv2["error"]:
@@ -5443,98 +5446,202 @@ if _page == "👥 Decision Makers":
                     _dc_em_sk  = f"dm_em_{_dq_key}_{_dci}"
                     _dc_ph_sk  = f"dm_ph_{_dq_key}_{_dci}"
                     _dc_crm_sk = f"dm_crm_{_dq_key}_{_dci}"
+                    _dc_enr_sk = f"dm_enr_{_dq_key}_{_dci}"
+                    _dc_rev_sk = f"dm_rev_saved_{_dq_key}_{_dci}"
 
-                    _dc_name = st.session_state.get(_dc_nm_sk) or _dcc.get("name") or f"Contact {_dci+1}"
-                    _dc_em   = (st.session_state.get(_dc_em_sk) or {}).get("email") or _dcc.get("email","")
-                    _dc_ph   = (st.session_state.get(_dc_ph_sk) or {}).get("phone") or _dcc.get("phone","")
-                    _dc_fit  = _dcc.get("crs_fit", 0)
-                    _dc_badge = "🟢" if _dc_fit >= 70 else "🟡" if _dc_fit >= 40 else "🔵"
+                    _dc_name     = st.session_state.get(_dc_nm_sk) or _dcc.get("name") or f"Contact {_dci+1}"
+                    _dc_enr_data = st.session_state.get(_dc_enr_sk, {})
+                    _dc_fit      = _dcc.get("crs_fit", 0)
+                    _dc_badge    = "🟢" if _dc_fit >= 70 else "🟡" if _dc_fit >= 40 else "🔵"
 
-                    _dc_crm = _auto_crm_check(_dcc.get("name",""), _dcc.get("email",""),
-                                              _dcc.get("linkedin",""), _dc_crm_sk)
+                    _dc_crm    = _auto_crm_check(_dcc.get("name",""), _dcc.get("email",""),
+                                                 _dcc.get("linkedin",""), _dc_crm_sk)
                     _dc_mon_em = (_dc_crm.get("crm_email","") if _dc_crm and _dc_crm.get("on_crm") else "")
                     _dc_mon_ph = (_dc_crm.get("crm_phone","") if _dc_crm and _dc_crm.get("on_crm") else "")
-                    _dc_em = _dc_em or _dc_mon_em
-                    _dc_ph = _dc_ph or _dc_mon_ph
+
+                    # Best email/phone — same priority chain as Lead Verification
+                    _dc_em_val = (_dcc.get("work_email") or _dcc.get("email") or _dc_mon_em
+                                  or _dc_enr_data.get("work_email") or _dc_enr_data.get("email")
+                                  or (st.session_state.get(_dc_em_sk) or {}).get("email",""))
+                    _dc_em_src = ("Apollo" if (_dcc.get("work_email") or _dcc.get("email"))
+                                  else "Monday" if _dc_mon_em else "Apollo")
+                    _dc_em_personal = (_dcc.get("personal_email") or _dc_enr_data.get("personal_email",""))
+
+                    _dc_ph_val = (_dcc.get("phone") or _dc_mon_ph
+                                  or _dc_enr_data.get("phone")
+                                  or (st.session_state.get(_dc_ph_sk) or {}).get("phone",""))
+                    _dc_ph_src = ("Apollo" if (_dcc.get("phone") or _dc_enr_data.get("phone"))
+                                  else "Monday" if _dc_mon_ph else "")
 
                     with st.container(border=True):
                         _dca, _dcb = st.columns([4, 2])
                         with _dca:
-                            _dc_hdr = f"**{_dc_badge} {_dc_name}**"
-                            if _dc_crm and _dc_crm.get("on_crm"):
-                                _dc_hdr += f"  `✓ {_dc_crm.get('crm_board', 'CRM')}`"
-                            st.markdown(_dc_hdr)
-                            if _dc_crm and _dc_crm.get("on_crm") and _dc_crm.get("crm_url"):
-                                st.caption(f"[→ View on {_dc_crm.get('crm_board','CRM')} board]({_dc_crm['crm_url']})")
-                            if _dcc.get("title"):  st.caption(f"🎯 {_dcc['title']}")
+                            st.markdown(f"### 👤 {_dc_badge} {_dc_name}")
+                            _dc_rp = [x for x in [_dcc.get("title"), _dcc.get("company")] if x]
+                            if _dc_rp: st.caption("💼 " + "  ·  ".join(_dc_rp))
+                            if _dcc.get("domain"):   st.caption(f"🌐 {_dcc['domain']}")
                             if _dcc.get("linkedin"): st.markdown(f"[LinkedIn →]({_dcc['linkedin']})")
-                            if _dc_em:  st.caption(f"📧 {_dc_em}")
-                            if _dc_ph:  st.caption(f"📞 {_dc_ph}")
-                            if not _dc_em:
-                                st.caption("📧 Available · ⚡ 1 credit" if _dcc.get("has_email") else "📧 Not flagged")
-                            if not _dc_ph:
-                                _hp = _dcc.get("has_phone","")
-                                if _hp == "yes":   st.caption("📞 Direct dial available")
-                                elif _hp == "maybe": st.caption("📞 May be available")
+                            if _dcc.get("twitter"):  st.caption(f"Twitter: {_dcc['twitter']}")
                         with _dcb:
-                            st.caption(f"CRS fit: {_dc_fit}/100")
+                            st.caption(f"🔵 {_dcc.get('source','Apollo')}  ·  CRS fit: {_dc_fit}/100")
+                            if _dc_crm:
+                                if _dc_crm.get("on_crm"):
+                                    st.success(f"📋 {_dc_crm['crm_board']}")
+                                    if _dc_crm.get("crm_url"):
+                                        st.markdown(f"[Open →]({_dc_crm['crm_url']})")
+                                else:
+                                    st.caption("📋 Not in CRM")
 
-                            # Enrich button
-                            if _dm_has_apo and _dc_apo_id and not (_dc_em and _dc_ph):
-                                _enr_lbl = "💳 Enrich — email + phone" if not _dc_em else "💳 Find phone"
-                                if st.button(_enr_lbl, key=f"dm_enrich_{_dq_key}_{_dci}",
-                                             use_container_width=True):
-                                    with st.spinner("Enriching…"):
-                                        _enr = _enrich_contact(
-                                            apollo_id=_dc_apo_id,
-                                            name=_dcc.get("name",""),
-                                            linkedin=_dcc.get("linkedin",""),
-                                            company=_dq_company,
-                                        )
-                                    if _enr.get("name"):
-                                        st.session_state[_dc_nm_sk] = _enr["name"]
-                                        st.session_state[_dq_res_key][_dci]["name"] = _enr["name"]
-                                    if _enr.get("email"):
-                                        st.session_state[_dc_em_sk] = {"email": _enr["email"], "source": "Apollo"}
-                                    if _enr.get("phone"):
-                                        st.session_state[_dc_ph_sk] = {"phone": _enr["phone"], "source": "Apollo"}
-                                    if not _enr.get("email") and not _enr.get("phone"):
-                                        st.toast("Nothing found in Apollo DB")
+                        # ── Email + Phone ──────────────────────────────────────
+                        _dce1, _dce2 = st.columns(2)
+                        with _dce1:
+                            if _dc_em_val:
+                                st.markdown(f"📧 **{_dc_em_val}**")
+                                st.caption(f"Business · via {_dc_em_src}")
+                                if _dc_em_personal and _dc_em_personal != _dc_em_val:
+                                    st.markdown(f"📧 `{_dc_em_personal}`")
+                                    st.caption("Personal · via Apollo")
+                            else:
+                                st.caption("📧 Available · ⚡ 1 credit" if _dcc.get("has_email") else "📧 Not flagged")
+                        with _dce2:
+                            if _dc_ph_val:
+                                st.markdown(f"📞 **{_dc_ph_val}**")
+                                st.caption(f"Mobile · via {_dc_ph_src}" if _dc_ph_src else "Mobile · via Apollo")
+                            elif _dc_apo_id:
+                                _hp = _dcc.get("has_phone","")
+                                st.caption("📞 Direct dial available" if _hp == "yes"
+                                           else "📞 May be available" if _hp == "maybe"
+                                           else "📞 Use Reveal All below")
+                            else:
+                                st.caption("📞 No Apollo ID")
+                            _dc_cph = _dcc.get("company_phone") or _dc_enr_data.get("company_phone","")
+                            if _dc_cph:
+                                st.markdown(f"🏢 **{_dc_cph}** (company)")
+
+                        # ── Reveal All & Save to Apollo List ───────────────────
+                        _dc_enrich_done = bool(_dc_em_val and _dc_ph_val)
+                        if _dm_has_apo and _dc_apo_id and not _dc_enrich_done:
+                            _dc_rv_lbl = (
+                                "🔓 Reveal All & Save to Apollo List"
+                                if not st.session_state.get(_dc_rev_sk)
+                                else "🔄 Re-reveal & Update List"
+                            )
+                            if st.button(_dc_rv_lbl, key=f"dm_reveal_{_dq_key}_{_dci}",
+                                         use_container_width=True, type="primary"):
+                                with st.spinner(f"Revealing via Apollo — saving to '{_APOLLO_REVEALED_LIST}'…"):
+                                    _dc_rv = _apollo_reveal_and_save(_dc_apo_id)
+                                if _dc_rv["error"] and not _dc_rv["person"]:
+                                    st.error(f"Apollo: {_dc_rv['error'][:140]}")
+                                else:
+                                    _dc_rn = _dc_rv["person"]
+                                    if _dc_rn.get("name") and "***" not in _dc_rn["name"]:
+                                        st.session_state[_dc_nm_sk] = _dc_rn["name"]
+                                        st.session_state[_dq_res_key][_dci]["name"] = _dc_rn["name"]
+                                    if _dc_rn.get("work_email") or _dc_rn.get("email"):
+                                        _dc_best = _dc_rn.get("work_email") or _dc_rn["email"]
+                                        st.session_state[_dc_em_sk] = {"email": _dc_best, "source": "Apollo"}
+                                        st.session_state[_dq_res_key][_dci]["work_email"] = _dc_best
+                                        st.session_state[_dq_res_key][_dci]["email"] = _dc_best
+                                        if _dc_rn.get("personal_email"):
+                                            st.session_state[_dq_res_key][_dci]["personal_email"] = _dc_rn["personal_email"]
+                                    _dc_rc = _dc_rv.get("contact") or {}
+                                    _dc_revealed_phone = (
+                                        _dc_rn.get("phone") or
+                                        _dc_rc.get("direct_phone") or
+                                        _dc_rc.get("mobile_phone") or
+                                        ((_dc_rc.get("phone_numbers") or [{}])[0]).get("sanitized_number","")
+                                    )
+                                    if _dc_revealed_phone:
+                                        st.session_state[_dc_ph_sk] = {"phone": _dc_revealed_phone, "source": "Apollo"}
+                                        st.session_state[_dq_res_key][_dci]["phone"] = _dc_revealed_phone
+                                    if _dc_rn.get("linkedin"):
+                                        st.session_state[_dq_res_key][_dci]["linkedin"] = _dc_rn["linkedin"]
+                                    st.session_state[_dc_enr_sk] = _dc_rn
+                                    st.session_state[_dc_rev_sk] = True
+                                    if _dc_rv["error"]:
+                                        st.warning(f"Revealed — list save failed: {_dc_rv['error'][:80]}")
+                                    elif _dc_rc.get("id"):
+                                        st.success(f"Saved to '{_APOLLO_REVEALED_LIST}' · Apollo ID: {_dc_rc['id']}")
+                                    else:
+                                        st.success(f"Revealed · added to '{_APOLLO_REVEALED_LIST}' list")
+                                    if not _dc_rn.get("email") and not _dc_rn.get("work_email") and not _dc_revealed_phone:
+                                        st.toast("Nothing revealed — contact may lack Apollo data")
                                     st.rerun()
 
-                            # Push to Monday
-                            if monday_active:
-                                _dc_push_lbl = "♻️ Update" if (_dc_crm and _dc_crm.get("on_crm")) else "📋 Push to Monday"
-                                if st.button(_dc_push_lbl, key=f"dm_push_{_dq_key}_{_dci}",
+                        # ── Company insights ───────────────────────────────────
+                        _dc_co_src  = _dc_enr_data if _dc_enr_data.get("description") else _dcc
+                        _dc_co_desc = _dc_co_src.get("description","")
+                        _dc_co_rev  = _dc_co_src.get("revenue","")
+                        _dc_co_emp  = _dc_co_src.get("employees")
+                        _dc_co_ind  = _dc_co_src.get("industry","")
+                        _dc_co_kw   = _dc_co_src.get("keywords") or []
+                        _dc_co_tech = _dc_co_src.get("tech_count", 0)
+                        _dc_co_yr   = _dc_co_src.get("founded_year")
+                        _dc_co_city = _dc_co_src.get("city","")
+                        _dc_co_ctry = _dc_co_src.get("country","")
+                        if any([_dc_co_desc, _dc_co_rev, _dc_co_emp, _dc_co_ind, _dc_co_kw, _dc_co_tech]):
+                            with st.expander("🏢 Company insights"):
+                                if _dc_co_desc:
+                                    st.caption(_dc_co_desc[:300] + ("…" if len(_dc_co_desc) > 300 else ""))
+                                _dci1, _dci2, _dci3 = st.columns(3)
+                                if _dc_co_rev:  _dci1.metric("Revenue", _dc_co_rev)
+                                if _dc_co_emp:  _dci2.metric("Employees", f"{_dc_co_emp:,}" if isinstance(_dc_co_emp, int) else _dc_co_emp)
+                                if _dc_co_yr:   _dci3.metric("Founded", _dc_co_yr)
+                                if _dc_co_ind:  st.caption(f"Industry: {_dc_co_ind}")
+                                if _dc_co_city or _dc_co_ctry:
+                                    st.caption(f"📍 {', '.join(x for x in [_dc_co_city, _dc_co_ctry] if x)}")
+                                if _dc_co_kw:   st.caption("Keywords: " + ", ".join(_dc_co_kw[:8]))
+                                if _dc_co_tech: st.caption(f"Tech stack: {_dc_co_tech} technologies detected")
+
+                        # ── Push buttons ───────────────────────────────────────
+                        if monday_active:
+                            _dc_src_ctx = f"Decision Makers · {_dq_solution}"
+                            if _dq_source: _dc_src_ctx += f" | from {_dq_source}"
+                            _dc_push_pl = {
+                                "name":           _dc_name,
+                                "title":          _dcc.get("title",""),
+                                "company":        _dq_company,
+                                "email":          _dc_em_val,
+                                "phone":          _dc_ph_val,
+                                "linkedin":       _dcc.get("linkedin",""),
+                                "company_phone":  _dcc.get("company_phone",""),
+                                "twitter":        _dcc.get("twitter",""),
+                                "accuracy_score": str(_dc_fit),
+                                "provider_chain": f"Decision Makers · {_dq_solution}",
+                                "source_context": _dc_src_ctx,
+                            }
+                            _dcp1, _dcp2 = st.columns(2)
+                            with _dcp1:
+                                _dc_leads_lbl = "♻️ Update Leads" if (_dc_crm and _dc_crm.get("on_crm")) else "📋 Push to Leads"
+                                if st.button(_dc_leads_lbl, key=f"dm_push_lead_{_dq_key}_{_dci}",
                                              use_container_width=True,
                                              type="secondary" if (_dc_crm and _dc_crm.get("on_crm")) else "primary"):
-                                    with st.spinner("Syncing to Monday…"):
+                                    with st.spinner("Pushing…"):
                                         try:
-                                            _pmr = sync_lead_to_monday({
-                                                "name":           _dc_name,
-                                                "title":          _dcc.get("title",""),
-                                                "company":        _dq_company,
-                                                "email":          _dc_em,
-                                                "phone":          _dc_ph,
-                                                "linkedin":       _dcc.get("linkedin",""),
-                                                "accuracy_score": str(_dc_fit),
-                                                "provider_chain": f"Decision Makers · {_dq_solution}",
-                                                "source_context": f"from {_dq_source}",
-                                            })
-                                            _pmr_board = _pmr.get("board", "Leads")
-                                            st.success(f"{_pmr.get('action','done').title()} on {_pmr_board} · ID: {_pmr.get('item_id')}")
+                                            _pmr = sync_lead_to_monday(_dc_push_pl)
+                                            st.success(f"{_pmr.get('action','done').title()} · {_pmr.get('item_id')}")
                                             del st.session_state[_dc_crm_sk]
-                                        except Exception as _dpe:
-                                            st.error(f"Push failed: {_dpe}")
+                                        except Exception as _dpe: st.error(str(_dpe))
+                            with _dcp2:
+                                if st.button("🏢 Push to Contacts", key=f"dm_push_contact_{_dq_key}_{_dci}",
+                                             use_container_width=True, type="primary"):
+                                    with st.spinner("Pushing…"):
+                                        try:
+                                            _rc2 = push_to_contacts_board(_dc_push_pl)
+                                            st.success(f"{_rc2.get('action','done').title()} · {_rc2.get('item_id')}")
+                                        except Exception as _pce: st.error(str(_pce))
 
                         _copy_block(
                             "\n".join(l for l in [
-                                f"NAME: {_dc_name}",
+                                f"CONTACT: {_dc_name}",
                                 f"Title: {_dcc.get('title','')}",
                                 f"Company: {_dq_company}",
-                                f"Email: {_dc_em}",
-                                f"Phone: {_dc_ph}",
-                                f"LinkedIn: {_dcc.get('linkedin','')}",
+                                f"Email: {_dc_em_val}"            if _dc_em_val                                    else "",
+                                f"Personal: {_dc_em_personal}"    if _dc_em_personal and _dc_em_personal != _dc_em_val else "",
+                                f"Phone: {_dc_ph_val}"            if _dc_ph_val                                    else "",
+                                f"Co Phone: {_dcc.get('company_phone','')}" if _dcc.get("company_phone")           else "",
+                                f"LinkedIn: {_dcc.get('linkedin','')}"      if _dcc.get("linkedin")                else "",
+                                f"Twitter: {_dcc.get('twitter','')}"        if _dcc.get("twitter")                 else "",
                                 f"CRS Fit: {_dc_fit}%",
                                 f"Source: {_dq_source}",
                             ] if l),
