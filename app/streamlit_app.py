@@ -6120,11 +6120,11 @@ if _page == "🤖 Intelligence Agent":
                                     "urgency": "High" if _ac_score >= 8 else "Medium",
                                 })
                                 _item_id = str(_pr.get("item_id", ""))
-                                supabase.table("agent_leads").update({
+                                _sb_execute(supabase.table("agent_leads").update({
                                     "status": "pushed_companies",
                                     "monday_item_id": _item_id,
                                     "monday_board": "Companies",
-                                }).eq("id", _ac_id).execute()
+                                }).eq("id", _ac_id))
                                 _load_agent_leads.clear()
                                 st.success(f"Pushed · {_item_id}")
                                 st.rerun()
@@ -6147,11 +6147,11 @@ if _page == "🤖 Intelligence Agent":
                                     "source_context": _ac_note[:200] if _ac_note else _ac_rationale[:200],
                                 })
                                 _item_id2 = str(_pr2.get("item_id", ""))
-                                supabase.table("agent_leads").update({
+                                _sb_execute(supabase.table("agent_leads").update({
                                     "status": "pushed_leads",
                                     "monday_item_id": _item_id2,
                                     "monday_board": "Leads 2.0",
-                                }).eq("id", _ac_id).execute()
+                                }).eq("id", _ac_id))
                                 _load_agent_leads.clear()
                                 st.success(f"Pushed · {_item_id2}")
                                 st.rerun()
@@ -6174,11 +6174,11 @@ if _page == "🤖 Intelligence Agent":
                                     "source_context": _ac_note[:200] if _ac_note else _ac_rationale[:200],
                                 })
                                 _item_id3 = str(_pr3.get("item_id", ""))
-                                supabase.table("agent_leads").update({
+                                _sb_execute(supabase.table("agent_leads").update({
                                     "status": "pushed_contacts",
                                     "monday_item_id": _item_id3,
                                     "monday_board": "Contacts",
-                                }).eq("id", _ac_id).execute()
+                                }).eq("id", _ac_id))
                                 _load_agent_leads.clear()
                                 st.success(f"Pushed · {_item_id3}")
                                 st.rerun()
@@ -6188,7 +6188,12 @@ if _page == "🤖 Intelligence Agent":
                 with _b4:
                     if st.button("🗑️ Dismiss", key=f"{card_key}_dismiss",
                                  use_container_width=True):
-                        supabase.table("agent_leads").update({"status": "dismissed"}).eq("id", _ac_id).execute()
+                        try:
+                            _sb_execute(supabase.table("agent_leads")
+                                        .update({"status": "dismissed"}).eq("id", _ac_id))
+                        except Exception as _de:
+                            st.error(f"Dismiss failed: {_de}")
+                            return
                         _load_agent_leads.clear()
                         st.rerun()
             else:
