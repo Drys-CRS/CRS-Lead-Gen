@@ -76,3 +76,62 @@ its own logs; keep only a small read-only status panel if useful).
 Scaffold the lean `app/streamlit_app.py` (config + sidebar + the 4 tabs as stubs
 reading Supabase), wire `monday_client.py` actions, then flesh out each tab. Keep
 the existing deploy files untouched.
+
+---
+
+## Development Agent Directives
+
+These are standing instructions for how to approach every change to this codebase.
+
+### 1. Read before writing
+- **Always** read the relevant section of `app/streamlit_app.py` (6 000+ lines) before
+  editing it. Use `grep`/`glob` to locate the exact block; do not guess line numbers.
+- Before adding a new helper, search for an existing one that does the same thing
+  (`_norm_apollo`, `_call_ai`, `_sb_execute`, `_copy_block`, `_colored_header`, etc.).
+- Check `app/monday_client.py` before touching any CRM push — board/column IDs are
+  already mapped; never re-derive them.
+- Understand where a new feature fits in the session-state model
+  (`_active_page`, `dm_queue`, `lk_results`, `agent_leads`) before touching state keys.
+
+### 2. Code quality rules
+- **DRY**: if the same pattern appears more than twice, extract it.
+  Key reusable patterns: `_render_agent_card`, `_copy_block`, `_tab_cards`.
+- **No dead imports**: if a library is used conditionally, guard with `try/except`.
+- **Error boundaries on every external call**: Supabase queries, Apollo API calls,
+  AI calls, and Monday.com pushes must each be wrapped in `try/except` with a
+  user-visible `st.error(...)` or `st.toast(...)`.
+- **Cache correctly**: Supabase loaders use `@st.cache_data(ttl=300)`. Mutation
+  functions (insert/update) must call `loader.clear()` after success.
+- **Session state keys must be unique and predictable**. Prefix widget keys with
+  the page abbreviation (`lk_`, `dm_`, `ia_`, `opp_`, etc.) to avoid collisions.
+- **No hardcoded secrets** — always `st.secrets.get(...)` or `os.getenv(...)`.
+
+### 3. Proactive quality checks
+When building or modifying a feature:
+- Verify the happy path *and* the empty-state (no data / no API key / API error).
+- Add a human-readable placeholder/caption when a Supabase table is empty or a
+  required key is missing — never let the UI silently render nothing.
+- For any new Supabase table, document its required columns as a `st.caption()`
+  help text (schema hint) so the user knows what to create if the table is absent.
+- Prefer `st.container(border=True)` over raw markdown for card-style layouts.
+- When a push button succeeds, immediately update the underlying session-state list
+  so `st.rerun()` shows the new state without a double API call.
+
+### 4. Commit discipline
+- Commits require **explicit user request** — never auto-commit or auto-push.
+- Each commit must cover one logical change with a descriptive message (what + why).
+- Run a syntax check (`python -c "import ast; ast.parse(open('app/streamlit_app.py').read())"`)
+  before every commit.
+- Do NOT use `git add .` — stage specific files to avoid accidentally committing
+  `.env`, `secrets.toml`, or large binaries.
+
+### 5. Pipeline / agent files (separate concern from UI)
+- `app/tender_agent.py` and `app/ingest_core.py` are headless pipeline modules.
+  They must never import Streamlit.
+- New pipeline phases go into `app/tender_agent.py` (web-search-driven agent) or
+  `app/ingest_core.py` (OCDS API scraping), not into `streamlit_app.py`.
+- New search queries go into `_TENDER_QUERIES`, `_ATTACK_QUERIES`, or
+  `_PARTNER_QUERIES` in `tender_agent.py`.
+- When adding a new secret used by the pipeline, add it to **both**:
+  - `ALLOWED_KEYS` in `make_secrets.py` (for the HF Space)
+  - The `env:` block in `.github/workflows/agent-tender.yml`
