@@ -1653,12 +1653,15 @@ def _agent_analyse_signal(signal: str, signal_type: str = "General") -> dict:
         f"SIGNAL TYPE: {signal_type}\n"
         f"SIGNAL:\n{signal[:3000]}\n\n"
         "Return ONLY valid JSON (no markdown):\n"
-        '{"lead_type":"Strategic Partner|End-User|Irrelevant",'
+        '{"lead_type":"Company Lead|Opportunity|Contact Lead|Irrelevant",'
         '"company":"name or Unknown","country":"country or Unknown",'
-        '"score":<1-10>,"rationale":"2-3 sentences",'
+        '"score":<1-10>,'
+        '"rationale":"2-3 sentences explaining why this was flagged as a CRS lead",'
         '"proposed_solutions":["sol1","sol2"],'
         '"pain_points":["pain1"],'
-        '"outreach_angle":"one sentence — specific CRS solution to confirmed pain point",'
+        '"outreach_note":"2-3 sentence sales brief: what triggered this lead, '
+        'which specific CRS product addresses the confirmed pain point, '
+        'and the recommended opening hook for the first email or call",'
         '"enrichment_status":"Complete|Partial|Missing",'
         '"next_action":"Push to Monday|Market Trends|Discard|Enrich First"}'
     )
@@ -1672,7 +1675,7 @@ def _agent_analyse_signal(signal: str, signal_type: str = "General") -> dict:
             except Exception: pass
     return {"lead_type": "Unknown", "company": "Unknown", "country": "Unknown",
             "score": 0, "rationale": raw[:300], "proposed_solutions": [],
-            "pain_points": [], "outreach_angle": "",
+            "pain_points": [], "outreach_note": "",
             "enrichment_status": "Missing", "next_action": "Discard"}
 
 
@@ -1708,6 +1711,172 @@ def _agent_enrich_company(company: str, country: str = "") -> dict:
     except Exception as e:
         result["enrichment_status"] = f"Failed: {str(e)[:100]}"
     return result
+
+
+@st.cache_data(ttl=60)
+def _load_agent_leads(statuses: tuple = ("pending",)) -> pd.DataFrame:
+    try:
+        q = (supabase.table("agent_leads").select("*")
+             .in_("status", list(statuses))
+             .order("score", desc=True)
+             .order("created_at", desc=True)
+             .limit(500))
+        r = _sb_execute(q)
+        return pd.DataFrame(r.data or [])
+    except Exception:
+        return pd.DataFrame()
+
+
+def _run_agent_batch(sources: list, limit: int = 20) -> tuple:
+    """Pull from selected sources, analyse each unprocessed record, insert into agent_leads.
+    Returns (inserted, skipped, errors)."""
+    inserted = skipped = errors = 0
+    try:
+        existing_raw = supabase.table("agent_leads").select("source_type,source_id").execute().data or []
+    except Exception:
+        existing_raw = []
+    existing = {(r["source_type"], str(r.get("source_id", ""))) for r in existing_raw}
+
+    items: list = []  # (source_type, source_id, signal_text, signal_type, extra_fields)
+
+    if "tenders" in sources:
+        try:
+            rows = _sb_execute(
+                supabase.table("sa_tenders").select("*")
+                .gte("ai_score", 6).neq("is_irrelevant", True)
+                .order("ai_score", desc=True).limit(limit)
+            ).data or []
+        except Exception:
+            rows = []
+        for r in rows:
+            sid = str(r.get("id", ""))
+            if ("tender", sid) in existing:
+                skipped += 1
+                continue
+            sig = (f"Tender title: {r.get('title','')}\n"
+                   f"Department: {r.get('department_name','')}\n"
+                   f"Country: {r.get('country','')}\n"
+                   f"Description: {str(r.get('description',''))[:500]}\n"
+                   f"AI score: {r.get('ai_score')}/10  Rationale: {r.get('ai_rationale','')}")
+            items.append(("tender", sid, sig, "Tender",
+                          {"company": r.get("department_name", "") or r.get("title", ""),
+                           "country": r.get("country", ""),
+                           "lead_type": "Opportunity"}))
+
+    if "partner_recs" in sources:
+        try:
+            rows = _sb_execute(
+                supabase.table("partner_recommendation_history").select("*")
+                .order("run_at", desc=True).limit(limit * 4)
+            ).data or []
+        except Exception:
+            rows = []
+        seen: set = set()
+        for r in rows:
+            company = str(r.get("company", "")).strip()
+            if not company or company in seen:
+                continue
+            seen.add(company)
+            sid = str(r.get("id", ""))
+            if ("partner_rec", sid) in existing:
+                skipped += 1
+                continue
+            sig = (f"Company: {company}\nCountry: {r.get('country','')}\n"
+                   f"Why aligned: {str(r.get('why','') or r.get('why_aligned',''))[:400]}\n"
+                   f"Urgency: {r.get('urgency','')}  Deal size: {r.get('estimated_deal_size','')}")
+            items.append(("partner_rec", sid, sig, "Partner Recommendation",
+                          {"company": company, "country": str(r.get("country", "")),
+                           "lead_type": "Company Lead"}))
+            if len(items) >= limit:
+                break
+
+    if "awarded_companies" in sources:
+        try:
+            rows = _sb_execute(
+                supabase.table("awarded_tenders")
+                .select("winning_bidder,country,title,department_name,award_value")
+                .neq("winning_bidder", None)
+                .order("created_at", desc=True).limit(limit * 6)
+            ).data or []
+        except Exception:
+            rows = []
+        seen_aw: set = set()
+        for r in rows:
+            company = str(r.get("winning_bidder", "")).strip()
+            if not company or len(company) < 3 or company in seen_aw:
+                continue
+            seen_aw.add(company)
+            sid = f"aw_{company[:60]}"
+            if ("awarded_company", sid) in existing:
+                skipped += 1
+                continue
+            sig = (f"Company: {company}\nCountry: {r.get('country','')}\n"
+                   f"Won tender: {r.get('title','')[:200]}\n"
+                   f"Dept: {r.get('department_name','')}  Value: {r.get('award_value','')}")
+            items.append(("awarded_company", sid, sig, "Awarded Tender",
+                          {"company": company, "country": str(r.get("country", "")),
+                           "lead_type": "Company Lead"}))
+            if len(items) >= limit:
+                break
+
+    if "dork_leads" in sources:
+        try:
+            rows = _sb_execute(
+                supabase.table("dork_leads").select("*")
+                .is_("monday_item_id", "null")
+                .order("created_at", desc=True).limit(limit)
+            ).data or []
+        except Exception:
+            rows = []
+        for r in rows:
+            sid = str(r.get("linkedin_url", "") or r.get("id", ""))
+            if ("dork_lead", sid) in existing:
+                skipped += 1
+                continue
+            sig = (f"Name: {r.get('name','')}\nTitle: {r.get('job_title','')}\n"
+                   f"Company: {r.get('company','')}\nLinkedIn: {sid}")
+            items.append(("dork_lead", sid, sig, "LinkedIn Contact",
+                          {"company": r.get("company", ""), "country": r.get("country", ""),
+                           "lead_type": "Contact Lead",
+                           "contact_name": r.get("name", ""),
+                           "contact_title": r.get("job_title", ""),
+                           "contact_linkedin": sid,
+                           "contact_email": r.get("email", ""),
+                           "contact_phone": r.get("phone", "")}))
+
+    prog = st.progress(0, text="Analysing leads…")
+    total = max(len(items), 1)
+    for idx, (src_type, src_id, signal, sig_type, extra) in enumerate(items):
+        prog.progress((idx + 1) / total,
+                      text=f"Analysing {idx+1}/{total}: {extra.get('company','')[:40]}…")
+        try:
+            result = _agent_analyse_signal(signal, sig_type)
+            score = int(result.get("score", 0) or 0)
+            record = {
+                "source_type": src_type,
+                "source_id": src_id,
+                "company": extra.get("company", "") or result.get("company", "Unknown"),
+                "country": extra.get("country", "") or result.get("country", ""),
+                "lead_type": extra.get("lead_type", "") or result.get("lead_type", "Company Lead"),
+                "score": score,
+                "rationale": result.get("rationale", ""),
+                "outreach_note": result.get("outreach_note", ""),
+                "proposed_solutions": json.dumps(result.get("proposed_solutions", [])),
+                "pain_points": json.dumps(result.get("pain_points", [])),
+            }
+            for cf in ("contact_name", "contact_title", "contact_linkedin",
+                       "contact_email", "contact_phone"):
+                if extra.get(cf):
+                    record[cf] = extra[cf]
+            supabase.table("agent_leads").insert(record).execute()
+            inserted += 1
+        except Exception as _be:
+            errors += 1
+            st.toast(f"⚠️ Skipped {extra.get('company','?')}: {str(_be)[:80]}", icon="⚠️")
+
+    prog.empty()
+    _load_agent_leads.clear()
+    return inserted, skipped, errors
 
 
 _NAV_PAGES = [
@@ -5790,371 +5959,342 @@ if _page == "👥 Decision Makers":
 if _page == "🤖 Intelligence Agent":
     _colored_header(
         label="CRS Chief Intelligence Agent",
-        description="Autonomously identify, qualify, enrich, and route high-value leads and partners.",
+        description="Source, analyse, and route leads from tenders, partner recs, awarded companies, and dork contacts — daily or on-demand.",
         color_name="violet-70",
     )
 
-    _ia_tab1, _ia_tab2, _ia_tab3, _ia_tab4 = st.tabs([
-        "🔍 Analyse Signal",
-        "📰 Vendor Surveillance",
-        "⚙️ Manual Knowledge Enrichment",
-        "📊 Market Trends",
-    ])
+    # ── Run Analysis Panel ────────────────────────────────────────────────────
+    _ia_pending_df  = _load_agent_leads(statuses=("pending",))
+    _ia_all_df      = _load_agent_leads(statuses=("pending","pushed_companies","pushed_leads","pushed_contacts"))
+    _ia_dismissed   = _load_agent_leads(statuses=("dismissed",))
+    _ia_pending_n   = len(_ia_pending_df)
 
-    # ── TAB 1 — ANALYSE SIGNAL ────────────────────────────────────────────────
-    with _ia_tab1:
-        st.markdown("Feed the agent any raw signal — a company name, news article, tender description, or breach alert. It will classify, score, enrich, and route the lead.")
-
-        _ia_sig_type = st.selectbox(
-            "Signal type",
-            ["Tender", "Breach / Attack News", "LinkedIn / Social Post",
-             "News Article", "Company Name", "General"],
-            key="ia_sig_type",
-        )
-        _ia_signal = st.text_area(
-            "Signal input",
-            placeholder="Paste a news snippet, tender title + description, company name, or breach report…",
-            height=140, key="ia_signal",
-        )
-
-        _ia_col1, _ia_col2 = st.columns([2, 1])
-        with _ia_col1:
-            _ia_analyse = st.button("🧠 Analyse Signal", type="primary",
-                                    use_container_width=True, key="ia_analyse_btn")
-        with _ia_col2:
-            _ia_clear = st.button("🗑️ Clear", use_container_width=True, key="ia_clear_btn")
-            if _ia_clear:
-                for _k in ["ia_signal_result", "ia_enrich_result"]:
-                    st.session_state.pop(_k, None)
+    with st.expander(f"⚙️ Run Analysis  {'— ' + str(_ia_pending_n) + ' leads pending' if _ia_pending_n else ''}", expanded=_ia_pending_n == 0):
+        st.markdown("Select data sources and the agent will pull unprocessed records, score them 1–10, generate a sales outreach note, and queue them below.")
+        _ia_sc1, _ia_sc2, _ia_sc3, _ia_sc4 = st.columns(4)
+        _ia_src_t  = _ia_sc1.checkbox("📢 Open Tenders", value=True, key="ia_src_tenders",
+                                       help="sa_tenders where ai_score ≥ 6")
+        _ia_src_p  = _ia_sc2.checkbox("🤝 Partner Recs",  value=True, key="ia_src_partner",
+                                       help="partner_recommendation_history (most recent run)")
+        _ia_src_a  = _ia_sc3.checkbox("🏆 Awarded Cos",   value=True, key="ia_src_awarded",
+                                       help="winning_bidder companies from awarded_tenders")
+        _ia_src_d  = _ia_sc4.checkbox("🔍 Dork Contacts", value=True, key="ia_src_dork",
+                                       help="dork_leads not yet pushed to Monday")
+        _ia_lim    = st.slider("Max new records per source", 5, 50, 15, 5, key="ia_limit")
+        _ia_run    = st.button("🧠 Run Agent Analysis Now", type="primary",
+                               use_container_width=True, key="ia_run_btn")
+        if _ia_run:
+            _ia_sources = []
+            if _ia_src_t: _ia_sources.append("tenders")
+            if _ia_src_p: _ia_sources.append("partner_recs")
+            if _ia_src_a: _ia_sources.append("awarded_companies")
+            if _ia_src_d: _ia_sources.append("dork_leads")
+            if not _ia_sources:
+                st.warning("Select at least one source.")
+            else:
+                _ins, _sk, _err = _run_agent_batch(_ia_sources, limit=_ia_lim)
+                st.success(f"✅ Done — {_ins} new leads queued · {_sk} already processed · {_err} errors")
                 st.rerun()
 
-        if _ia_analyse and _ia_signal.strip():
-            # Memory check — skip if already processed this session
-            _ia_mem = st.session_state.setdefault("_agent_memory", set())
-            _ia_sig_key = _ia_signal.strip()[:80]
-            if _ia_sig_key in _ia_mem:
-                st.info("⚠️ This signal was already analysed this session. Clear to re-run.")
-            else:
-                with st.spinner("Agent analysing signal…"):
-                    _ia_result = _agent_analyse_signal(_ia_signal, _ia_sig_type)
-                st.session_state["ia_signal_result"] = _ia_result
-                st.session_state.pop("ia_enrich_result", None)
-                _ia_mem.add(_ia_sig_key)
+    st.divider()
 
-        _ia_result = st.session_state.get("ia_signal_result")
-        if _ia_result:
-            _ia_score    = int(_ia_result.get("score", 0) or 0)
-            _ia_company  = _ia_result.get("company","Unknown")
-            _ia_country  = _ia_result.get("country","Unknown")
-            _ia_ltype    = _ia_result.get("lead_type","Unknown")
-            _ia_action   = _ia_result.get("next_action","Discard")
-            _ia_score_c  = ("🟢" if _ia_score >= 7 else "🟡" if _ia_score >= 5 else "🔴")
+    # ── Helper: render a single agent_lead card ───────────────────────────────
+    def _render_agent_card(row: dict, card_key: str):
+        _ac_company  = str(row.get("company") or "Unknown")
+        _ac_country  = str(row.get("country") or "")
+        _ac_score    = int(row.get("score") or 0)
+        _ac_ltype    = str(row.get("lead_type") or "Company Lead")
+        _ac_src      = str(row.get("source_type") or "")
+        _ac_rationale = str(row.get("rationale") or "")
+        _ac_note     = str(row.get("outreach_note") or "")
+        _ac_status   = str(row.get("status") or "pending")
+        _ac_id       = str(row.get("id") or "")
+        _ac_cname    = str(row.get("contact_name") or "")
+        _ac_ctitle   = str(row.get("contact_title") or "")
+        _ac_cemail   = str(row.get("contact_email") or "")
+        _ac_cphone   = str(row.get("contact_phone") or "")
+        _ac_cli      = str(row.get("contact_linkedin") or "")
+        try:
+            _ac_sols  = json.loads(row.get("proposed_solutions") or "[]") if isinstance(row.get("proposed_solutions"), str) else (row.get("proposed_solutions") or [])
+            _ac_pains = json.loads(row.get("pain_points") or "[]") if isinstance(row.get("pain_points"), str) else (row.get("pain_points") or [])
+        except Exception:
+            _ac_sols = _ac_pains = []
 
-            st.divider()
-            with st.container(border=True):
-                _iah1, _iah2 = st.columns([3, 1])
-                with _iah1:
-                    st.markdown(f"### 🏢 {_ia_company}")
-                    st.caption(f"📍 {_ia_country}  ·  Type: **{_ia_ltype}**")
-                with _iah2:
-                    st.metric("Agent Score", f"{_ia_score_c} {_ia_score}/10")
-                    st.caption(f"Action: **{_ia_action}**")
+        _ac_sc_emoji = "🟢" if _ac_score >= 7 else "🟡" if _ac_score >= 5 else "🔴"
+        _src_labels  = {"tender": "📢 Tender", "partner_rec": "🤝 Partner Rec",
+                        "awarded_company": "🏆 Awarded Co", "dork_lead": "🔍 Dork Lead",
+                        "manual": "✍️ Manual"}
+        _ltype_colors = {"Company Lead": "🏢", "Opportunity": "📢",
+                         "Contact Lead": "👤", "Irrelevant": "❌"}
 
-                st.markdown(f"**Rationale:** {_ia_result.get('rationale','')}")
+        with st.container(border=True):
+            _h1, _h2 = st.columns([4, 1])
+            with _h1:
+                st.markdown(f"### {_ltype_colors.get(_ac_ltype,'🏢')} {_ac_company}")
+                _meta = [x for x in [
+                    f"📍 {_ac_country}" if _ac_country else "",
+                    _src_labels.get(_ac_src, _ac_src),
+                    _ac_ltype,
+                    f"**Pushed** to {row.get('monday_board','Monday')}" if _ac_status.startswith("pushed") else "",
+                ] if x]
+                st.caption("  ·  ".join(_meta))
+            with _h2:
+                st.metric("Agent Score", f"{_ac_sc_emoji} {_ac_score}/10")
 
-                _ia_sols = _ia_result.get("proposed_solutions") or []
-                _ia_pains = _ia_result.get("pain_points") or []
-                _ia_angle = _ia_result.get("outreach_angle","")
+            if _ac_rationale:
+                st.markdown(f"**Why this lead:** {_ac_rationale}")
 
-                _iab1, _iab2 = st.columns(2)
-                with _iab1:
-                    if _ia_sols:
-                        st.markdown("**Proposed solutions:**")
-                        for s in _ia_sols:
+            if _ac_note:
+                st.info(f"💬 **Sales outreach note:** {_ac_note}")
+
+            if _ac_sols or _ac_pains:
+                _sol_col, _pain_col = st.columns(2)
+                with _sol_col:
+                    if _ac_sols:
+                        st.markdown("**Proposed CRS solutions:**")
+                        for s in _ac_sols[:4]:
                             st.markdown(f"  • {s}")
-                with _iab2:
-                    if _ia_pains:
+                with _pain_col:
+                    if _ac_pains:
                         st.markdown("**Pain points:**")
-                        for p in _ia_pains:
+                        for p in _ac_pains[:4]:
                             st.markdown(f"  • {p}")
 
-                if _ia_angle:
-                    st.info(f"💬 **Outreach angle:** {_ia_angle}")
+            if _ac_ltype == "Contact Lead" and (_ac_cname or _ac_cemail):
+                with st.expander("👤 Contact details"):
+                    if _ac_cname:  st.caption(f"**Name:** {_ac_cname}")
+                    if _ac_ctitle: st.caption(f"**Title:** {_ac_ctitle}")
+                    if _ac_cemail: st.caption(f"**Email:** {_ac_cemail}")
+                    if _ac_cphone: st.caption(f"**Phone:** {_ac_cphone}")
+                    if _ac_cli:    st.markdown(f"[LinkedIn →]({_ac_cli})")
 
-                st.caption(f"Enrichment status: *{_ia_result.get('enrichment_status','Unknown')}*")
+            # ── Action buttons ────────────────────────────────────────────
+            if _ac_status == "pending":
+                _b1, _b2, _b3, _b4 = st.columns(4)
 
-            # ── Enrich button ──────────────────────────────────────────────
-            _ia_enr_data = st.session_state.get("ia_enrich_result")
-            _ia_has_apo = bool(st.secrets.get("APOLLO_API_KEY","") or os.getenv("APOLLO_API_KEY",""))
-
-            if _ia_company != "Unknown" and _ia_has_apo and not _ia_enr_data:
-                if st.button("🔎 Enrich with Apollo", key="ia_enrich_btn",
-                             use_container_width=True, type="primary"):
-                    with st.spinner(f"Enriching {_ia_company} via Apollo…"):
-                        _ia_enr_data = _agent_enrich_company(_ia_company, _ia_country)
-                    st.session_state["ia_enrich_result"] = _ia_enr_data
-                    st.rerun()
-
-            if _ia_enr_data:
-                st.divider()
-                _ia_org = _ia_enr_data.get("org", {})
-                _ia_contacts = _ia_enr_data.get("contacts", [])
-                st.caption(f"Apollo enrichment: *{_ia_enr_data.get('enrichment_status','')}*")
-
-                if _ia_org:
-                    with st.expander("🏢 Company intelligence", expanded=True):
-                        _ioe1, _ioe2, _ioe3 = st.columns(3)
-                        if _ia_org.get("employees"): _ioe1.metric("Employees", f"{_ia_org['employees']:,}" if isinstance(_ia_org["employees"], int) else _ia_org["employees"])
-                        if _ia_org.get("industry"):  _ioe2.metric("Industry", _ia_org["industry"])
-                        if _ia_org.get("country"):   _ioe3.metric("HQ", _ia_org["country"])
-                        if _ia_org.get("description"): st.caption(_ia_org["description"][:300])
-                        if _ia_org.get("domain"):    st.caption(f"🌐 {_ia_org['domain']}")
-                        if _ia_org.get("tech"):      st.caption("Tech: " + ", ".join(_ia_org["tech"][:8]))
-                        if _ia_org.get("keywords"):  st.caption("Keywords: " + ", ".join(_ia_org["keywords"][:6]))
-
-                if _ia_contacts:
-                    st.markdown(f"**{len(_ia_contacts)} decision-maker contacts found:**")
-                    for _iac in _ia_contacts:
-                        with st.container(border=True):
-                            _iacc1, _iacc2 = st.columns([3, 1])
-                            with _iacc1:
-                                st.markdown(f"**👤 {_iac.get('name','—')}**")
-                                _iac_rp = [x for x in [_iac.get("title"), _iac.get("company")] if x]
-                                if _iac_rp: st.caption("💼 " + "  ·  ".join(_iac_rp))
-                                if _iac.get("email"):   st.caption(f"📧 {_iac['email']}")
-                                if _iac.get("phone"):   st.caption(f"📞 {_iac['phone']}")
-                                if _iac.get("linkedin"): st.markdown(f"[LinkedIn →]({_iac['linkedin']})")
-                            with _iacc2:
-                                if monday_active:
-                                    if st.button("📋 Push", key=f"ia_push_{_iac.get('id','')}", use_container_width=True):
-                                        with st.spinner("Pushing to Monday…"):
-                                            try:
-                                                _ia_pr = sync_lead_to_monday({
-                                                    "name":           _iac.get("name",""),
-                                                    "title":          _iac.get("title",""),
-                                                    "company":        _ia_company,
-                                                    "email":          _iac.get("email",""),
-                                                    "phone":          _iac.get("phone",""),
-                                                    "linkedin":       _iac.get("linkedin",""),
-                                                    "provider_chain": "Intelligence Agent",
-                                                    "source_context": f"Signal: {_ia_sig_type}",
-                                                })
-                                                st.success(f"Pushed · {_ia_pr.get('item_id')}")
-                                            except Exception as _iae:
-                                                st.error(str(_iae))
-
-            # ── Route action buttons ───────────────────────────────────────
-            st.divider()
-            _iac1, _iac2 = st.columns(2)
-            with _iac1:
-                if _ia_score >= 5 and monday_active:
-                    if st.button("📋 Push company lead to Monday", key="ia_push_company",
-                                 use_container_width=True, type="primary"):
-                        with st.spinner("Pushing…"):
+                if monday_active and _ac_ltype in ("Company Lead", "Opportunity"):
+                    with _b1:
+                        if st.button("🏢 Companies", key=f"{card_key}_push_co",
+                                     use_container_width=True):
                             try:
-                                _ia_pr2 = sync_lead_to_monday({
-                                    "name":           _ia_company,
-                                    "company":        _ia_company,
-                                    "email":          "",
-                                    "provider_chain": "Intelligence Agent",
-                                    "source_context": f"{_ia_sig_type} · Score {_ia_score}/10",
+                                _pr = push_partner_to_companies({
+                                    "company": _ac_company,
+                                    "country": _ac_country,
+                                    "crs_score": _ac_score * 10,
+                                    "why": _ac_rationale,
+                                    "outreach_angle": _ac_note,
+                                    "proposed_solutions": _ac_sols,
+                                    "urgency": "High" if _ac_score >= 8 else "Medium",
                                 })
-                                st.success(f"Pushed · {_ia_pr2.get('item_id')}")
-                            except Exception as _iae2:
-                                st.error(str(_iae2))
-                else:
-                    st.caption("📋 Score ≥5 required to push to Monday")
-            with _iac2:
-                if st.button("📉 Log to Market Trends", key="ia_log_trend",
-                             use_container_width=True):
-                    try:
-                        supabase.table("market_trends").insert({
-                            "company":    _ia_company,
-                            "country":    _ia_country,
-                            "lead_type":  _ia_ltype,
-                            "score":      _ia_score,
-                            "rationale":  _ia_result.get("rationale",""),
-                            "solutions":  json.dumps(_ia_sols),
-                            "outreach_angle": _ia_angle,
-                            "signal_type": _ia_sig_type,
-                        }).execute()
-                        _load_market_trends.clear()
-                        st.success("Added to Market Trends log.")
-                    except Exception as _te:
-                        st.error(f"Market Trends table missing or error: {_te}")
+                                _item_id = str(_pr.get("item_id", ""))
+                                supabase.table("agent_leads").update({
+                                    "status": "pushed_companies",
+                                    "monday_item_id": _item_id,
+                                    "monday_board": "Companies",
+                                }).eq("id", _ac_id).execute()
+                                _load_agent_leads.clear()
+                                st.success(f"Pushed · {_item_id}")
+                                st.rerun()
+                            except Exception as _pe:
+                                st.error(str(_pe))
 
-            _copy_block(
-                "\n".join(l for l in [
-                    f"COMPANY: {_ia_company}",
-                    f"Country: {_ia_country}",
-                    f"Lead Type: {_ia_ltype}",
-                    f"Score: {_ia_score}/10",
-                    f"Rationale: {_ia_result.get('rationale','')}",
-                    f"Solutions: {', '.join(_ia_sols)}",
-                    f"Pain Points: {', '.join(_ia_pains)}",
-                    f"Outreach Angle: {_ia_angle}",
-                    f"Action: {_ia_action}",
-                ] if l),
-                label="📋 Copy analysis",
-                key="ia_copy_analysis",
-            )
+                if monday_active:
+                    with _b2:
+                        if st.button("📋 Leads Board", key=f"{card_key}_push_lead",
+                                     use_container_width=True):
+                            try:
+                                _pr2 = sync_lead_to_monday({
+                                    "name": _ac_cname or _ac_company,
+                                    "title": _ac_ctitle or _ac_ltype,
+                                    "company": _ac_company,
+                                    "email": _ac_cemail,
+                                    "phone": _ac_cphone,
+                                    "linkedin": _ac_cli,
+                                    "provider_chain": f"Intelligence Agent · {_ac_src}",
+                                    "source_context": _ac_note[:200] if _ac_note else _ac_rationale[:200],
+                                })
+                                _item_id2 = str(_pr2.get("item_id", ""))
+                                supabase.table("agent_leads").update({
+                                    "status": "pushed_leads",
+                                    "monday_item_id": _item_id2,
+                                    "monday_board": "Leads 2.0",
+                                }).eq("id", _ac_id).execute()
+                                _load_agent_leads.clear()
+                                st.success(f"Pushed · {_item_id2}")
+                                st.rerun()
+                            except Exception as _pe2:
+                                st.error(str(_pe2))
 
-    # ── TAB 2 — VENDOR SURVEILLANCE ───────────────────────────────────────────
-    with _ia_tab2:
-        st.markdown("Fetch a vendor or partner site, compare it against the CRS portfolio, and flag any new or changed offerings.")
+                if monday_active and _ac_ltype == "Contact Lead" and (_ac_cemail or _ac_cname):
+                    with _b3:
+                        if st.button("🏢 Contacts Board", key=f"{card_key}_push_ct",
+                                     use_container_width=True):
+                            try:
+                                _pr3 = push_to_contacts_board({
+                                    "name": _ac_cname,
+                                    "title": _ac_ctitle,
+                                    "company": _ac_company,
+                                    "email": _ac_cemail,
+                                    "phone": _ac_cphone,
+                                    "linkedin": _ac_cli,
+                                    "provider_chain": f"Intelligence Agent · {_ac_src}",
+                                    "source_context": _ac_note[:200] if _ac_note else _ac_rationale[:200],
+                                })
+                                _item_id3 = str(_pr3.get("item_id", ""))
+                                supabase.table("agent_leads").update({
+                                    "status": "pushed_contacts",
+                                    "monday_item_id": _item_id3,
+                                    "monday_board": "Contacts",
+                                }).eq("id", _ac_id).execute()
+                                _load_agent_leads.clear()
+                                st.success(f"Pushed · {_item_id3}")
+                                st.rerun()
+                            except Exception as _pe3:
+                                st.error(str(_pe3))
 
-        _vs_url = st.text_input(
-            "Vendor / partner URL",
-            value="https://retaliator.io",
-            key="vs_url",
-            placeholder="https://retaliator.io or any partner portal",
-        )
-        _vs_scan = st.button("🔭 Scan Vendor Site", type="primary", key="vs_scan_btn", use_container_width=True)
-
-        if _vs_scan and _vs_url.strip():
-            with st.spinner(f"Fetching {_vs_url}…"):
-                _vs_content = _fetch_url_content(_vs_url.strip())
-            with st.spinner("Agent comparing against CRS portfolio…"):
-                _vs_prompt = (
-                    f"{_CRS_AGENT_SYSTEM}\n\n"
-                    f"VENDOR SITE URL: {_vs_url}\n"
-                    f"SITE CONTENT (truncated):\n{_vs_content}\n\n"
-                    "Compare this vendor/partner site against the CRS portfolio above.\n"
-                    "Return ONLY valid JSON:\n"
-                    '{"vendor_name":"name","summary":"1-2 sentence overview",'
-                    '"existing_overlap":["product1"],'
-                    '"new_services":["anything not in CRS portfolio"],'
-                    '"partnership_angle":"how CRS could partner or compete",'
-                    '"recommended_action":"Explore Partnership|Update CRS Profile|Monitor|No Action",'
-                    '"key_contacts_to_find":["CEO","CTO"]}'
-                )
-                _vs_raw = _call_ai(_vs_prompt)
-                try:
-                    _vs_result = json.loads(_vs_raw)
-                except Exception:
-                    m = re.search(r'\{[\s\S]*\}', _vs_raw)
-                    _vs_result = json.loads(m.group(0)) if m else {"summary": _vs_raw[:300]}
-            st.session_state["vs_result"] = _vs_result
-            st.session_state["vs_content"] = _vs_content
-            st.rerun()
-
-        _vs_result = st.session_state.get("vs_result")
-        if _vs_result:
-            with st.container(border=True):
-                st.markdown(f"### 🏢 {_vs_result.get('vendor_name','Vendor')}")
-                st.caption(_vs_result.get("summary",""))
-                _vsc1, _vsc2 = st.columns(2)
-                with _vsc1:
-                    if _vs_result.get("existing_overlap"):
-                        st.markdown("**Overlaps with CRS portfolio:**")
-                        for _ov in _vs_result["existing_overlap"]:
-                            st.markdown(f"  • {_ov}")
-                with _vsc2:
-                    if _vs_result.get("new_services"):
-                        st.markdown("**New / uncovered services:**")
-                        for _ns in _vs_result["new_services"]:
-                            st.markdown(f"  • {_ns}")
-                if _vs_result.get("partnership_angle"):
-                    st.info(f"🤝 **Partnership angle:** {_vs_result['partnership_angle']}")
-                st.caption(f"Recommended action: **{_vs_result.get('recommended_action','')}**")
-
-            if st.button("💾 Save to Knowledge Base", key="vs_save_kb", use_container_width=True):
-                try:
-                    supabase.table("knowledge_base").insert({
-                        "source":  _vs_url,
-                        "summary": json.dumps(_vs_result),
-                    }).execute()
-                    _load_knowledge_base.clear()
-                    st.success("Saved to knowledge base.")
-                except Exception as _kbe:
-                    st.error(f"knowledge_base table missing or error: {_kbe}")
-
-            with st.expander("Raw site content"):
-                st.code(st.session_state.get("vs_content","")[:3000], language=None)
-
-    # ── TAB 3 — MANUAL KNOWLEDGE ENRICHMENT ──────────────────────────────────
-    with _ia_tab3:
-        st.markdown("Feed the agent vendor documentation, partnership agreements, or any reference material. It extracts CRS-relevant features and stores them for future signal analysis.")
-
-        _ke_url  = st.text_input("URL to vendor documentation (optional)", key="ke_url",
-                                  placeholder="https://vendor.com/partner-guide")
-        _ke_text = st.text_area("Or paste raw text / document content", height=180, key="ke_text",
-                                 placeholder="Paste product specs, pricing sheets, partnership terms…")
-
-        if st.button("🚀 Feed to Knowledge Base", type="primary",
-                     use_container_width=True, key="ke_feed_btn"):
-            if not _ke_url.strip() and not _ke_text.strip():
-                st.warning("Provide a URL or paste some content first.")
+                with _b4:
+                    if st.button("🗑️ Dismiss", key=f"{card_key}_dismiss",
+                                 use_container_width=True):
+                        supabase.table("agent_leads").update({"status": "dismissed"}).eq("id", _ac_id).execute()
+                        _load_agent_leads.clear()
+                        st.rerun()
             else:
-                with st.spinner("Fetching content…"):
-                    _ke_content = _fetch_url_content(_ke_url.strip()) if _ke_url.strip() else _ke_text.strip()
-                with st.spinner("Agent extracting CRS-relevant features…"):
-                    _ke_prompt = (
-                        f"{_CRS_AGENT_SYSTEM}\n\n"
-                        "Extract all CRS-relevant features from the document below. "
-                        "Focus on: products/services that overlap with or complement the CRS portfolio, "
-                        "pricing signals, target markets, integration capabilities, and partnership terms.\n\n"
-                        f"SOURCE: {_ke_url or 'Manual Input'}\n"
-                        f"CONTENT:\n{_ke_content[:4000]}\n\n"
-                        "Return a concise summary (3-5 sentences) of CRS-relevant insights only."
-                    )
-                    _ke_summary = _call_ai(_ke_prompt)
+                # Already actioned
+                _ac_board = row.get("monday_board", "")
+                _ac_mid   = row.get("monday_item_id", "")
+                st.caption(f"✅ {_ac_status.replace('_',' ').title()}"
+                           + (f" · {_ac_board}" if _ac_board else "")
+                           + (f" · ID {_ac_mid}" if _ac_mid else ""))
+
+    # ── Lead Queue Tabs ────────────────────────────────────────────────────────
+    _ia_qtab_pend, _ia_qtab_co, _ia_qtab_opp, _ia_qtab_ct, _ia_qtab_all, _ia_qtab_dis = st.tabs([
+        f"⏳ Pending ({len(_ia_pending_df)})",
+        "🏢 Company Leads",
+        "📢 Opportunities",
+        "👤 Contact Leads",
+        "📋 All Actioned",
+        "🗑️ Dismissed",
+    ])
+
+    def _tab_cards(df: pd.DataFrame, tab_key: str, empty_msg: str):
+        if df.empty:
+            st.caption(empty_msg)
+            return
+        for _qi, _qrow in df.iterrows():
+            _render_agent_card(_qrow.to_dict(), f"{tab_key}_{_qi}")
+
+    with _ia_qtab_pend:
+        if _ia_pending_df.empty:
+            st.info("No pending leads. Run an analysis above to populate the queue.")
+        else:
+            _fc1, _fc2, _fc3 = st.columns(3)
+            _fc1.metric("Pending leads", len(_ia_pending_df))
+            _high = len(_ia_pending_df[_ia_pending_df["score"] >= 7]) if not _ia_pending_df.empty and "score" in _ia_pending_df.columns else 0
+            _fc2.metric("High-score (≥7)", _high)
+            _fc3.metric("Sources", _ia_pending_df["source_type"].nunique() if "source_type" in _ia_pending_df.columns else 0)
+            st.divider()
+            for _qi, _qrow in _ia_pending_df.iterrows():
+                _render_agent_card(_qrow.to_dict(), f"pend_{_qi}")
+
+    with _ia_qtab_co:
+        _co_df = _ia_pending_df[_ia_pending_df["lead_type"] == "Company Lead"] if not _ia_pending_df.empty and "lead_type" in _ia_pending_df.columns else pd.DataFrame()
+        _tab_cards(_co_df, "co", "No pending Company Leads.")
+
+    with _ia_qtab_opp:
+        _opp_df = _ia_pending_df[_ia_pending_df["lead_type"] == "Opportunity"] if not _ia_pending_df.empty and "lead_type" in _ia_pending_df.columns else pd.DataFrame()
+        _tab_cards(_opp_df, "opp", "No pending Opportunities.")
+
+    with _ia_qtab_ct:
+        _ct_df = _ia_pending_df[_ia_pending_df["lead_type"] == "Contact Lead"] if not _ia_pending_df.empty and "lead_type" in _ia_pending_df.columns else pd.DataFrame()
+        _tab_cards(_ct_df, "ct", "No pending Contact Leads.")
+
+    with _ia_qtab_all:
+        _tab_cards(_ia_all_df, "all", "No actioned leads yet.")
+
+    with _ia_qtab_dis:
+        _tab_cards(_ia_dismissed, "dis", "No dismissed leads.")
+
+    # ── Secondary tools: Knowledge Base + Vendor Surveillance ─────────────────
+    st.divider()
+    st.markdown("#### Intelligence Tools")
+    _ia_vs_tab, _ia_ke_tab = st.tabs(["📰 Vendor Surveillance", "⚙️ Knowledge Enrichment"])
+
+    with _ia_vs_tab:
+        st.markdown("Fetch a vendor or partner site, compare it against the CRS portfolio, save findings to the knowledge base.")
+        _vs_url = st.text_input("Vendor URL", value="https://retaliator.io", key="vs_url2")
+        if st.button("🔭 Scan", type="primary", key="vs_scan2", use_container_width=True):
+            with st.spinner(f"Fetching {_vs_url}…"):
+                _vs_c = _fetch_url_content(_vs_url.strip())
+            with st.spinner("Comparing against CRS portfolio…"):
+                _vs_p = (f"{_CRS_AGENT_SYSTEM}\n\nVENDOR URL: {_vs_url}\nCONTENT:\n{_vs_c}\n\n"
+                         "Compare against CRS portfolio. Return ONLY JSON:\n"
+                         '{"vendor_name":"","summary":"","existing_overlap":[],'
+                         '"new_services":[],"partnership_angle":"","recommended_action":""}')
+                _vs_r = _call_ai(_vs_p)
+                try:
+                    _vs_j = json.loads(_vs_r)
+                except Exception:
+                    _m2 = re.search(r'\{[\s\S]*\}', _vs_r)
+                    _vs_j = json.loads(_m2.group(0)) if _m2 else {"summary": _vs_r[:300]}
+            st.session_state["vs_result2"] = _vs_j
+
+        _vs_j = st.session_state.get("vs_result2")
+        if _vs_j:
+            with st.container(border=True):
+                st.markdown(f"### {_vs_j.get('vendor_name','Vendor')}")
+                st.caption(_vs_j.get("summary",""))
+                _vc1, _vc2 = st.columns(2)
+                with _vc1:
+                    if _vs_j.get("existing_overlap"):
+                        st.markdown("**Overlaps with CRS:**")
+                        for _ov in _vs_j["existing_overlap"]:
+                            st.markdown(f"  • {_ov}")
+                with _vc2:
+                    if _vs_j.get("new_services"):
+                        st.markdown("**New / uncovered:**")
+                        for _ns in _vs_j["new_services"]:
+                            st.markdown(f"  • {_ns}")
+                if _vs_j.get("partnership_angle"): st.info(f"🤝 {_vs_j['partnership_angle']}")
+                st.caption(f"Action: **{_vs_j.get('recommended_action','')}**")
+            if st.button("💾 Save to Knowledge Base", key="vs_save2", use_container_width=True):
                 try:
                     supabase.table("knowledge_base").insert({
-                        "source":  _ke_url.strip() or "Manual Input",
-                        "summary": _ke_summary,
-                    }).execute()
+                        "source": _vs_url, "summary": json.dumps(_vs_j)}).execute()
                     _load_knowledge_base.clear()
-                    st.success("✅ Knowledge base updated!")
-                    st.info(f"**Extracted:** {_ke_summary[:400]}")
-                except Exception as _kbe2:
-                    st.error(f"knowledge_base table missing or write error: {_kbe2}")
-                    st.info(f"**Extracted summary (not saved):**\n\n{_ke_summary}")
+                    st.success("Saved.")
+                except Exception as _ke3:
+                    st.error(str(_ke3))
+
+    with _ia_ke_tab:
+        st.markdown("Feed a URL or text to the knowledge base. The agent injects these summaries into every future lead analysis.")
+        _ke_url2  = st.text_input("URL (optional)", key="ke_url2")
+        _ke_text2 = st.text_area("Or paste text", height=120, key="ke_text2")
+        if st.button("🚀 Feed to Knowledge Base", type="primary",
+                     key="ke_feed2", use_container_width=True):
+            if not _ke_url2.strip() and not _ke_text2.strip():
+                st.warning("Provide a URL or paste content.")
+            else:
+                _kc = _fetch_url_content(_ke_url2.strip()) if _ke_url2.strip() else _ke_text2.strip()
+                _kp = (f"{_CRS_AGENT_SYSTEM}\n\nExtract CRS-relevant insights:\n"
+                       f"SOURCE: {_ke_url2 or 'Manual'}\nCONTENT:\n{_kc[:4000]}\n\n"
+                       "3-5 sentence summary of CRS-relevant features only.")
+                _ks = _call_ai(_kp)
+                try:
+                    supabase.table("knowledge_base").insert({
+                        "source": _ke_url2.strip() or "Manual", "summary": _ks}).execute()
+                    _load_knowledge_base.clear()
+                    st.success("✅ Knowledge base updated.")
+                    st.info(_ks[:400])
+                except Exception as _kbe3:
+                    st.error(str(_kbe3))
 
         st.divider()
-        st.markdown("#### Current Knowledge Base")
-        _kb_df = _load_knowledge_base()
-        if _kb_df.empty:
-            st.caption("No entries yet. Feed a URL or document above to build the knowledge base.")
-            st.caption("Requires a `knowledge_base` Supabase table with columns: `source` (text), `summary` (text), `created_at` (timestamptz, default now()).")
+        st.markdown("**Current Knowledge Base**")
+        _kb_df2 = _load_knowledge_base()
+        if _kb_df2.empty:
+            st.caption("Empty. Feed a URL or document above.")
         else:
-            for _, _kb_row in _kb_df.iterrows():
-                with st.expander(f"📄 {str(_kb_row.get('source',''))[:80]}  —  {str(_kb_row.get('created_at',''))[:10]}"):
-                    st.write(_kb_row.get("summary",""))
+            for _, _kb_r in _kb_df2.iterrows():
+                with st.expander(f"📄 {str(_kb_r.get('source',''))[:80]}  —  {str(_kb_r.get('created_at',''))[:10]}"):
+                    st.write(_kb_r.get("summary",""))
 
-    # ── TAB 4 — MARKET TRENDS ─────────────────────────────────────────────────
-    with _ia_tab4:
-        st.markdown("Low-score signals (<5) that CRS didn't qualify as active leads. Useful for tracking market gaps and evolving the CRS portfolio.")
-
-        _mt_df = _load_market_trends()
-        if _mt_df.empty:
-            st.caption("No market trend entries yet. Signals scored below 5 are logged here.")
-            st.caption("Requires a `market_trends` Supabase table with columns: `company`, `country`, `lead_type`, `score` (int), `rationale`, `solutions` (text), `outreach_angle`, `signal_type`, `created_at` (timestamptz, default now()).")
-        else:
-            # Filters
-            _mt_f1, _mt_f2 = st.columns(2)
-            with _mt_f1:
-                _mt_types = ["All"] + sorted(_mt_df["lead_type"].dropna().unique().tolist()) if "lead_type" in _mt_df.columns else ["All"]
-                _mt_ftype = st.selectbox("Lead type", _mt_types, key="mt_ftype")
-            with _mt_f2:
-                _mt_ctries = ["All"] + sorted(_mt_df["country"].dropna().unique().tolist()) if "country" in _mt_df.columns else ["All"]
-                _mt_fctry = st.selectbox("Country", _mt_ctries, key="mt_fctry")
-
-            _mt_view = _mt_df.copy()
-            if _mt_ftype != "All" and "lead_type" in _mt_view.columns:
-                _mt_view = _mt_view[_mt_view["lead_type"] == _mt_ftype]
-            if _mt_fctry != "All" and "country" in _mt_view.columns:
-                _mt_view = _mt_view[_mt_view["country"] == _mt_fctry]
-
-            st.caption(f"**{len(_mt_view)}** entries")
-            for _, _mt_row in _mt_view.iterrows():
-                with st.container(border=True):
-                    _mta, _mtb = st.columns([4, 1])
-                    with _mta:
-                        st.markdown(f"**{_mt_row.get('company','Unknown')}** — {_mt_row.get('country','')}")
-                        st.caption(f"Type: {_mt_row.get('lead_type','')}  ·  Signal: {_mt_row.get('signal_type','')}  ·  {str(_mt_row.get('created_at',''))[:10]}")
-                        if _mt_row.get("rationale"): st.caption(_mt_row["rationale"])
-                        if _mt_row.get("outreach_angle"): st.info(f"💬 {_mt_row['outreach_angle']}")
-                    with _mtb:
-                        _mt_sc = int(_mt_row.get("score",0) or 0)
-                        st.metric("Score", f"{'🔴' if _mt_sc < 3 else '🟡'} {_mt_sc}/10")
