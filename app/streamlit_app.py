@@ -1415,6 +1415,26 @@ def _pull_worker(env_overrides: dict, countries_sel: list | None = None) -> None
             parallel_workers=4, progress_cb=_prog_cb,
             log=_log,
         )
+
+        # ── Tender Intelligence Agent ──────────────────────────────────
+        _log("🤖 Starting Tender Intelligence Agent (web search + enrichment)…")
+        _PULL_STATE["current_country"] = "Agent: web search…"
+        try:
+            import tender_agent as _ta  # type: ignore[import-not-found]
+            _ta.init_supabase()
+            _ta.init_ai(log=lambda _: None)
+            _agent_stats = _ta.run_agent(log=_log)
+            result["agent_tenders"]        = _agent_stats.get("tenders", 0)
+            result["agent_attack_signals"] = _agent_stats.get("attack_signals", 0)
+            result["agent_partners"]       = _agent_stats.get("partners", 0)
+            result["agent_contacts"]       = _agent_stats.get("contacts", 0)
+            _log(f"🤖 Agent done — {_agent_stats.get('tenders',0)} tenders · "
+                 f"{_agent_stats.get('attack_signals',0)} signals · "
+                 f"{_agent_stats.get('partners',0)} partners · "
+                 f"{_agent_stats.get('contacts',0)} contacts")
+        except Exception as _ae:
+            _log(f"⚠️ Agent phase error: {str(_ae)[:120]}")
+
         _PULL_STATE.update({"status": "done", "result": result,
                             "progress": 1.0, "current_country": ""})
     except Exception as _e:
@@ -2065,9 +2085,16 @@ with st.sidebar:
                  help=_pull_help):
         if _ps != "running":
             _env_ov: dict = {}
-            for _k in ("SUPABASE_URL", "SUPABASE_KEY", "GROQ_API_KEY", "CEREBRAS_API_KEY",
-                       "OPENROUTER_API_KEY", "GH_PAT", "GITHUB_TOKEN", "NVIDIA_API_KEY",
-                       "DEEPSEEK_API_KEY", "GEMINI_API_KEY"):
+            for _k in (
+                "SUPABASE_URL", "SUPABASE_KEY",
+                "GROQ_API_KEY", "CEREBRAS_API_KEY", "OPENROUTER_API_KEY",
+                "GH_PAT", "GITHUB_TOKEN", "NVIDIA_API_KEY",
+                "DEEPSEEK_API_KEY", "GEMINI_API_KEY",
+                # Search backends for the Tender Intelligence Agent
+                "SERPER_API_KEY", "SERPAPI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_CSE_ID",
+                # Enrichment
+                "APOLLO_API_KEY",
+            ):
                 if not os.environ.get(_k):
                     _v = st.secrets.get(_k, "")
                     if _v:
@@ -2088,6 +2115,12 @@ with st.sidebar:
     elif _ps == "done":
         _r = _PULL_STATE.get("result") or {}
         st.success(f"✅ {_r.get('tenders_scraped', 0):,} scraped · {_r.get('tenders_scored', 0)} scored")
+        _ag_t = _r.get("agent_tenders", 0)
+        _ag_a = _r.get("agent_attack_signals", 0)
+        _ag_p = _r.get("agent_partners", 0)
+        _ag_c = _r.get("agent_contacts", 0)
+        if any((_ag_t, _ag_a, _ag_p, _ag_c)):
+            st.info(f"🤖 Agent: {_ag_t} tenders · {_ag_a} attack signals · {_ag_p} partners · {_ag_c} contacts")
         _PULL_STATE["status"] = "idle"
         st.cache_data.clear()
     elif _ps == "failed":
