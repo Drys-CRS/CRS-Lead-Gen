@@ -1910,6 +1910,7 @@ _NAV_PAGES = [
     "🎯 End-User Targets",
     "👥 Decision Makers",
     "🤖 Intelligence Agent",
+    "🕵️ Darktrace Intel",
 ]
 
 with st.sidebar:
@@ -6335,4 +6336,419 @@ if _page == "🤖 Intelligence Agent":
             for _, _kb_r in _kb_df2.iterrows():
                 with st.expander(f"📄 {str(_kb_r.get('source',''))[:80]}  —  {str(_kb_r.get('created_at',''))[:10]}"):
                     st.write(_kb_r.get("summary",""))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 🕵️ DARKTRACE INTEL
+# OSINT-sourced Darktrace customer map for Africa — VECTRA displacement playbook
+# ══════════════════════════════════════════════════════════════════════════════
+if _page == "🕵️ Darktrace Intel":
+    _colored_header(
+        label="Darktrace Intel — Africa",
+        description="OSINT-sourced map of African Darktrace customers. Use for VECTRA displacement: Vectra AI delivers the same NDR capability at a fraction of the price.",
+        color_name="red-70",
+    )
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+    import glob as _glob
+    import subprocess as _subprocess
+
+    _DT_REPORTS_DIR = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "crs-competitive-intelligence",
+    )
+    _DT_CONF_COLORS = {"high": "🔴", "medium": "🟡", "low": "⚪"}
+    _DT_SOURCE_LABELS = {
+        "shodan":        "🖧 Shodan",
+        "crt":           "🔐 Cert Trans.",
+        "jobs":          "💼 Job Board",
+        "procurement":   "📋 Tender",
+        "darktrace_blog": "📰 DT Blog",
+    }
+
+    def _dt_load_report(path: str) -> list[dict]:
+        with open(path, encoding="utf-8") as _f:
+            return json.load(_f)
+
+    def _dt_latest_report() -> tuple[str | None, list[dict]]:
+        pattern = os.path.join(_DT_REPORTS_DIR, "darktrace_discovery_*.json")
+        files = sorted(_glob.glob(pattern), reverse=True)
+        if not files:
+            return None, []
+        return files[0], _dt_load_report(files[0])
+
+    def _dt_vectra_outreach(org: str, country: str, evidence: str,
+                            ai_approach: str, contacts: list[dict]) -> str:
+        """Generate a VECTRA-led price-first displacement outreach note via Gemini."""
+        contact_line = ""
+        if contacts:
+            c = contacts[0]
+            contact_line = (f"Target contact: {c.get('name','')} ({c.get('title','')}). ")
+
+        prompt = (
+            f"You are a CRS (Cyber Retaliator Solutions) sales executive in Africa.\n"
+            f"CRS sells Vectra AI NDR — same AI-driven network detection as Darktrace, "
+            f"typically 30-50% cheaper with no vendor lock-in and local African support.\n\n"
+            f"Write a punchy 3-sentence cold outreach email body for:\n"
+            f"Organisation: {org}\nCountry: {country}\n"
+            f"Signal: {evidence[:250]}\n"
+            f"{contact_line}"
+            f"Prior AI note: {ai_approach[:200] if ai_approach else 'N/A'}\n\n"
+            f"Rules:\n"
+            f"- Lead with price / cost savings (e.g. 'cut your NDR spend by up to 40%')\n"
+            f"- Name Vectra AI explicitly\n"
+            f"- Reference that we know they already run Darktrace\n"
+            f"- End with a CTA for a 20-minute ROI call\n"
+            f"- No subject line, no sign-off, just the body sentences\n"
+            f"Return ONLY the email body text."
+        )
+        return _call_ai(prompt)
+
+    # ── Load / upload report ──────────────────────────────────────────────────
+    _dt_c1, _dt_c2 = st.columns([3, 1])
+    with _dt_c1:
+        _dt_latest_path, _dt_latest_data = _dt_latest_report()
+        if _dt_latest_path:
+            _dt_fname = os.path.basename(_dt_latest_path)
+            _dt_ts = _dt_fname.replace("darktrace_discovery_", "").replace(".json", "")
+            st.caption(f"Latest report: **{_dt_fname}** — {len(_dt_latest_data)} organisations")
+        else:
+            st.caption("No report found. Run discovery below or upload a JSON file.")
+
+    with _dt_c2:
+        _dt_upload = st.file_uploader(
+            "Upload report JSON", type=["json"], key="dt_upload", label_visibility="collapsed"
+        )
+
+    # Resolve which data to use
+    if _dt_upload is not None:
+        try:
+            _dt_data: list[dict] = json.loads(_dt_upload.read())
+            st.success(f"Loaded {len(_dt_data)} organisations from upload.")
+        except Exception as _ue:
+            st.error(f"Invalid JSON: {_ue}")
+            _dt_data = _dt_latest_data
+    else:
+        _dt_data = _dt_latest_data
+
+    # ── Run Discovery panel ───────────────────────────────────────────────────
+    with st.expander("⚙️ Run OSINT Discovery", expanded=not bool(_dt_data)):
+        st.markdown(
+            "Launches the `darktrace_discovery.py` CLI tool. "
+            "Requires `SHODAN_API_KEY` for Shodan; others are free. "
+            "Gemini analysis + Apollo enrichment run automatically when keys are set."
+        )
+        _dt_rc1, _dt_rc2 = st.columns(2)
+        with _dt_rc1:
+            _dt_countries = st.multiselect(
+                "Countries",
+                ["ZA", "NG", "KE", "EG", "GH", "TZ", "MA", "ET", "CI", "SN", "UG", "RW"],
+                default=["ZA", "NG", "KE", "EG", "GH"],
+                key="dt_countries",
+            )
+            _dt_modules = st.multiselect(
+                "Modules",
+                ["shodan", "crt", "jobs", "procurement", "darktrace"],
+                default=["crt", "jobs", "procurement", "darktrace"],
+                key="dt_modules",
+            )
+        with _dt_rc2:
+            _dt_no_gemini = st.checkbox("Skip Gemini analysis", key="dt_no_gemini")
+            _dt_no_apollo = st.checkbox("Skip Apollo enrichment", key="dt_no_apollo")
+            _dt_min_conf = st.selectbox(
+                "Minimum confidence in output", ["low", "medium", "high"],
+                key="dt_min_conf"
+            )
+
+        if st.button("🚀 Run Discovery Now", type="primary", key="dt_run_btn", use_container_width=True):
+            _script = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "crs-competitive-intelligence", "darktrace_discovery.py"
+            )
+            _cmd = [
+                sys.executable, _script,
+                "--countries", ",".join(_dt_countries or ["ZA", "NG", "KE"]),
+                "--modules", ",".join(_dt_modules or ["crt", "jobs", "procurement", "darktrace"]),
+                "--output-dir", _DT_REPORTS_DIR,
+                "--min-confidence", _dt_min_conf,
+            ]
+            if _dt_no_gemini: _cmd.append("--no-gemini")
+            if _dt_no_apollo: _cmd.append("--no-apollo")
+
+            _env = {**os.environ}
+            for _k in ("SHODAN_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "APOLLO_API_KEY"):
+                _val = st.secrets.get(_k, "") or os.getenv(_k, "")
+                if _val: _env[_k] = _val
+
+            try:
+                _proc = _subprocess.Popen(
+                    _cmd, env=_env, stdout=_subprocess.PIPE, stderr=_subprocess.STDOUT
+                )
+                st.session_state["dt_proc_pid"] = _proc.pid
+                st.success(
+                    f"Discovery running in background (PID {_proc.pid}). "
+                    "Reload this page in a few minutes to see the results."
+                )
+            except Exception as _re:
+                st.error(f"Failed to start: {_re}")
+
+    if not _dt_data:
+        st.info("No report loaded. Run discovery above or upload a JSON file.")
+        st.stop()
+
+    st.divider()
+
+    # ── Summary metrics ───────────────────────────────────────────────────────
+    _dt_total = len(_dt_data)
+    _dt_high   = sum(1 for d in _dt_data if d.get("confidence") == "high")
+    _dt_med    = sum(1 for d in _dt_data if d.get("confidence") == "medium")
+    _dt_low    = sum(1 for d in _dt_data if d.get("confidence") == "low")
+    _dt_with_contacts = sum(1 for d in _dt_data if d.get("contacts"))
+    _dt_ai_confirmed  = sum(1 for d in _dt_data if d.get("gemini", {}).get("is_real_customer"))
+
+    _dtm1, _dtm2, _dtm3, _dtm4, _dtm5 = st.columns(5)
+    _dtm1.metric("Total orgs", _dt_total)
+    _dtm2.metric("🔴 High conf.", _dt_high)
+    _dtm3.metric("🟡 Medium conf.", _dt_med)
+    _dtm4.metric("AI confirmed", _dt_ai_confirmed, help="Gemini assessed as real Darktrace customer")
+    _dtm5.metric("With contacts", _dt_with_contacts, help="Apollo decision-maker contacts found")
+
+    # ── Charts row ────────────────────────────────────────────────────────────
+    _dt_chart_c1, _dt_chart_c2 = st.columns(2)
+
+    with _dt_chart_c1:
+        st.markdown("**Organisations by country**")
+        _dt_country_counts: dict[str, int] = {}
+        for _d in _dt_data:
+            _c = _d.get("country") or "Unknown"
+            _dt_country_counts[_c] = _dt_country_counts.get(_c, 0) + 1
+        if _dt_country_counts:
+            _dt_cc_df = pd.DataFrame(
+                sorted(_dt_country_counts.items(), key=lambda x: -x[1]),
+                columns=["Country", "Organisations"],
+            ).set_index("Country")
+            st.bar_chart(_dt_cc_df)
+
+    with _dt_chart_c2:
+        st.markdown("**By OSINT source**")
+        _dt_src_counts: dict[str, int] = {}
+        for _d in _dt_data:
+            _s = _d.get("source") or "unknown"
+            _dt_src_counts[_DT_SOURCE_LABELS.get(_s, _s)] = _dt_src_counts.get(_DT_SOURCE_LABELS.get(_s, _s), 0) + 1
+        if _dt_src_counts:
+            _dt_src_df = pd.DataFrame(
+                sorted(_dt_src_counts.items(), key=lambda x: -x[1]),
+                columns=["Source", "Count"],
+            ).set_index("Source")
+            st.bar_chart(_dt_src_df)
+
+    st.divider()
+
+    # ── Filters ───────────────────────────────────────────────────────────────
+    _dtf1, _dtf2, _dtf3, _dtf4 = st.columns(4)
+    _dt_f_conf = _dtf1.multiselect(
+        "Confidence", ["high", "medium", "low"],
+        default=["high", "medium"], key="dt_f_conf",
+    )
+    _dt_all_countries = sorted({d.get("country") or "Unknown" for d in _dt_data})
+    _dt_f_countries = _dtf2.multiselect(
+        "Country", _dt_all_countries, key="dt_f_countries",
+    )
+    _dt_all_sources = sorted({d.get("source") or "unknown" for d in _dt_data})
+    _dt_f_sources = _dtf3.multiselect(
+        "Source", _dt_all_sources, key="dt_f_sources",
+    )
+    _dt_f_contacts_only = _dtf4.checkbox(
+        "Has contacts only", key="dt_f_contacts_only"
+    )
+    _dt_f_ai_confirmed = _dtf4.checkbox(
+        "AI confirmed only", key="dt_f_ai_confirmed"
+    )
+
+    # Apply filters
+    _dt_filtered = [
+        d for d in _dt_data
+        if (not _dt_f_conf or d.get("confidence") in _dt_f_conf)
+        and (not _dt_f_countries or (d.get("country") or "Unknown") in _dt_f_countries)
+        and (not _dt_f_sources or d.get("source") in _dt_f_sources)
+        and (not _dt_f_contacts_only or bool(d.get("contacts")))
+        and (not _dt_f_ai_confirmed or bool(d.get("gemini", {}).get("is_real_customer")))
+    ]
+
+    st.caption(f"Showing {len(_dt_filtered)} of {_dt_total} organisations")
+
+    if not _dt_filtered:
+        st.info("No organisations match the current filters.")
+        st.stop()
+
+    # ── Flat table view ───────────────────────────────────────────────────────
+    with st.expander("📊 Table view", expanded=False):
+        _dt_table_rows = []
+        for _d in _dt_filtered:
+            _g = _d.get("gemini") or {}
+            _dt_table_rows.append({
+                "Org": _d.get("org_name", ""),
+                "Country": _d.get("country", ""),
+                "Conf.": _d.get("confidence", ""),
+                "Source": _DT_SOURCE_LABELS.get(_d.get("source", ""), _d.get("source", "")),
+                "AI real?": "✅" if _g.get("is_real_customer") else "—",
+                "AI conf.": _g.get("refined_confidence", ""),
+                "Contacts": len(_d.get("contacts") or []),
+                "Domain": _d.get("domain", ""),
+                "IP": _d.get("ip", ""),
+                "Date": _d.get("date_found", ""),
+            })
+        st.dataframe(pd.DataFrame(_dt_table_rows), use_container_width=True, hide_index=True)
+
+    # ── Org cards ─────────────────────────────────────────────────────────────
+    for _dt_idx, _dt_d in enumerate(_dt_filtered):
+        _dt_org     = str(_dt_d.get("org_name") or "Unknown")
+        _dt_country = str(_dt_d.get("country") or "")
+        _dt_conf    = str(_dt_d.get("confidence") or "low")
+        _dt_src     = str(_dt_d.get("source") or "")
+        _dt_evidence = str(_dt_d.get("evidence") or "")
+        _dt_url     = str(_dt_d.get("url") or "")
+        _dt_ip      = str(_dt_d.get("ip") or "")
+        _dt_domain  = str(_dt_d.get("domain") or "")
+        _dt_gemini  = _dt_d.get("gemini") or {}
+        _dt_contacts: list[dict] = _dt_d.get("contacts") or []
+        _dt_extra   = _dt_d.get("extra") or {}
+        _dt_all_srcs = _dt_extra.get("all_sources") or [_dt_src]
+
+        with st.container(border=True):
+            _dth1, _dth2 = st.columns([5, 1])
+            with _dth1:
+                _conf_badge = _DT_CONF_COLORS.get(_dt_conf, "⚪")
+                _ai_badge   = "🧠✅" if _dt_gemini.get("is_real_customer") else ""
+                st.markdown(f"### {_conf_badge} {_dt_org}  {_ai_badge}")
+                _meta_parts = [p for p in [
+                    f"📍 {_dt_country}" if _dt_country else "",
+                    _DT_SOURCE_LABELS.get(_dt_src, _dt_src),
+                    (f"corroborated by {', '.join(_DT_SOURCE_LABELS.get(s, s) for s in _dt_all_srcs)}"
+                     if len(_dt_all_srcs) > 1 else ""),
+                    f"[{_dt_domain}]({_dt_url})" if _dt_domain and _dt_url else
+                    (_dt_domain or (_dt_url[:60] if _dt_url else "")),
+                ] if p]
+                st.caption("  ·  ".join(_meta_parts))
+            with _dth2:
+                if _dt_ip:
+                    st.code(_dt_ip, language=None)
+
+            # Evidence
+            if _dt_evidence:
+                st.markdown(f"**Evidence:** {_dt_evidence[:300]}")
+
+            # Gemini AI analysis
+            if _dt_gemini:
+                _ai_conf = _dt_gemini.get("refined_confidence", _dt_conf)
+                _ai_real = _dt_gemini.get("is_real_customer", False)
+                _ai_rsn  = _dt_gemini.get("reasoning", "")
+                _ai_appr = _dt_gemini.get("suggested_approach", "")
+                _ai_titles = _dt_gemini.get("ideal_titles", [])
+
+                with st.expander("🧠 AI Assessment", expanded=_ai_real):
+                    _ai_col1, _ai_col2 = st.columns([2, 1])
+                    with _ai_col1:
+                        st.markdown(
+                            f"**{'✅ Confirmed Darktrace customer' if _ai_real else '⚠️ Uncertain signal'}**  \n"
+                            f"{_ai_rsn}"
+                        )
+                        if _ai_appr:
+                            st.info(f"💡 **Approach:** {_ai_appr}")
+                    with _ai_col2:
+                        st.metric("AI confidence", _ai_conf.upper())
+                        if _ai_titles:
+                            st.caption("Target titles: " + " · ".join(_ai_titles[:4]))
+
+            # Decision maker contacts
+            if _dt_contacts:
+                with st.expander(f"👥 Decision Makers ({len(_dt_contacts)} found)", expanded=True):
+                    for _ci, _ct in enumerate(_dt_contacts):
+                        _ct_name  = str(_ct.get("name") or "")
+                        _ct_title = str(_ct.get("title") or "")
+                        _ct_email = _ct.get("email") or _ct.get("work_email") or ""
+                        _ct_phone = str(_ct.get("phone") or "")
+                        _ct_li    = str(_ct.get("linkedin") or "")
+                        _ct_city  = str(_ct.get("city") or _ct.get("country") or "")
+
+                        _ctc1, _ctc2, _ctc3 = st.columns([3, 2, 2])
+                        with _ctc1:
+                            st.markdown(f"**{_ct_name}**")
+                            st.caption(f"{_ct_title}{'  ·  ' + _ct_city if _ct_city else ''}")
+                        with _ctc2:
+                            if _ct_email:
+                                st.markdown(f"✉️ `{_ct_email}`")
+                            if _ct_phone:
+                                st.markdown(f"📞 `{_ct_phone}`")
+                        with _ctc3:
+                            if _ct_li:
+                                st.markdown(f"[LinkedIn →]({_ct_li})")
+
+                        if _ci < len(_dt_contacts) - 1:
+                            st.divider()
+
+            # ── VECTRA outreach note ───────────────────────────────────────────
+            _dt_note_key = f"dt_note_{_dt_idx}"
+            _dt_push_key = f"dt_push_{_dt_idx}"
+
+            _dt_action_c1, _dt_action_c2, _dt_action_c3 = st.columns(3)
+            with _dt_action_c1:
+                if st.button("✍️ Generate VECTRA Outreach", key=f"dt_gen_{_dt_idx}",
+                             use_container_width=True):
+                    with st.spinner("Generating VECTRA displacement note…"):
+                        _note = _dt_vectra_outreach(
+                            org=_dt_org,
+                            country=_dt_country,
+                            evidence=_dt_evidence,
+                            ai_approach=_dt_gemini.get("suggested_approach", ""),
+                            contacts=_dt_contacts,
+                        )
+                    st.session_state[_dt_note_key] = _note
+
+            if _dt_note_key in st.session_state:
+                _note_val = st.session_state[_dt_note_key]
+                st.text_area(
+                    "VECTRA displacement email body",
+                    value=_note_val,
+                    key=f"dt_note_ta_{_dt_idx}",
+                    height=160,
+                )
+                _copy_block(_note_val, f"dt_copy_{_dt_idx}")
+
+            with _dt_action_c2:
+                if _MONDAY_OK and st.button("🏢 Push to Companies", key=f"dt_co_{_dt_idx}",
+                                             use_container_width=True):
+                    try:
+                        _dt_note_for_push = st.session_state.get(_dt_note_key, "")
+                        push_partner_to_companies({
+                            "company_name":  _dt_org,
+                            "country":       _dt_country,
+                            "rationale":     f"[Darktrace Intel] {_dt_evidence[:200]}",
+                            "opportunity":   _dt_note_for_push[:300] if _dt_note_for_push else
+                                             f"VECTRA displacement target — Darktrace customer ({_dt_src})",
+                            "ibm_products":  "Vectra AI NDR",
+                        })
+                        st.toast(f"✅ {_dt_org} pushed to Companies board")
+                    except Exception as _pe:
+                        st.error(str(_pe))
+
+            with _dt_action_c3:
+                if _MONDAY_OK and _dt_contacts and st.button(
+                    "👤 Push Top Contact", key=f"dt_ct_{_dt_idx}", use_container_width=True
+                ):
+                    try:
+                        _best = _dt_contacts[0]
+                        push_to_contacts_board({
+                            "name":    _best.get("name", ""),
+                            "title":   _best.get("title", ""),
+                            "email":   _best.get("email") or _best.get("work_email", ""),
+                            "phone":   _best.get("phone", ""),
+                            "company": _dt_org,
+                            "country": _dt_country,
+                            "linkedin": _best.get("linkedin", ""),
+                            "source":  "Darktrace Intel (VECTRA target)",
+                        })
+                        st.toast(f"✅ {_best.get('name','')} pushed to Contacts board")
+                    except Exception as _cpe:
+                        st.error(str(_cpe))
 
